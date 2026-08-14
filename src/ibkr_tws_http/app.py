@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
+from . import __version__
 from .config import Settings
 from .gateway import (
     ContractInfo,
@@ -19,11 +21,14 @@ from .models import (
     AccountResponse,
     AccountValueResponse,
     ContractResponse,
+    ContractSearchResponse,
     ContractSpec,
     HistoricalBarResponse,
     HistoricalBarsRequest,
     MarketDataSnapshotRequest,
     MarketDataSnapshotResponse,
+    OptionChainResponse,
+    OptionChainsRequest,
     PositionResponse,
     StatusResponse,
 )
@@ -61,7 +66,7 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
 
     app = FastAPI(
         title="IBKR TWS HTTP",
-        version="0.1.0",
+        version=__version__,
         description="A deliberately narrow, read-only facade for a local TWS API.",
         lifespan=lifespan,
     )
@@ -142,6 +147,37 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
         policy.check_contract(contract)
         values = policy.filter_contracts(await active_gateway.contract_details(contract))
         return [_contract_response(value) for value in values]
+
+    @app.get("/v1/contracts/search", response_model=list[ContractSearchResponse])
+    async def contract_search(
+        pattern: Annotated[str, Query(min_length=1, max_length=64)],
+    ) -> list[ContractSearchResponse]:
+        policy.require_feature("contract-search")
+        values = policy.filter_contract_search(await active_gateway.search_contracts(pattern))
+        return [
+            ContractSearchResponse(
+                contract=_contract_response(value.contract),
+                derivative_security_types=list(value.derivative_security_types),
+            )
+            for value in values
+        ]
+
+    @app.post("/v1/options/chains", response_model=list[OptionChainResponse])
+    async def option_chains(request: OptionChainsRequest) -> list[OptionChainResponse]:
+        policy.require_feature("option-chains")
+        policy.check_option_chain(request)
+        values = policy.filter_option_chains(await active_gateway.option_chains(request))
+        return [
+            OptionChainResponse(
+                exchange=value.exchange,
+                underlying_con_id=value.underlying_con_id,
+                trading_class=value.trading_class,
+                multiplier=value.multiplier,
+                expirations=list(value.expirations),
+                strikes=list(value.strikes),
+            )
+            for value in values
+        ]
 
     @app.post("/v1/market-data/snapshot", response_model=MarketDataSnapshotResponse)
     async def market_data(request: MarketDataSnapshotRequest) -> MarketDataSnapshotResponse:

@@ -72,7 +72,9 @@ are intentionally explicit:
 - `GET /v1/accounts`
 - `GET /v1/account-summary`
 - `GET /v1/positions`
+- `GET /v1/contracts/search?pattern=AAPL`
 - `POST /v1/contracts/details`
+- `POST /v1/options/chains`
 - `POST /v1/market-data/snapshot`
 - `POST /v1/historical-bars`
 
@@ -80,6 +82,16 @@ Examples:
 
 ```console
 curl http://127.0.0.1:8080/v1/positions
+
+curl 'http://127.0.0.1:8080/v1/contracts/search?pattern=apple'
+
+curl -X POST http://127.0.0.1:8080/v1/options/chains \
+  -H 'content-type: application/json' \
+  -d '{"underlying_symbol":"AAPL","underlying_con_id":265598}'
+
+curl -X POST http://127.0.0.1:8080/v1/contracts/details \
+  -H 'content-type: application/json' \
+  -d '{"symbol":"AAPL","sec_type":"OPT","last_trade_date_or_contract_month":"20260918","strike":200,"right":"C"}'
 
 curl -X POST http://127.0.0.1:8080/v1/market-data/snapshot \
   -H 'content-type: application/json' \
@@ -89,6 +101,12 @@ curl -X POST http://127.0.0.1:8080/v1/historical-bars \
   -H 'content-type: application/json' \
   -d '{"contract":{"symbol":"AAPL"},"duration":"1 D","bar_size":"5 mins"}'
 ```
+
+Use contract search to find the underlying contract ID, query its option chains
+for available exchanges, trading classes, expirations, and strikes, then use
+contract details to resolve a selected expiry/strike/right into a specific
+option contract. Supplying an empty `exchange` (the default) returns chains
+from all applicable exchanges.
 
 The default policy redacts account IDs as `account`. Configure an alias to make
 multiple accounts distinguishable without returning their real IDs. Empty

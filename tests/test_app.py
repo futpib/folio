@@ -9,9 +9,11 @@ from ibkr_tws_http.config import ExposureConfig, ServerConfig, Settings
 from ibkr_tws_http.gateway import (
     AccountValue,
     ContractInfo,
+    ContractSearchResult,
     GatewayRequestError,
     GatewayStatus,
     HistoricalBar,
+    OptionChain,
     Position,
 )
 
@@ -68,6 +70,24 @@ class FakeGateway:
         self.last_contract = requested
         return [contract(), contract("MSFT")]
 
+    async def search_contracts(self, pattern: str) -> list[ContractSearchResult]:
+        return [
+            ContractSearchResult(contract(), ("OPT", "FUT")),
+            ContractSearchResult(contract("MSFT"), ("OPT",)),
+        ]
+
+    async def option_chains(self, request) -> list[OptionChain]:
+        return [
+            OptionChain(
+                exchange="SMART",
+                underlying_con_id=request.underlying_con_id,
+                trading_class="AAPL",
+                multiplier="100",
+                expirations=("20260918", "20260925"),
+                strikes=(195.0, 200.0, 205.0),
+            )
+        ]
+
     async def market_data_snapshot(self, request):
         self.last_contract = request.contract
         return {"bid": 199.5, "ask": 199.6, "bid_size": 100}
@@ -89,14 +109,15 @@ class FakeGateway:
 
 
 def settings(**exposure_overrides) -> Settings:
-    exposure = ExposureConfig(
-        allowed_accounts=frozenset({"DU111"}),
-        account_aliases={"DU111": "paper"},
-        account_summary_tags=frozenset({"NetLiquidation"}),
-        allowed_security_types=frozenset({"STK"}),
-        allowed_symbols=frozenset({"AAPL"}),
-        **exposure_overrides,
-    )
+    exposure_values = {
+        "allowed_accounts": frozenset({"DU111"}),
+        "account_aliases": {"DU111": "paper"},
+        "account_summary_tags": frozenset({"NetLiquidation"}),
+        "allowed_security_types": frozenset({"STK", "OPT"}),
+        "allowed_symbols": frozenset({"AAPL"}),
+    }
+    exposure_values.update(exposure_overrides)
+    exposure = ExposureConfig(**exposure_values)
     return Settings(server=ServerConfig(), exposure=exposure)
 
 
@@ -134,6 +155,42 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert [item["symbol"] for item in response.json()] == ["AAPL"]
         assert gateway.last_contract.symbol == "AAPL"
 
+        response = client.get("/v1/contracts/search", params={"pattern": "apple"})
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "contract": {
+                    "con_id": 265598,
+                    "symbol": "AAPL",
+                    "sec_type": "STK",
+                    "exchange": "SMART",
+                    "primary_exchange": "NASDAQ",
+                    "currency": "USD",
+                    "local_symbol": "AAPL",
+                    "trading_class": "NMS",
+                    "long_name": "Apple Inc.",
+                    "min_tick": 0.01,
+                },
+                "derivative_security_types": ["OPT"],
+            }
+        ]
+
+        response = client.post(
+            "/v1/options/chains",
+            json={"underlying_symbol": "aapl", "underlying_con_id": 265598},
+        )
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "exchange": "SMART",
+                "underlying_con_id": 265598,
+                "trading_class": "AAPL",
+                "multiplier": "100",
+                "expirations": ["20260918", "20260925"],
+                "strikes": [195.0, 200.0, 205.0],
+            }
+        ]
+
         response = client.post(
             "/v1/market-data/snapshot",
             json={"contract": {"symbol": "aapl"}},
@@ -156,6 +213,8 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "/v1/account-summary",
             "/v1/positions",
             "/v1/contracts/details",
+            "/v1/contracts/search",
+            "/v1/options/chains",
             "/v1/market-data/snapshot",
             "/v1/historical-bars",
         }
@@ -172,6 +231,13 @@ def test_rejects_out_of_policy_and_naive_historical_time() -> None:
         assert denied.status_code == 403
         assert denied.json() == {"detail": "symbol is not allowed"}
 
+        denied_chain = client.post(
+            "/v1/options/chains",
+            json={"underlying_symbol": "MSFT", "underlying_con_id": 272093},
+        )
+        assert denied_chain.status_code == 403
+        assert denied_chain.json() == {"detail": "symbol is not allowed"}
+
         invalid = client.post(
             "/v1/historical-bars",
             json={"contract": {"symbol": "AAPL"}, "end": "2026-08-14T12:00:00"},
@@ -184,6 +250,17 @@ def test_disabled_feature_is_not_exposed() -> None:
         response = client.get("/v1/positions")
     assert response.status_code == 403
     assert response.json() == {"detail": "feature 'positions' is disabled"}
+
+
+def test_option_chains_require_option_security_type() -> None:
+    restricted = settings(allowed_security_types=frozenset({"STK"}))
+    with TestClient(create_app(restricted, FakeGateway())) as client:
+        response = client.post(
+            "/v1/options/chains",
+            json={"underlying_symbol": "AAPL", "underlying_con_id": 265598},
+        )
+    assert response.status_code == 403
+    assert response.json() == {"detail": "security type 'OPT' is not allowed"}
 
 
 class ErrorGateway(FakeGateway):

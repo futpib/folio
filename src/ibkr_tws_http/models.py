@@ -48,6 +48,23 @@ class MarketDataSnapshotRequest(StrictModel):
     regulatory_snapshot: bool = False
 
 
+class OptionChainsRequest(StrictModel):
+    underlying_symbol: str = Field(min_length=1, max_length=32)
+    underlying_con_id: int = Field(ge=1)
+    underlying_security_type: str = Field(default="STK", min_length=1, max_length=16)
+    exchange: str = Field(default="", max_length=32)
+
+    @field_validator(
+        "underlying_symbol",
+        "underlying_security_type",
+        "exchange",
+        mode="before",
+    )
+    @classmethod
+    def uppercase_identifiers(cls, value: Any) -> Any:
+        return value.upper() if isinstance(value, str) else value
+
+
 class HistoricalBarsRequest(StrictModel):
     contract: ContractSpec
     end: datetime | None = None
@@ -99,6 +116,20 @@ class ContractResponse(StrictModel):
     trading_class: str | None = None
     long_name: str | None = None
     min_tick: float | None = None
+
+
+class ContractSearchResponse(StrictModel):
+    contract: ContractResponse
+    derivative_security_types: list[str]
+
+
+class OptionChainResponse(StrictModel):
+    exchange: str
+    underlying_con_id: int
+    trading_class: str
+    multiplier: str
+    expirations: list[str]
+    strikes: list[float]
 
 
 class PositionResponse(StrictModel):

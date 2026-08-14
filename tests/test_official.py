@@ -9,7 +9,12 @@ import pytest
 
 from ibkr_tws_http.config import TwsConfig
 from ibkr_tws_http.gateway import GatewayRequestError
-from ibkr_tws_http.models import ContractSpec, HistoricalBarsRequest, MarketDataSnapshotRequest
+from ibkr_tws_http.models import (
+    ContractSpec,
+    HistoricalBarsRequest,
+    MarketDataSnapshotRequest,
+    OptionChainsRequest,
+)
 from ibkr_tws_http.official import IbApiBindings, OfficialGateway, load_ibapi
 
 
@@ -38,6 +43,7 @@ def apple_contract() -> FakeContract:
     value.currency = "USD"
     value.localSymbol = "AAPL"
     value.tradingClass = "NMS"
+    value.description = "Apple Inc."
     return value
 
 
@@ -86,6 +92,29 @@ class FakeClient:
         details = SimpleNamespace(contract=apple_contract(), longName="Apple Inc.", minTick=0.01)
         self.wrapper.contractDetails(request_id, details)
         self.wrapper.contractDetailsEnd(request_id)
+
+    def reqMatchingSymbols(self, request_id: int, pattern: str) -> None:
+        description = SimpleNamespace(contract=apple_contract(), derivativeSecTypes=["OPT", "WAR"])
+        self.wrapper.symbolSamples(request_id, [description])
+
+    def reqSecDefOptParams(
+        self,
+        request_id: int,
+        underlying_symbol: str,
+        exchange: str,
+        underlying_security_type: str,
+        underlying_con_id: int,
+    ) -> None:
+        self.wrapper.securityDefinitionOptionParameter(
+            request_id,
+            "SMART",
+            underlying_con_id,
+            underlying_symbol,
+            "100",
+            {"20260925", "20260918"},
+            {205.0, 195.0, 200.0},
+        )
+        self.wrapper.securityDefinitionOptionParameterEnd(request_id)
 
     def reqMktData(
         self,
@@ -164,6 +193,18 @@ def test_official_callback_bridge_round_trip() -> None:
 
         details = await gateway.contract_details(ContractSpec(symbol="AAPL"))
         assert details[0].long_name == "Apple Inc."
+
+        search = await gateway.search_contracts("apple")
+        assert search[0].contract.symbol == "AAPL"
+        assert search[0].contract.long_name == "Apple Inc."
+        assert search[0].derivative_security_types == ("OPT", "WAR")
+
+        chains = await gateway.option_chains(
+            OptionChainsRequest(underlying_symbol="AAPL", underlying_con_id=265598)
+        )
+        assert chains[0].exchange == "SMART"
+        assert chains[0].expirations == ("20260918", "20260925")
+        assert chains[0].strikes == (195.0, 200.0, 205.0)
 
         snapshot = await gateway.market_data_snapshot(
             MarketDataSnapshotRequest(contract=ContractSpec(symbol="AAPL"))

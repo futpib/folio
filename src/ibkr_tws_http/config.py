@@ -13,6 +13,8 @@ FEATURES = frozenset(
         "account-summary",
         "positions",
         "contract-details",
+        "contract-search",
+        "option-chains",
         "market-data",
         "historical-data",
     }
@@ -25,6 +27,8 @@ DEFAULT_FEATURES = frozenset(
         "account-summary",
         "positions",
         "contract-details",
+        "contract-search",
+        "option-chains",
         "market-data",
         "historical-data",
     }

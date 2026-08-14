@@ -17,6 +17,8 @@ features = [
   "account-summary",
   "positions",
   "contract-details",
+  "contract-search",
+  "option-chains",
   "market-data",
   "historical-data",
 ]

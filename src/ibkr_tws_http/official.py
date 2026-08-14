@@ -14,14 +14,21 @@ from .config import TwsConfig
 from .gateway import (
     AccountValue,
     ContractInfo,
+    ContractSearchResult,
     GatewayRequestError,
     GatewayStatus,
     GatewayTimeout,
     GatewayUnavailable,
     HistoricalBar,
+    OptionChain,
     Position,
 )
-from .models import ContractSpec, HistoricalBarsRequest, MarketDataSnapshotRequest
+from .models import (
+    ContractSpec,
+    HistoricalBarsRequest,
+    MarketDataSnapshotRequest,
+    OptionChainsRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +159,31 @@ class OfficialGateway:
             self._send(
                 client,
                 lambda: client.reqContractDetails(request_id, self._make_contract(contract)),
+            )
+            return await self._wait(request_id, pending)
+        finally:
+            self._discard(request_id, pending)
+
+    async def search_contracts(self, pattern: str) -> list[ContractSearchResult]:
+        request_id, pending, client = await self._begin_request()
+        try:
+            self._send(client, lambda: client.reqMatchingSymbols(request_id, pattern))
+            return await self._wait(request_id, pending)
+        finally:
+            self._discard(request_id, pending)
+
+    async def option_chains(self, request: OptionChainsRequest) -> list[OptionChain]:
+        request_id, pending, client = await self._begin_request()
+        try:
+            self._send(
+                client,
+                lambda: client.reqSecDefOptParams(
+                    request_id,
+                    request.underlying_symbol,
+                    request.exchange,
+                    request.underlying_security_type,
+                    request.underlying_con_id,
+                ),
             )
             return await self._wait(request_id, pending)
         finally:
@@ -352,6 +384,44 @@ class OfficialGateway:
             def contractDetailsEnd(self, reqId: int) -> None:
                 gateway._complete_items(reqId)
 
+            def symbolSamples(self, reqId: int, contractDescriptions: list[Any]) -> None:
+                for description in contractDescriptions:
+                    gateway._append(
+                        reqId,
+                        ContractSearchResult(
+                            contract=gateway._contract_info(description.contract),
+                            derivative_security_types=tuple(
+                                str(value) for value in description.derivativeSecTypes
+                            ),
+                        ),
+                    )
+                gateway._complete_items(reqId)
+
+            def securityDefinitionOptionParameter(
+                self,
+                reqId: int,
+                exchange: str,
+                underlyingConId: int,
+                tradingClass: str,
+                multiplier: str,
+                expirations: set[str],
+                strikes: set[float],
+            ) -> None:
+                gateway._append(
+                    reqId,
+                    OptionChain(
+                        exchange=exchange,
+                        underlying_con_id=underlyingConId,
+                        trading_class=tradingClass,
+                        multiplier=multiplier,
+                        expirations=tuple(sorted(str(value) for value in expirations)),
+                        strikes=tuple(sorted(float(value) for value in strikes)),
+                    ),
+                )
+
+            def securityDefinitionOptionParameterEnd(self, reqId: int) -> None:
+                gateway._complete_items(reqId)
+
             def tickPrice(self, reqId: int, tickType: int, price: float, attrib: Any) -> None:
                 gateway._set_tick(reqId, tickType, float(price))
 
@@ -534,7 +604,11 @@ class OfficialGateway:
         primary_exchange = getattr(contract, "primaryExchange", "") or None
         local_symbol = getattr(contract, "localSymbol", "") or None
         trading_class = getattr(contract, "tradingClass", "") or None
-        long_name = (getattr(details, "longName", "") or None) if details is not None else None
+        long_name = (
+            (getattr(details, "longName", "") or None)
+            if details is not None
+            else (getattr(contract, "description", "") or None)
+        )
         min_tick = getattr(details, "minTick", None) if details is not None else None
         return ContractInfo(
             con_id=int(getattr(contract, "conId", 0)),

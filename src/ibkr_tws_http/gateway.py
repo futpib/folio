@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
 
-from .models import ContractSpec, HistoricalBarsRequest, MarketDataSnapshotRequest
+from .models import (
+    ContractSpec,
+    HistoricalBarsRequest,
+    MarketDataSnapshotRequest,
+    OptionChainsRequest,
+)
 
 
 class GatewayError(RuntimeError):
@@ -61,6 +66,22 @@ class Position:
 
 
 @dataclass(frozen=True, slots=True)
+class ContractSearchResult:
+    contract: ContractInfo
+    derivative_security_types: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OptionChain:
+    exchange: str
+    underlying_con_id: int
+    trading_class: str
+    multiplier: str
+    expirations: tuple[str, ...]
+    strikes: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class HistoricalBar:
     time: str
     open: float
@@ -86,6 +107,10 @@ class Gateway(Protocol):
     async def positions(self) -> list[Position]: ...
 
     async def contract_details(self, contract: ContractSpec) -> list[ContractInfo]: ...
+
+    async def search_contracts(self, pattern: str) -> list[ContractSearchResult]: ...
+
+    async def option_chains(self, request: OptionChainsRequest) -> list[OptionChain]: ...
 
     async def market_data_snapshot(
         self, request: MarketDataSnapshotRequest

@@ -1,0 +1,100 @@
+# IBKR TWS HTTP
+
+`ibkr-tws-http` exposes a deliberately small, read-only HTTP API backed by a
+local Interactive Brokers TWS or IB Gateway connection. It uses IBKR's official
+Python `ibapi` client directly and does not include any order, cancellation, or
+account-update endpoints.
+
+This service has no authentication or TLS. It binds to `127.0.0.1:8080` by
+default. If you bind it to another interface, every host that can reach it can
+read every resource permitted by the exposure policy.
+
+## Install
+
+Python 3.11 or newer and the official TWS API package are required. Download the
+TWS API from IBKR, then install its Python client alongside this project:
+
+```console
+uv sync --extra dev
+uv pip install /path/to/TWS\ API/source/pythonclient
+```
+
+The PyPI package named `ibapi` is not declared as a dependency because IBKR
+distributes the current official client in its TWS API download.
+
+In TWS, enable socket clients under **Global Configuration > API > Settings**.
+Also enable TWS's **Read-Only API** setting as defense in depth. The default TWS
+port here is the paper-trading TWS port, `7497`.
+
+## Run
+
+No configuration file is required:
+
+```console
+uv run --no-sync ibkr-tws-http
+```
+
+The HTTP listener can be selected on the command line:
+
+```console
+uv run --no-sync ibkr-tws-http --host 127.0.0.1 --port 9080
+```
+
+To apply an exposure policy, start from [`example-config.toml`](example-config.toml):
+
+```console
+uv run --no-sync ibkr-tws-http --config example-config.toml
+uv run --no-sync ibkr-tws-http --config example-config.toml --host 127.0.0.2 --port 9080
+uv run --no-sync ibkr-tws-http --config example-config.toml --check
+```
+
+`--no-sync` preserves the separately installed official `ibapi` package; a
+subsequent `uv sync` removes packages that are not present in the lockfile.
+
+`--host` and `--port` override `[server]` values in the TOML file. The TWS
+socket itself is always restricted to a loopback host.
+
+## API
+
+OpenAPI documentation is served at <http://127.0.0.1:8080/docs>. The endpoints
+are intentionally explicit:
+
+- `GET /healthz`
+- `GET /v1/status`
+- `GET /v1/accounts`
+- `GET /v1/account-summary`
+- `GET /v1/positions`
+- `POST /v1/contracts/details`
+- `POST /v1/market-data/snapshot`
+- `POST /v1/historical-bars`
+
+Examples:
+
+```console
+curl http://127.0.0.1:8080/v1/positions
+
+curl -X POST http://127.0.0.1:8080/v1/market-data/snapshot \
+  -H 'content-type: application/json' \
+  -d '{"contract":{"symbol":"AAPL","sec_type":"STK","exchange":"SMART","currency":"USD"}}'
+
+curl -X POST http://127.0.0.1:8080/v1/historical-bars \
+  -H 'content-type: application/json' \
+  -d '{"contract":{"symbol":"AAPL"},"duration":"1 D","bar_size":"5 mins"}'
+```
+
+The default policy redacts account IDs as `account`. Configure an alias to make
+multiple accounts distinguishable without returning their real IDs. Empty
+symbol and exchange allowlists mean “allow all”; the security-type allowlist is
+enabled by default.
+
+## Read-only boundary
+
+The public app only references the read methods defined by its `Gateway`
+protocol. The official adapter implements market/account requests and their
+matching cancellation calls; it contains no placement, modification, exercise,
+or global-cancel operation. TWS error text is logged locally but replaced with a
+generic HTTP error so it cannot leak account identifiers through responses.
+
+Market-data permissions and pacing rules still apply. Requests time out rather
+than keeping abandoned TWS subscriptions alive, and the adapter reconnects when
+the local TWS session drops.

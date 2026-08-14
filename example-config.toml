@@ -1,0 +1,41 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[tws]
+host = "127.0.0.1"
+port = 7497
+client_id = 37
+connect_timeout_seconds = 3
+request_timeout_seconds = 15
+reconnect_delay_seconds = 5
+
+[exposure]
+features = [
+  "status",
+  "accounts",
+  "account-summary",
+  "positions",
+  "contract-details",
+  "market-data",
+  "historical-data",
+]
+
+# An empty list permits every managed account. Prefer an explicit allowlist.
+allowed_accounts = ["DU1234567"]
+expose_account_ids = false
+account_aliases = { DU1234567 = "paper" }
+
+account_summary_tags = [
+  "AvailableFunds",
+  "BuyingPower",
+  "ExcessLiquidity",
+  "NetLiquidation",
+  "TotalCashValue",
+]
+
+allowed_security_types = ["STK", "OPT", "FUT", "CASH", "IND"]
+
+# Empty symbol and exchange lists permit every value.
+allowed_symbols = []
+allowed_exchanges = []

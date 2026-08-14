@@ -200,12 +200,15 @@ def run_smoke(
             "/v1/market-data/snapshot returned an invalid market data type",
         )
         _expect(
-            any(underlying_snapshot.get(field) is not None for field in ("bid", "ask", "last")),
+            any(
+                underlying_snapshot.get(field) is not None
+                for field in ("bid", "ask", "last", "mark")
+            ),
             f"market snapshot returned no usable price for {symbol}",
         )
         _expect(
-            underlying_snapshot.get("complete") is True,
-            f"market snapshot returned an incomplete result for {symbol}",
+            underlying_snapshot.get("quote_complete") is True,
+            f"market snapshot returned an incomplete quote for {symbol}",
         )
         report(f"Underlying market snapshot succeeded ({underlying_market_data_type})")
 
@@ -279,12 +282,15 @@ def run_smoke(
             "/v1/options/chain-snapshot underlying_snapshot",
         )
         _expect(
-            any(batch_underlying.get(field) is not None for field in ("bid", "ask", "last")),
+            any(
+                batch_underlying.get(field) is not None for field in ("bid", "ask", "last", "mark")
+            ),
             f"batch option snapshot returned no usable underlying price for {symbol}",
         )
         _expect(
-            isinstance(chain_snapshot.get("complete"), bool),
-            "/v1/options/chain-snapshot returned no completeness indicator",
+            isinstance(chain_snapshot.get("quote_complete"), bool)
+            and isinstance(chain_snapshot.get("enrichment_complete"), bool),
+            "/v1/options/chain-snapshot returned invalid completeness indicators",
         )
         quotes = _list(chain_snapshot.get("quotes"), "/v1/options/chain-snapshot quotes")
         priced_quotes = [
@@ -292,7 +298,7 @@ def run_smoke(
             for quote in quotes
             if isinstance(quote, dict)
             and isinstance(quote.get("snapshot"), dict)
-            and any(quote["snapshot"].get(field) is not None for field in ("bid", "ask", "last"))
+            and _snapshot_has_price(quote["snapshot"])
         ]
         _expect(
             priced_quotes,
@@ -340,6 +346,16 @@ def _select_underlying(results: list[Any], symbol: str) -> dict[str, Any]:
     candidates.sort(key=lambda result: preferred_types.get(result["contract"].get("sec_type"), 2))
     _expect(candidates, f"contract search found no optionable underlying for {symbol}")
     return candidates[0]
+
+
+def _snapshot_has_price(snapshot: dict[str, Any]) -> bool:
+    if any(snapshot.get(field) is not None for field in ("bid", "ask", "last", "mark")):
+        return True
+    computations = snapshot.get("option_computations")
+    if not isinstance(computations, dict):
+        return False
+    model = computations.get("model")
+    return isinstance(model, dict) and model.get("option_price") is not None
 
 
 def _object(value: Any, endpoint: str) -> dict[str, Any]:

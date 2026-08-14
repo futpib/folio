@@ -206,12 +206,15 @@ class MarketDataSnapshotResponse(StrictModel):
     contract: ContractSpec
     requested_market_data_type: MarketDataType
     market_data_type: MarketDataType
+    quote_complete: bool
+    enrichment_complete: bool
     complete: bool
     collected_at: datetime
     last_trade_time: datetime | None = None
     bid: float | None = None
     ask: float | None = None
     last: float | None = None
+    mark: float | None = None
     bid_size: float | int | None = None
     ask_size: float | int | None = None
     last_size: float | int | None = None
@@ -250,6 +253,8 @@ class OptionChainSnapshotResponse(StrictModel):
     expiration: str
     exchange: str
     requested_market_data_type: MarketDataType
+    quote_complete: bool
+    enrichment_complete: bool
     complete: bool
     collection_started_at: datetime
     collected_at: datetime

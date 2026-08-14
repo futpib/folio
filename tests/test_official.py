@@ -41,10 +41,13 @@ class FakeTickType:
             8: "VOLUME",
             13: "MODEL_OPTION",
             27: "OPTION_CALL_OPEN_INTEREST",
+            29: "OPTION_CALL_VOLUME",
+            37: "MARK_PRICE",
             45: "LAST_TIMESTAMP",
             66: "DELAYED_BID",
             67: "DELAYED_ASK",
             74: "DELAYED_VOLUME",
+            83: "DELAYED_MODEL_OPTION",
             88: "DELAYED_LAST_TIMESTAMP",
         }.get(value, str(value))
 
@@ -168,6 +171,8 @@ class FakeClient:
         self.wrapper.tickString(request_id, 45, "1786718400")
         if requested.secType == "OPT":
             self.wrapper.tickSize(request_id, 27, 2500)
+            self.wrapper.tickSize(request_id, 29, 125)
+            self.wrapper.tickPrice(request_id, 37, 2.05, None)
             self.wrapper.tickOptionComputation(
                 request_id,
                 13,
@@ -298,6 +303,8 @@ def test_official_callback_bridge_round_trip() -> None:
         )
         assert option_snapshot.fields["option_call_open_interest"] == 2500
         assert option_snapshot.option_computations["model"].delta == 0.55
+        assert option_snapshot.quote_complete is True
+        assert option_snapshot.enrichment_complete is True
         assert option_snapshot.complete is True
         assert FakeClient.instances[-1].market_data_requests[-1] == (
             "OPT",
@@ -319,11 +326,14 @@ def test_official_callback_bridge_round_trip() -> None:
             )
         )
         assert delayed_option_snapshot.market_data_type is MarketDataType.DELAYED
-        assert FakeClient.instances[-1].last_generic_ticks == "101,106,221"
+        assert delayed_option_snapshot.quote_complete is True
+        assert delayed_option_snapshot.enrichment_complete is False
+        assert delayed_option_snapshot.complete is False
+        assert FakeClient.instances[-1].last_generic_ticks == ""
         assert FakeClient.instances[-1].market_data_requests[-1] == (
             "OPT",
-            "101,106,221",
-            False,
+            "",
+            True,
         )
 
         bars = await gateway.historical_bars(
@@ -525,6 +535,54 @@ class PartialSubscriptionClient(FakeClient):
         )
 
 
+class CleanDelayedOptionFallbackClient(FakeClient):
+    live_error_code = 354
+
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        self.last_generic_ticks = generic_ticks
+        self.market_data_requests.append((requested.secType, generic_ticks, snapshot))
+        if self.market_data_type == 1:
+            self.wrapper.error(
+                request_id,
+                self.live_error_code,
+                "Live market data is not available; delayed fallback is required",
+                "",
+            )
+            return
+
+        self.wrapper.error(
+            request_id,
+            2187,
+            "Generic tick data is not available when using delayed market data fallback",
+            "",
+        )
+        self.wrapper.marketDataType(request_id, 3)
+        self.wrapper.tickPrice(request_id, 66, 0.75, None)
+        self.wrapper.tickPrice(request_id, 67, 1.05, None)
+        self.wrapper.tickOptionComputation(
+            request_id,
+            83,
+            0,
+            0.857,
+            0.447,
+            0.9,
+            0.0,
+            0.08,
+            0.02,
+            -0.01,
+            4.8567,
+        )
+        self.wrapper.tickSnapshotEnd(request_id)
+
+
 @pytest.mark.parametrize(
     "client_type",
     [
@@ -560,6 +618,90 @@ def test_auto_market_data_falls_back_to_delayed_quotes(client_type) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("live_error_code", [354, 10091, 10167, 10186, 2186, 2187])
+def test_auto_option_quotes_retry_delayed_without_generic_ticks(live_error_code: int) -> None:
+    async def scenario() -> None:
+        CleanDelayedOptionFallbackClient.instances.clear()
+        CleanDelayedOptionFallbackClient.live_error_code = live_error_code
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.5, request_timeout_seconds=0.5),
+            IbApiBindings(
+                CleanDelayedOptionFallbackClient,
+                FakeWrapper,
+                FakeContract,
+                FakeTickType,
+            ),
+        )
+        await gateway.start()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(
+                    contract=ContractSpec(
+                        symbol="XXI",
+                        sec_type="OPT",
+                        last_trade_date_or_contract_month="20280121",
+                        strike=10,
+                        right="C",
+                    )
+                )
+            )
+            assert snapshot.market_data_type is MarketDataType.DELAYED
+            assert snapshot.quote_complete is True
+            assert snapshot.enrichment_complete is False
+            assert snapshot.complete is False
+            assert snapshot.fields["delayed_bid"] == 0.75
+            assert snapshot.option_computations["model"].delta == 0.447
+            assert snapshot.notices == (
+                TwsNotice(
+                    2187,
+                    "Generic tick data is not available when using delayed market data fallback",
+                ),
+            )
+            client = CleanDelayedOptionFallbackClient.instances[-1]
+            assert client.market_data_requests == [
+                ("OPT", "100,101,106,221", False),
+                ("OPT", "", True),
+            ]
+            assert client.market_data_type_requests == [1, 3]
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+def test_auto_underlying_quote_retries_after_2186() -> None:
+    async def scenario() -> None:
+        CleanDelayedOptionFallbackClient.instances.clear()
+        CleanDelayedOptionFallbackClient.live_error_code = 2186
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.5, request_timeout_seconds=0.5),
+            IbApiBindings(
+                CleanDelayedOptionFallbackClient,
+                FakeWrapper,
+                FakeContract,
+                FakeTickType,
+            ),
+        )
+        await gateway.start()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(contract=ContractSpec(symbol="XXI"))
+            )
+            assert snapshot.market_data_type is MarketDataType.DELAYED
+            assert snapshot.quote_complete is True
+            assert snapshot.enrichment_complete is True
+            assert snapshot.complete is True
+            client = CleanDelayedOptionFallbackClient.instances[-1]
+            assert client.market_data_requests == [
+                ("STK", "", True),
+                ("STK", "", True),
+            ]
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
 class EmptyMarketDataClient(FakeClient):
     def reqMktData(
         self,
@@ -586,19 +728,6 @@ class PartialStreamingMarketDataClient(FakeClient):
         assert requested.secType == "OPT"
         assert snapshot is False
         self.wrapper.tickSize(request_id, 27, 2500)
-        self.wrapper.tickOptionComputation(
-            request_id,
-            13,
-            0,
-            0.75,
-            0.55,
-            2.05,
-            0.0,
-            0.08,
-            0.02,
-            -0.01,
-            5.0,
-        )
 
 
 def test_empty_market_data_is_a_timeout_instead_of_a_clean_snapshot() -> None:
@@ -641,6 +770,8 @@ def test_streaming_market_data_returns_observable_partial_result_at_deadline() -
                     market_data_type=MarketDataType.LIVE,
                 )
             )
+            assert snapshot.quote_complete is False
+            assert snapshot.enrichment_complete is False
             assert snapshot.complete is False
             assert snapshot.fields["option_call_open_interest"] == 2500
             assert snapshot.notices[-1] == TwsNotice(

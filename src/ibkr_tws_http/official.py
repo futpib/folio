@@ -66,7 +66,12 @@ class _Pending:
     future: Future[Any] = field(default_factory=Future)
     items: list[Any] = field(default_factory=list)
     fields: dict[str, float | int | str | None] = field(default_factory=dict)
+    requested_market_data_type: MarketDataType = MarketDataType.LIVE
     market_data_type: MarketDataType = MarketDataType.LIVE
+    auto_fallback: bool = False
+    enrichment_expected: bool = False
+    enrichment_requested: bool = False
+    contract_right: str | None = None
     option_computations: dict[str, OptionComputation] = field(default_factory=dict)
     notices: list[TwsNotice] = field(default_factory=list)
     updated_at: float = field(default_factory=time.monotonic)
@@ -75,7 +80,8 @@ class _Pending:
 class OfficialGateway:
     _INFORMATIONAL_CODES = frozenset({1101, 1102, 2104, 2106, 2107, 2108, 2158})
     _NON_FATAL_REQUEST_CODES = frozenset({10090, 10091, 10167})
-    _AUTO_DELAYED_CODES = frozenset({354, 10089, 10167, 10168, 10197})
+    _AUTO_DELAYED_CODES = frozenset({354, 10089, 10091, 10167, 10168, 10186, 10197, 2186, 2187})
+    _DELAYED_FALLBACK_NOTICES = frozenset({2186, 2187})
     _MARKET_DATA_TYPE_IDS: ClassVar[dict[MarketDataType, int]] = {
         MarketDataType.LIVE: 1,
         MarketDataType.FROZEN: 2,
@@ -262,12 +268,20 @@ class OfficialGateway:
         market_data_type: MarketDataType,
     ) -> MarketDataSnapshot:
         request_id, pending, client = await self._begin_request()
+        pending.requested_market_data_type = market_data_type
         pending.market_data_type = market_data_type
+        pending.auto_fallback = request.market_data_type is MarketDataType.AUTO
+        pending.enrichment_expected = request.contract.sec_type == "OPT"
+        pending.contract_right = request.contract.right
         generic_tick_values = set(request.generic_ticks)
         if request.contract.sec_type == "OPT":
-            generic_tick_values.update({100, 101, 106, 221})
+            if market_data_type in {MarketDataType.LIVE, MarketDataType.FROZEN}:
+                generic_tick_values.update({100, 101, 106, 221})
+            else:
+                generic_tick_values.clear()
         if market_data_type in {MarketDataType.DELAYED, MarketDataType.DELAYED_FROZEN}:
             generic_tick_values &= self._DELAYED_GENERIC_TICKS
+        pending.enrichment_requested = bool(generic_tick_values)
         generic_ticks = ",".join(str(tick) for tick in sorted(generic_tick_values))
         streaming = bool(generic_tick_values)
         market_data_type_id = self._MARKET_DATA_TYPE_IDS[market_data_type]
@@ -383,8 +397,12 @@ class OfficialGateway:
                     raise GatewayUnavailable("TWS market data request was interrupted")
 
                 now = time.monotonic()
-                if self._has_usable_market_price(snapshot) and now - updated_at >= settle_seconds:
-                    return replace(snapshot, complete=True, as_of=datetime.now(UTC))
+                if snapshot.quote_complete and now - updated_at >= settle_seconds:
+                    return replace(
+                        snapshot,
+                        as_of=datetime.now(UTC),
+                        complete=snapshot.quote_complete and snapshot.enrichment_complete,
+                    )
                 if now >= deadline:
                     if self._has_market_data(snapshot):
                         return self._mark_incomplete(
@@ -653,10 +671,26 @@ class OfficialGateway:
             numeric_code = int(code)
         except (TypeError, ValueError):
             numeric_code = -1
+        with self._pending_lock:
+            request = self._pending.get(request_id) if isinstance(request_id, int) else None
+            triggers_auto_fallback = (
+                request is not None
+                and request.auto_fallback
+                and request.requested_market_data_type is MarketDataType.LIVE
+                and numeric_code in self._AUTO_DELAYED_CODES
+            )
+            is_delayed_fallback_notice = (
+                request is not None
+                and request.requested_market_data_type
+                in {MarketDataType.DELAYED, MarketDataType.DELAYED_FROZEN}
+                and numeric_code in self._DELAYED_FALLBACK_NOTICES
+            )
         if numeric_code in self._INFORMATIONAL_CODES:
             logger.info("TWS notice %s: %s", numeric_code, message)
             return
-        if numeric_code in self._NON_FATAL_REQUEST_CODES:
+        if (
+            numeric_code in self._NON_FATAL_REQUEST_CODES and not triggers_auto_fallback
+        ) or is_delayed_fallback_notice:
             logger.info("TWS request notice %s: %s", numeric_code, message)
             if isinstance(request_id, int) and request_id >= 0:
                 with self._client_lock:
@@ -768,12 +802,18 @@ class OfficialGateway:
         if pending is not None:
             self._set_result(pending.future, snapshot)
 
-    @staticmethod
-    def _snapshot(pending: _Pending, *, complete: bool) -> MarketDataSnapshot:
+    def _snapshot(self, pending: _Pending, *, complete: bool) -> MarketDataSnapshot:
+        quote_complete = self._has_usable_market_price_values(
+            pending.fields,
+            pending.option_computations,
+        )
+        enrichment_complete = self._enrichment_complete(pending)
         return MarketDataSnapshot(
             market_data_type=pending.market_data_type,
             as_of=datetime.now(UTC),
-            complete=complete,
+            quote_complete=quote_complete,
+            enrichment_complete=enrichment_complete,
+            complete=complete and quote_complete and enrichment_complete,
             fields=dict(pending.fields),
             option_computations=dict(pending.option_computations),
             notices=tuple(pending.notices),
@@ -891,10 +931,31 @@ class OfficialGateway:
             return None
         return number
 
+    @classmethod
+    def _has_usable_market_price(cls, snapshot: MarketDataSnapshot) -> bool:
+        return cls._has_usable_market_price_values(
+            snapshot.fields,
+            snapshot.option_computations,
+        )
+
     @staticmethod
-    def _has_usable_market_price(snapshot: MarketDataSnapshot) -> bool:
-        for name in ("bid", "ask", "last", "delayed_bid", "delayed_ask", "delayed_last"):
-            value = snapshot.fields.get(name)
+    def _has_usable_market_price_values(
+        fields: dict[str, float | int | str | None],
+        option_computations: dict[str, OptionComputation],
+    ) -> bool:
+        price_names = (
+            "bid",
+            "ask",
+            "last",
+            "delayed_bid",
+            "delayed_ask",
+            "delayed_last",
+            "mark_price",
+            "creditman_mark_price",
+            "creditman_slow_mark_price",
+        )
+        for name in price_names:
+            value = fields.get(name)
             if (
                 isinstance(value, (int, float))
                 and not isinstance(value, bool)
@@ -903,7 +964,40 @@ class OfficialGateway:
                 and value != -1
             ):
                 return True
-        return False
+        model = option_computations.get("model")
+        return model is not None and model.option_price is not None
+
+    @staticmethod
+    def _enrichment_complete(pending: _Pending) -> bool:
+        if not pending.enrichment_expected:
+            return True
+        if not pending.enrichment_requested:
+            return False
+
+        right = pending.contract_right
+        volume_names = ["volume", "option_volume"]
+        open_interest_names = ["open_interest"]
+        if right == "C":
+            volume_names.insert(0, "option_call_volume")
+            open_interest_names.insert(0, "option_call_open_interest")
+        elif right == "P":
+            volume_names.insert(0, "option_put_volume")
+            open_interest_names.insert(0, "option_put_open_interest")
+        has_volume = any(name in pending.fields for name in volume_names)
+        has_open_interest = any(name in pending.fields for name in open_interest_names)
+        has_mark = any(
+            name in pending.fields
+            for name in ("mark_price", "creditman_mark_price", "creditman_slow_mark_price")
+        )
+        has_greeks = any(
+            computation.implied_volatility is not None
+            and computation.delta is not None
+            and computation.gamma is not None
+            and computation.theta is not None
+            and computation.vega is not None
+            for computation in pending.option_computations.values()
+        )
+        return has_volume and has_open_interest and has_mark and has_greeks
 
     @classmethod
     def _has_market_data(cls, snapshot: MarketDataSnapshot) -> bool:

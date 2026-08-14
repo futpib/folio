@@ -147,27 +147,34 @@ delayed feed when TWS reports missing entitlements or returns no usable price,
 then tries delayed-frozen data for a closed market.
 The response identifies both the requested and actual type. `collected_at` is
 the server collection time, while `last_trade_time` is the exchange tick time.
-It also exposes an explicit `complete` flag, bid/ask/last prices and sizes,
-volume, open interest, and bid, ask, last, and model option computations
-containing IV and Greeks. Raw IBKR tick fields remain available under `fields`;
-non-fatal partial-subscription and partial-collection messages are returned under
-`tws_notices` with the same redaction. A wholly empty snapshot is an HTTP 504,
-not a successful response containing null fields.
+`quote_complete` means a bid, ask, last, mark, or model option price was
+received. `enrichment_complete` additionally requires the requested option
+volume, open interest, mark, IV, and Greeks; `complete` requires both. The
+response exposes bid/ask/last/mark prices, sizes, volume, open interest, and bid,
+ask, last, and model option computations containing IV and Greeks. Raw IBKR tick
+fields remain available under `fields`; non-fatal partial-subscription and
+partial-collection messages are returned under `tws_notices` with the same
+redaction. A wholly empty snapshot is an HTTP 504, not a successful response
+containing null fields.
 
 Option quotes use short-lived streaming subscriptions because IBKR rejects
 generic option ticks on one-shot snapshots. The adapter collects the initial
 price, volume, open-interest, IV, and Greek burst, marks deadline-limited partial
-results incomplete, and always cancels the subscription.
+results incomplete, and always cancels the subscription. If live enrichment is
+unavailable, `auto` cancels that request and starts a clean delayed one-shot
+request without generic ticks. Delayed bid/ask/last and default delayed option
+computations can therefore produce `quote_complete: true` while optional
+enrichment remains false.
 
-The batch option endpoint resolves an underlying and expiry, then collects the
-underlying and matching calls and puts together with at most ten active
-requests. `collection_started_at` and `collected_at` bound that collection
-cohort, and the embedded underlying snapshot has its own exchange tick time. A
-request may contain up to 40 option contracts; use `strike_min` and `strike_max`
-to narrow larger chains. Each quote carries either a snapshot or a structured
-per-contract TWS error, including timeouts, so one unavailable strike does not
-discard the rest of the chain. The batch `complete` flag is false when any
-component is partial or unavailable.
+The batch option endpoint resolves an underlying and expiry, then starts the
+underlying and every selected call and put concurrently within one global TWS
+request-timeout window. `collection_started_at` and `collected_at` bound that
+collection cohort, and the embedded underlying snapshot has its own exchange
+tick time. A request may contain up to 40 option contracts; use `strike_min` and
+`strike_max` to narrow larger chains. Each quote carries either a snapshot or a
+structured per-contract TWS error, including the global deadline, so one
+unavailable strike does not discard the rest of the chain. Batch quote,
+enrichment, and aggregate completeness are reported separately.
 
 The default policy redacts account IDs as `account`. Configure an alias to make
 multiple accounts distinguishable without returning their real IDs. Empty

@@ -143,6 +143,8 @@ class TwsNotice:
 class MarketDataSnapshot:
     market_data_type: MarketDataType
     as_of: datetime
+    quote_complete: bool
+    enrichment_complete: bool
     complete: bool
     fields: dict[str, float | int | str | None]
     option_computations: dict[str, OptionComputation]

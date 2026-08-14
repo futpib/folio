@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
 
 from ibkr_tws_http.app import create_app
-from ibkr_tws_http.config import ExposureConfig, ServerConfig, Settings
+from ibkr_tws_http.config import ExposureConfig, ServerConfig, Settings, TwsConfig
 from ibkr_tws_http.gateway import (
     AccountValue,
     ContractInfo,
@@ -136,10 +138,13 @@ class FakeGateway:
                 underlying_price=200.0,
                 present_value_dividend=0.0,
             )
+        enrichment_complete = request.contract.sec_type != "OPT" or not delayed
         return MarketDataSnapshot(
             market_data_type=(MarketDataType.DELAYED if delayed else MarketDataType.LIVE),
             as_of=datetime(2026, 8, 14, 14, 0, tzinfo=UTC),
-            complete=True,
+            quote_complete=True,
+            enrichment_complete=enrichment_complete,
+            complete=enrichment_complete,
             fields={
                 f"{prefix}bid": 199.5,
                 f"{prefix}ask": 199.6,
@@ -266,6 +271,8 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         snapshot = response.json()
         assert snapshot["requested_market_data_type"] == "delayed"
         assert snapshot["market_data_type"] == "delayed"
+        assert snapshot["quote_complete"] is True
+        assert snapshot["enrichment_complete"] is True
         assert snapshot["complete"] is True
         assert snapshot["collected_at"] == "2026-08-14T14:00:00Z"
         assert "as_of" not in snapshot
@@ -288,7 +295,9 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert chain_snapshot["underlying_snapshot"]["last"] == 199.55
         assert chain_snapshot["underlying_error"] is None
         assert chain_snapshot["requested_market_data_type"] == "delayed"
-        assert chain_snapshot["complete"] is True
+        assert chain_snapshot["quote_complete"] is True
+        assert chain_snapshot["enrichment_complete"] is False
+        assert chain_snapshot["complete"] is False
         assert chain_snapshot["collection_started_at"] <= chain_snapshot["collected_at"]
         assert len(chain_snapshot["quotes"]) == 6
         assert chain_snapshot["quotes"][0]["contract"]["strike"] == 195.0
@@ -310,7 +319,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert response.json()[0]["volume"] == "1000"
 
         openapi = client.get("/openapi.json").json()
-        assert openapi["info"]["version"] == "0.4.0"
+        assert openapi["info"]["version"] == "0.5.0"
         assert set(openapi["paths"]) == {
             "/healthz",
             "/v1/status",
@@ -326,7 +335,12 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         }
         assert set(openapi["paths"]["/v1/options/chains"]) == {"get"}
         market_data_schema = openapi["components"]["schemas"]["MarketDataSnapshotResponse"]
-        assert {"complete", "collected_at"} <= set(market_data_schema["properties"])
+        assert {
+            "quote_complete",
+            "enrichment_complete",
+            "complete",
+            "collected_at",
+        } <= set(market_data_schema["properties"])
         assert "as_of" not in market_data_schema["properties"]
         assert (
             openapi["paths"]["/v1/market-data/snapshot"]["post"]["responses"]["504"]["content"][
@@ -430,6 +444,21 @@ class PartialQuoteTimeoutGateway(FakeGateway):
         return await super().market_data_snapshot(request)
 
 
+class HangingQuoteGateway(FakeGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_quotes = 0
+        self.max_active_quotes = 0
+
+    async def market_data_snapshot(self, request):
+        self.active_quotes += 1
+        self.max_active_quotes = max(self.max_active_quotes, self.active_quotes)
+        try:
+            await asyncio.sleep(10)
+        finally:
+            self.active_quotes -= 1
+
+
 def test_batch_snapshot_keeps_per_contract_errors_and_redacts_accounts() -> None:
     with TestClient(create_app(settings(), PartialQuoteErrorGateway())) as client:
         response = client.get(
@@ -458,3 +487,37 @@ def test_batch_snapshot_keeps_per_contract_timeouts() -> None:
     assert response.json()["complete"] is False
     errors = [quote["error"] for quote in response.json()["quotes"] if quote["error"]]
     assert errors == [{"code": None, "message": "TWS market data request timed out"}] * 3
+
+
+def test_batch_snapshot_uses_one_concurrent_collection_deadline() -> None:
+    gateway = HangingQuoteGateway()
+    base_settings = settings()
+    deadline_settings = Settings(
+        server=base_settings.server,
+        tws=TwsConfig(request_timeout_seconds=0.05),
+        exposure=base_settings.exposure,
+    )
+
+    started_at = time.monotonic()
+    with TestClient(create_app(deadline_settings, gateway)) as client:
+        response = client.get(
+            "/v1/options/chain-snapshot",
+            params={"symbol": "AAPL", "expiration": "20260918"},
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["quote_complete"] is False
+    assert payload["enrichment_complete"] is False
+    assert payload["complete"] is False
+    assert payload["underlying_error"] == {
+        "code": None,
+        "message": "batch market data collection deadline reached",
+    }
+    assert {(quote["error"]["code"], quote["error"]["message"]) for quote in payload["quotes"]} == {
+        (None, "batch market data collection deadline reached")
+    }
+    assert gateway.max_active_quotes == 7
+    assert gateway.active_quotes == 0
+    assert elapsed < 1

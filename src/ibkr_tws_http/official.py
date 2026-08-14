@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from datetime import UTC
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, ClassVar
 
 from .config import TwsConfig
 from .gateway import (
@@ -20,13 +21,17 @@ from .gateway import (
     GatewayTimeout,
     GatewayUnavailable,
     HistoricalBar,
+    MarketDataSnapshot,
     OptionChain,
+    OptionComputation,
     Position,
+    TwsNotice,
 )
 from .models import (
     ContractSpec,
     HistoricalBarsRequest,
     MarketDataSnapshotRequest,
+    MarketDataType,
     OptionChainsRequest,
 )
 
@@ -60,10 +65,25 @@ class _Pending:
     future: Future[Any] = field(default_factory=Future)
     items: list[Any] = field(default_factory=list)
     fields: dict[str, float | int | str | None] = field(default_factory=dict)
+    market_data_type: MarketDataType = MarketDataType.LIVE
+    option_computations: dict[str, OptionComputation] = field(default_factory=dict)
+    notices: list[TwsNotice] = field(default_factory=list)
 
 
 class OfficialGateway:
     _INFORMATIONAL_CODES = frozenset({1101, 1102, 2104, 2106, 2107, 2108, 2158})
+    _NON_FATAL_REQUEST_CODES = frozenset({10090, 10091, 10167})
+    _AUTO_DELAYED_CODES = frozenset({354, 10089, 10167, 10197})
+    _MARKET_DATA_TYPE_IDS: ClassVar[dict[MarketDataType, int]] = {
+        MarketDataType.LIVE: 1,
+        MarketDataType.FROZEN: 2,
+        MarketDataType.DELAYED: 3,
+        MarketDataType.DELAYED_FROZEN: 4,
+    }
+    _MARKET_DATA_TYPES_BY_ID: ClassVar[dict[int, MarketDataType]] = {
+        value: key for key, value in _MARKET_DATA_TYPE_IDS.items()
+    }
+    _DELAYED_GENERIC_TICKS = frozenset({101, 106, 165, 221, 232, 236, 258})
 
     def __init__(self, config: TwsConfig, bindings: IbApiBindings | None = None):
         self._config = config
@@ -75,6 +95,7 @@ class OfficialGateway:
         self._server_version: int | None = None
         self._connection_time: str | None = None
         self._client: Any | None = None
+        self._active_market_data_type: MarketDataType | None = None
         self._supervisor: threading.Thread | None = None
         self._request_id = 1
         self._client_lock = threading.RLock()
@@ -189,22 +210,54 @@ class OfficialGateway:
         finally:
             self._discard(request_id, pending)
 
-    async def market_data_snapshot(
-        self, request: MarketDataSnapshotRequest
-    ) -> dict[str, float | int | str | None]:
-        request_id, pending, client = await self._begin_request()
-        generic_ticks = ",".join(str(tick) for tick in request.generic_ticks)
+    async def market_data_snapshot(self, request: MarketDataSnapshotRequest) -> MarketDataSnapshot:
+        if request.market_data_type is not MarketDataType.AUTO:
+            return await self._market_data_snapshot_once(request, request.market_data_type)
+
         try:
-            self._send(
-                client,
-                lambda: client.reqMktData(
+            snapshot = await self._market_data_snapshot_once(request, MarketDataType.LIVE)
+        except GatewayRequestError as exc:
+            if exc.code not in self._AUTO_DELAYED_CODES:
+                raise
+        else:
+            if snapshot.fields or snapshot.option_computations:
+                return snapshot
+        return await self._market_data_snapshot_once(request, MarketDataType.DELAYED)
+
+    async def _market_data_snapshot_once(
+        self,
+        request: MarketDataSnapshotRequest,
+        market_data_type: MarketDataType,
+    ) -> MarketDataSnapshot:
+        request_id, pending, client = await self._begin_request()
+        pending.market_data_type = market_data_type
+        generic_tick_values = set(request.generic_ticks)
+        if request.contract.sec_type == "OPT":
+            generic_tick_values.update({101, 106, 165})
+            if market_data_type in {MarketDataType.LIVE, MarketDataType.FROZEN}:
+                generic_tick_values.update({100, 233})
+        if market_data_type in {MarketDataType.DELAYED, MarketDataType.DELAYED_FROZEN}:
+            generic_tick_values &= self._DELAYED_GENERIC_TICKS
+        generic_ticks = ",".join(str(tick) for tick in sorted(generic_tick_values))
+        market_data_type_id = self._MARKET_DATA_TYPE_IDS[market_data_type]
+        try:
+
+            def request_snapshot() -> None:
+                if self._active_market_data_type is not market_data_type:
+                    client.reqMarketDataType(market_data_type_id)
+                    self._active_market_data_type = market_data_type
+                client.reqMktData(
                     request_id,
                     self._make_contract(request.contract),
                     generic_ticks,
                     True,
                     request.regulatory_snapshot,
                     [],
-                ),
+                )
+
+            self._send(
+                client,
+                request_snapshot,
             )
             return await self._wait(request_id, pending)
         finally:
@@ -312,6 +365,7 @@ class OfficialGateway:
             client = self._new_client()
             with self._client_lock:
                 self._client = client
+                self._active_market_data_type = None
                 self._accounts = []
                 self._accounts_ready.clear()
             try:
@@ -332,6 +386,7 @@ class OfficialGateway:
                 with self._client_lock:
                     if self._client is client:
                         self._client = None
+                        self._active_market_data_type = None
                 self._disconnect(GatewayUnavailable("TWS connection closed"))
             self._stopping.wait(self._config.reconnect_delay_seconds)
 
@@ -434,6 +489,38 @@ class OfficialGateway:
             def tickGeneric(self, reqId: int, tickType: int, value: float) -> None:
                 gateway._set_tick(reqId, tickType, float(value))
 
+            def marketDataType(self, reqId: int, marketDataType: int) -> None:
+                gateway._set_market_data_type(reqId, marketDataType)
+
+            def tickOptionComputation(
+                self,
+                reqId: int,
+                tickType: int,
+                tickAttrib: int,
+                impliedVol: float,
+                delta: float,
+                optPrice: float,
+                pvDividend: float,
+                gamma: float,
+                vega: float,
+                theta: float,
+                undPrice: float,
+            ) -> None:
+                gateway._set_option_computation(
+                    reqId,
+                    tickType,
+                    OptionComputation(
+                        option_price=gateway._optional_number(optPrice, minimum=0),
+                        implied_volatility=gateway._optional_number(impliedVol, minimum=0),
+                        delta=gateway._optional_number(delta, minimum=-1, maximum=1),
+                        gamma=gateway._optional_number(gamma, minimum=0),
+                        theta=gateway._optional_number(theta),
+                        vega=gateway._optional_number(vega, minimum=0),
+                        underlying_price=gateway._optional_number(undPrice, minimum=0),
+                        present_value_dividend=gateway._optional_number(pvDividend, minimum=0),
+                    ),
+                )
+
             def tickSnapshotEnd(self, reqId: int) -> None:
                 gateway._complete_fields(reqId)
 
@@ -496,13 +583,31 @@ class OfficialGateway:
         if numeric_code in self._INFORMATIONAL_CODES:
             logger.info("TWS notice %s: %s", numeric_code, message)
             return
+        if numeric_code in self._NON_FATAL_REQUEST_CODES:
+            logger.info("TWS request notice %s: %s", numeric_code, message)
+            if isinstance(request_id, int) and request_id >= 0:
+                with self._client_lock:
+                    accounts = tuple(self._accounts)
+                public_message = GatewayRequestError(
+                    str(message),
+                    code=numeric_code,
+                    sensitive_values=accounts,
+                ).public_message
+                self._append_notice(request_id, TwsNotice(numeric_code, public_message))
+            return
         logger.warning("TWS error for request %s: %s: %s", request_id, numeric_code, message)
         if numeric_code in {1100, 1300}:
             self._disconnect(GatewayUnavailable("TWS connection lost"))
         if isinstance(request_id, int) and request_id >= 0:
+            with self._client_lock:
+                accounts = tuple(self._accounts)
             self._fail_request(
                 request_id,
-                GatewayRequestError(f"TWS error {numeric_code}: {message}"),
+                GatewayRequestError(
+                    str(message),
+                    code=numeric_code,
+                    sensitive_values=accounts,
+                ),
             )
 
     def _disconnect(self, error: Exception) -> None:
@@ -543,12 +648,60 @@ class OfficialGateway:
             if pending is not None:
                 pending.fields[name] = value
 
+    def _set_market_data_type(self, request_id: int, market_data_type: int) -> None:
+        value = self._MARKET_DATA_TYPES_BY_ID.get(market_data_type)
+        if value is None:
+            logger.warning("unknown TWS market data type %s", market_data_type)
+            return
+        with self._pending_lock:
+            pending = self._pending.get(request_id)
+            if pending is not None:
+                pending.market_data_type = value
+
+    def _set_option_computation(
+        self,
+        request_id: int,
+        tick_type: int,
+        computation: OptionComputation,
+    ) -> None:
+        try:
+            name = str(self._bindings.tick_type.toStr(tick_type)).lower()
+        except Exception:
+            name = str(tick_type)
+        category = next(
+            (value for value in ("bid", "ask", "last", "model") if value in name),
+            None,
+        )
+        if category is None:
+            logger.debug("unknown option computation tick type %s", name)
+            return
+        with self._pending_lock:
+            pending = self._pending.get(request_id)
+            if pending is not None:
+                pending.option_computations[category] = computation
+
+    def _append_notice(self, request_id: int, notice: TwsNotice) -> None:
+        with self._pending_lock:
+            pending = self._pending.get(request_id)
+            if pending is not None:
+                pending.notices.append(notice)
+
     def _complete_fields(self, request_id: int) -> None:
         with self._pending_lock:
             pending = self._pending.get(request_id)
-            fields = dict(pending.fields) if pending is not None else None
+            snapshot = (
+                MarketDataSnapshot(
+                    market_data_type=pending.market_data_type,
+                    as_of=datetime.now(UTC),
+                    fields=dict(pending.fields),
+                    option_computations=dict(pending.option_computations),
+                    notices=tuple(pending.notices),
+                )
+                if pending is not None
+                else None
+            )
         if pending is not None:
-            self._set_result(pending.future, fields)
+            self._set_result(pending.future, snapshot)
 
     def _append_position(self, position: Position) -> None:
         with self._pending_lock:
@@ -601,6 +754,7 @@ class OfficialGateway:
 
     @staticmethod
     def _contract_info(contract: Any, details: Any | None = None) -> ContractInfo:
+        sec_type = str(getattr(contract, "secType", ""))
         primary_exchange = getattr(contract, "primaryExchange", "") or None
         local_symbol = getattr(contract, "localSymbol", "") or None
         trading_class = getattr(contract, "tradingClass", "") or None
@@ -613,7 +767,7 @@ class OfficialGateway:
         return ContractInfo(
             con_id=int(getattr(contract, "conId", 0)),
             symbol=str(getattr(contract, "symbol", "")),
-            sec_type=str(getattr(contract, "secType", "")),
+            sec_type=sec_type,
             exchange=str(getattr(contract, "exchange", "")),
             primary_exchange=primary_exchange,
             currency=str(getattr(contract, "currency", "")),
@@ -621,9 +775,42 @@ class OfficialGateway:
             trading_class=trading_class,
             long_name=long_name,
             min_tick=float(min_tick) if min_tick is not None else None,
+            last_trade_date_or_contract_month=(
+                getattr(contract, "lastTradeDateOrContractMonth", "") or None
+            ),
+            strike=(
+                float(getattr(contract, "strike", 0))
+                if sec_type in {"OPT", "FOP"} and getattr(contract, "strike", None) is not None
+                else None
+            ),
+            right=(getattr(contract, "right", "") or None) if sec_type in {"OPT", "FOP"} else None,
+            multiplier=(
+                getattr(contract, "multiplier", "") or None
+                if sec_type in {"OPT", "FOP", "FUT"}
+                else None
+            ),
         )
 
     @staticmethod
     def _number(value: Any) -> float | int:
         number = float(value)
         return int(number) if number.is_integer() else number
+
+    @staticmethod
+    def _optional_number(
+        value: Any,
+        *,
+        minimum: float | None = None,
+        maximum: float | None = None,
+    ) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or abs(number) > 1e100:
+            return None
+        if minimum is not None and number < minimum:
+            return None
+        if maximum is not None and number > maximum:
+            return None
+        return number

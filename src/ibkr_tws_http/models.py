@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -9,6 +10,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class MarketDataType(StrEnum):
+    AUTO = "auto"
+    LIVE = "live"
+    FROZEN = "frozen"
+    DELAYED = "delayed"
+    DELAYED_FROZEN = "delayed-frozen"
 
 
 class ContractSpec(StrictModel):
@@ -44,6 +53,7 @@ class ContractSpec(StrictModel):
 
 class MarketDataSnapshotRequest(StrictModel):
     contract: ContractSpec
+    market_data_type: MarketDataType = MarketDataType.AUTO
     generic_ticks: list[int] = Field(default_factory=list, max_length=32)
     regulatory_snapshot: bool = False
 
@@ -63,6 +73,32 @@ class OptionChainsRequest(StrictModel):
     @classmethod
     def uppercase_identifiers(cls, value: Any) -> Any:
         return value.upper() if isinstance(value, str) else value
+
+
+class OptionChainSnapshotRequest(StrictModel):
+    symbol: str = Field(min_length=1, max_length=32)
+    expiration: str = Field(pattern=r"^\d{8}$")
+    exchange: str = Field(default="SMART", min_length=1, max_length=32)
+    currency: str = Field(default="USD", min_length=3, max_length=8)
+    market_data_type: MarketDataType = MarketDataType.AUTO
+    strike_min: float | None = Field(default=None, ge=0)
+    strike_max: float | None = Field(default=None, ge=0)
+    max_contracts: int = Field(default=40, ge=1, le=40)
+
+    @field_validator("symbol", "exchange", "currency", mode="before")
+    @classmethod
+    def uppercase_identifiers(cls, value: Any) -> Any:
+        return value.upper() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def validate_strike_range(self) -> OptionChainSnapshotRequest:
+        if (
+            self.strike_min is not None
+            and self.strike_max is not None
+            and self.strike_min > self.strike_max
+        ):
+            raise ValueError("strike_min must not exceed strike_max")
+        return self
 
 
 class HistoricalBarsRequest(StrictModel):
@@ -116,6 +152,10 @@ class ContractResponse(StrictModel):
     trading_class: str | None = None
     long_name: str | None = None
     min_tick: float | None = None
+    last_trade_date_or_contract_month: str | None = None
+    strike: float | None = None
+    right: Literal["C", "P"] | None = None
+    multiplier: str | None = None
 
 
 class ContractSearchResponse(StrictModel):
@@ -139,9 +179,72 @@ class PositionResponse(StrictModel):
     average_cost: float
 
 
+class OptionComputationResponse(StrictModel):
+    option_price: float | None = None
+    implied_volatility: float | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+    underlying_price: float | None = None
+    present_value_dividend: float | None = None
+
+
+class OptionComputationsResponse(StrictModel):
+    bid: OptionComputationResponse | None = None
+    ask: OptionComputationResponse | None = None
+    last: OptionComputationResponse | None = None
+    model: OptionComputationResponse | None = None
+
+
+class TwsErrorDetailResponse(StrictModel):
+    code: int | None = None
+    message: str
+
+
 class MarketDataSnapshotResponse(StrictModel):
     contract: ContractSpec
+    requested_market_data_type: MarketDataType
+    market_data_type: MarketDataType
+    as_of: datetime
+    last_trade_time: datetime | None = None
+    bid: float | None = None
+    ask: float | None = None
+    last: float | None = None
+    bid_size: float | int | None = None
+    ask_size: float | int | None = None
+    last_size: float | int | None = None
+    volume: float | int | None = None
+    open_interest: float | int | None = None
+    option_computations: OptionComputationsResponse | None = None
+    tws_notices: list[TwsErrorDetailResponse] = Field(default_factory=list)
     fields: dict[str, float | int | str | None]
+
+
+class TwsErrorResponse(StrictModel):
+    detail: Literal["TWS rejected the request"] = "TWS rejected the request"
+    tws_error: TwsErrorDetailResponse
+
+
+class OptionChainQuoteResponse(StrictModel):
+    contract: ContractResponse
+    snapshot: MarketDataSnapshotResponse | None = None
+    error: TwsErrorDetailResponse | None = None
+
+    @model_validator(mode="after")
+    def require_snapshot_or_error(self) -> OptionChainQuoteResponse:
+        if (self.snapshot is None) == (self.error is None):
+            raise ValueError("exactly one of snapshot or error is required")
+        return self
+
+
+class OptionChainSnapshotResponse(StrictModel):
+    underlying: ContractResponse
+    expiration: str
+    exchange: str
+    requested_market_data_type: MarketDataType
+    as_of: datetime
+    quotes: list[OptionChainQuoteResponse]
 
 
 class HistoricalBarResponse(StrictModel):

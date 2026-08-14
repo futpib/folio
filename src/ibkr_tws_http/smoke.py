@@ -70,12 +70,17 @@ class SmokeResult:
     chain_count: int
     expiration_count: int
     strike_count: int
+    quoted_contract_count: int | None = None
 
 
 def run_smoke(
     client: ApiClient,
     symbol: str,
     report: Callable[[str], None] = lambda message: None,
+    *,
+    check_market_data: bool = False,
+    expiration: str | None = None,
+    market_data_type: str = "auto",
 ) -> SmokeResult:
     symbol = symbol.upper()
 
@@ -169,6 +174,60 @@ def run_smoke(
         f"{len(expirations)} expirations, {len(strikes)} strikes)"
     )
 
+    quoted_contract_count = None
+    if check_market_data:
+        smart_chains = [chain for chain in valid_chains if chain.get("exchange") == "SMART"]
+        _expect(smart_chains, f"no SMART option chain was returned for {symbol}")
+        selected_expiration = expiration or min(
+            value for chain in smart_chains for value in chain["expirations"]
+        )
+        matching_chains = [
+            chain for chain in smart_chains if selected_expiration in chain["expirations"]
+        ]
+        _expect(
+            matching_chains,
+            f"SMART option chain has no expiration {selected_expiration}",
+        )
+        selected_strikes = sorted(
+            {strike for chain in matching_chains for strike in chain["strikes"]}
+        )
+        _expect(selected_strikes, "SMART option chain returned no strikes")
+        middle = len(selected_strikes) // 2
+        selected_strikes = selected_strikes[max(0, middle - 1) : middle + 2]
+        quote_query = urlencode(
+            {
+                "symbol": symbol,
+                "expiration": selected_expiration,
+                "exchange": "SMART",
+                "market_data_type": market_data_type,
+                "strike_min": selected_strikes[0],
+                "strike_max": selected_strikes[-1],
+                "max_contracts": len(selected_strikes) * 2,
+            }
+        )
+        chain_snapshot = _object(
+            client.get(f"/v1/options/chain-snapshot?{quote_query}"),
+            "/v1/options/chain-snapshot",
+        )
+        quotes = _list(chain_snapshot.get("quotes"), "/v1/options/chain-snapshot quotes")
+        priced_quotes = [
+            quote
+            for quote in quotes
+            if isinstance(quote, dict)
+            and isinstance(quote.get("snapshot"), dict)
+            and any(quote["snapshot"].get(field) is not None for field in ("bid", "ask", "last"))
+        ]
+        _expect(
+            priced_quotes,
+            f"batch option snapshot returned no usable prices for {symbol} {selected_expiration}",
+        )
+        quoted_contract_count = len(priced_quotes)
+        report(
+            f"Batch option snapshot succeeded "
+            f"({len(priced_quotes)}/{len(quotes)} contracts priced, "
+            f"requested {market_data_type})"
+        )
+
     return SmokeResult(
         server_version=server_version,
         account_count=len(accounts),
@@ -178,6 +237,7 @@ def run_smoke(
         chain_count=len(valid_chains),
         expiration_count=len(expirations),
         strike_count=len(strikes),
+        quoted_contract_count=quoted_contract_count,
     )
 
 
@@ -249,6 +309,21 @@ def _parser() -> argparse.ArgumentParser:
         default=30.0,
         help="timeout for each HTTP request in seconds (default: %(default)s)",
     )
+    parser.add_argument(
+        "--check-market-data",
+        action="store_true",
+        help="also require usable prices from a small batch option snapshot",
+    )
+    parser.add_argument(
+        "--expiration",
+        help="YYYYMMDD option expiration for --check-market-data (default: nearest SMART expiry)",
+    )
+    parser.add_argument(
+        "--market-data-type",
+        choices=("auto", "live", "frozen", "delayed", "delayed-frozen"),
+        default="auto",
+        help="quote type for --check-market-data (default: %(default)s)",
+    )
     return parser
 
 
@@ -257,7 +332,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.timeout <= 0:
         _parser().error("--timeout must be greater than zero")
     try:
-        run_smoke(UrlLibApiClient(args.base_url, args.timeout), args.symbol, print)
+        run_smoke(
+            UrlLibApiClient(args.base_url, args.timeout),
+            args.symbol,
+            print,
+            check_market_data=args.check_market_data,
+            expiration=args.expiration,
+            market_data_type=args.market_data_type,
+        )
     except SmokeFailure as exc:
         print(f"smoke test failed: {exc}", file=sys.stderr)
         return 1

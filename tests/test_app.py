@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
@@ -13,9 +14,12 @@ from ibkr_tws_http.gateway import (
     GatewayRequestError,
     GatewayStatus,
     HistoricalBar,
+    MarketDataSnapshot,
     OptionChain,
+    OptionComputation,
     Position,
 )
+from ibkr_tws_http.models import MarketDataType
 
 
 def contract(symbol: str = "AAPL", sec_type: str = "STK") -> ContractInfo:
@@ -30,6 +34,23 @@ def contract(symbol: str = "AAPL", sec_type: str = "STK") -> ContractInfo:
         trading_class="NMS",
         long_name="Apple Inc.",
         min_tick=0.01,
+    )
+
+
+def option_contract(strike: float, right: str) -> ContractInfo:
+    return ContractInfo(
+        con_id=829_402_000 + int(strike * 10) + (1 if right == "C" else 2),
+        symbol="AAPL",
+        sec_type="OPT",
+        exchange="SMART",
+        primary_exchange=None,
+        currency="USD",
+        local_symbol=f"AAPL  260918{right}{int(strike * 1000):08d}",
+        trading_class="AAPL",
+        last_trade_date_or_contract_month="20260918",
+        strike=strike,
+        right=right,
+        multiplier="100",
     )
 
 
@@ -68,6 +89,12 @@ class FakeGateway:
 
     async def contract_details(self, requested):
         self.last_contract = requested
+        if requested.sec_type == "OPT":
+            return [
+                option_contract(strike, right)
+                for strike in (195.0, 200.0, 205.0)
+                for right in ("C", "P")
+            ]
         return [contract(), contract("MSFT")]
 
     async def search_contracts(self, pattern: str) -> list[ContractSearchResult]:
@@ -90,7 +117,37 @@ class FakeGateway:
 
     async def market_data_snapshot(self, request):
         self.last_contract = request.contract
-        return {"bid": 199.5, "ask": 199.6, "bid_size": 100}
+        delayed = request.market_data_type is MarketDataType.DELAYED
+        prefix = "delayed_" if delayed else ""
+        computations = {}
+        if request.contract.sec_type == "OPT":
+            computations["model"] = OptionComputation(
+                option_price=2.05,
+                implied_volatility=0.75,
+                delta=0.55 if request.contract.right == "C" else -0.45,
+                gamma=0.08,
+                theta=-0.01,
+                vega=0.02,
+                underlying_price=200.0,
+                present_value_dividend=0.0,
+            )
+        return MarketDataSnapshot(
+            market_data_type=(MarketDataType.DELAYED if delayed else MarketDataType.LIVE),
+            as_of=datetime(2026, 8, 14, 14, 0, tzinfo=UTC),
+            fields={
+                f"{prefix}bid": 199.5,
+                f"{prefix}ask": 199.6,
+                f"{prefix}last": 199.55,
+                f"{prefix}bid_size": 100,
+                f"{prefix}ask_size": 120,
+                f"{prefix}last_size": 5,
+                f"{prefix}volume": 1000,
+                f"{prefix}last_timestamp": "1786714800",
+                "option_call_open_interest": 2500,
+                "option_put_open_interest": 1250,
+            },
+            option_computations=computations,
+        )
 
     async def historical_bars(self, request):
         self.last_contract = request.contract
@@ -170,6 +227,10 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
                     "trading_class": "NMS",
                     "long_name": "Apple Inc.",
                     "min_tick": 0.01,
+                    "last_trade_date_or_contract_month": None,
+                    "strike": None,
+                    "right": None,
+                    "multiplier": None,
                 },
                 "derivative_security_types": ["OPT"],
             }
@@ -193,10 +254,39 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
 
         response = client.post(
             "/v1/market-data/snapshot",
-            json={"contract": {"symbol": "aapl"}},
+            json={"contract": {"symbol": "aapl"}, "market_data_type": "delayed"},
         )
         assert response.status_code == 200
-        assert response.json()["fields"]["bid"] == 199.5
+        snapshot = response.json()
+        assert snapshot["requested_market_data_type"] == "delayed"
+        assert snapshot["market_data_type"] == "delayed"
+        assert snapshot["bid"] == 199.5
+        assert snapshot["ask_size"] == 120
+        assert snapshot["volume"] == 1000
+        assert snapshot["last_trade_time"] == "2026-08-14T13:40:00Z"
+
+        response = client.get(
+            "/v1/options/chain-snapshot",
+            params={
+                "symbol": "aapl",
+                "expiration": "20260918",
+                "market_data_type": "delayed",
+            },
+        )
+        assert response.status_code == 200
+        chain_snapshot = response.json()
+        assert chain_snapshot["underlying"]["con_id"] == 265598
+        assert chain_snapshot["requested_market_data_type"] == "delayed"
+        assert len(chain_snapshot["quotes"]) == 6
+        assert chain_snapshot["quotes"][0]["contract"]["strike"] == 195.0
+        assert (
+            chain_snapshot["quotes"][0]["snapshot"]["option_computations"]["model"][
+                "implied_volatility"
+            ]
+            == 0.75
+        )
+        assert chain_snapshot["quotes"][0]["snapshot"]["open_interest"] == 2500
+        assert chain_snapshot["quotes"][1]["snapshot"]["open_interest"] == 1250
 
         response = client.post(
             "/v1/historical-bars",
@@ -215,6 +305,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "/v1/contracts/details",
             "/v1/contracts/search",
             "/v1/options/chains",
+            "/v1/options/chain-snapshot",
             "/v1/market-data/snapshot",
             "/v1/historical-bars",
         }
@@ -266,12 +357,57 @@ def test_option_chains_require_option_security_type() -> None:
 
 class ErrorGateway(FakeGateway):
     async def positions(self) -> list[Position]:
-        raise GatewayRequestError("account DU111 is invalid")
+        raise GatewayRequestError("account DU111 is invalid", code=354)
+
+    async def market_data_snapshot(self, request):
+        raise GatewayRequestError("No market data for DU111", code=354)
 
 
 def test_upstream_error_details_are_not_returned() -> None:
     with TestClient(create_app(settings(), ErrorGateway())) as client:
         response = client.get("/v1/positions")
     assert response.status_code == 502
-    assert response.json() == {"detail": "TWS rejected the request"}
+    assert response.json() == {
+        "detail": "TWS rejected the request",
+        "tws_error": {"code": 354, "message": "account [redacted account] is invalid"},
+    }
+    assert "DU111" not in response.text
+
+    with TestClient(create_app(settings(), ErrorGateway())) as client:
+        response = client.post(
+            "/v1/market-data/snapshot",
+            json={"contract": {"symbol": "AAPL"}},
+        )
+        openapi = client.get("/openapi.json").json()
+    assert response.status_code == 502
+    assert response.json()["tws_error"] == {
+        "code": 354,
+        "message": "No market data for [redacted account]",
+    }
+    assert (
+        openapi["paths"]["/v1/market-data/snapshot"]["post"]["responses"]["502"]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        == "#/components/schemas/TwsErrorResponse"
+    )
+
+
+class PartialQuoteErrorGateway(FakeGateway):
+    async def market_data_snapshot(self, request):
+        if request.contract.right == "P":
+            raise GatewayRequestError("No market data for DU111", code=354)
+        return await super().market_data_snapshot(request)
+
+
+def test_batch_snapshot_keeps_per_contract_errors_and_redacts_accounts() -> None:
+    with TestClient(create_app(settings(), PartialQuoteErrorGateway())) as client:
+        response = client.get(
+            "/v1/options/chain-snapshot",
+            params={"symbol": "AAPL", "expiration": "20260918"},
+        )
+    assert response.status_code == 200
+    quotes = response.json()["quotes"]
+    assert len([quote for quote in quotes if quote["snapshot"] is not None]) == 3
+    errors = [quote["error"] for quote in quotes if quote["error"] is not None]
+    assert errors == [{"code": 354, "message": "No market data for [redacted account]"}] * 3
     assert "DU111" not in response.text

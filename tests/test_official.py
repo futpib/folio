@@ -8,11 +8,12 @@ from typing import ClassVar
 import pytest
 
 from ibkr_tws_http.config import TwsConfig
-from ibkr_tws_http.gateway import GatewayRequestError
+from ibkr_tws_http.gateway import GatewayRequestError, TwsNotice
 from ibkr_tws_http.models import (
     ContractSpec,
     HistoricalBarsRequest,
     MarketDataSnapshotRequest,
+    MarketDataType,
     OptionChainsRequest,
 )
 from ibkr_tws_http.official import IbApiBindings, OfficialGateway, load_ibapi
@@ -30,7 +31,22 @@ class FakeContract:
 class FakeTickType:
     @staticmethod
     def toStr(value: int) -> str:
-        return {1: "BID", 2: "ASK", 0: "BID_SIZE"}.get(value, str(value))
+        return {
+            0: "BID_SIZE",
+            1: "BID",
+            2: "ASK",
+            3: "ASK_SIZE",
+            4: "LAST",
+            5: "LAST_SIZE",
+            8: "VOLUME",
+            13: "MODEL_OPTION",
+            27: "OPTION_CALL_OPEN_INTEREST",
+            45: "LAST_TIMESTAMP",
+            66: "DELAYED_BID",
+            67: "DELAYED_ASK",
+            74: "DELAYED_VOLUME",
+            88: "DELAYED_LAST_TIMESTAMP",
+        }.get(value, str(value))
 
 
 def apple_contract() -> FakeContract:
@@ -55,6 +71,9 @@ class FakeClient:
         self.finished = threading.Event()
         self.cancelled: list[tuple[str, int | None]] = []
         self.last_historical_end = None
+        self.market_data_type = 1
+        self.market_data_type_requests: list[int] = []
+        self.last_generic_ticks = ""
         type(self).instances.append(self)
 
     def connect(self, host: str, port: int, clientId: int) -> bool:
@@ -89,7 +108,17 @@ class FakeClient:
         self.cancelled.append(("positions", None))
 
     def reqContractDetails(self, request_id: int, requested: FakeContract) -> None:
-        details = SimpleNamespace(contract=apple_contract(), longName="Apple Inc.", minTick=0.01)
+        resolved = apple_contract()
+        if requested.secType == "OPT":
+            resolved.conId = 829402031
+            resolved.secType = "OPT"
+            resolved.lastTradeDateOrContractMonth = requested.lastTradeDateOrContractMonth
+            resolved.strike = requested.strike
+            resolved.right = requested.right
+            resolved.multiplier = "100"
+            resolved.localSymbol = "AAPL  260918C00200000"
+            resolved.tradingClass = "AAPL"
+        details = SimpleNamespace(contract=resolved, longName="Apple Inc.", minTick=0.01)
         self.wrapper.contractDetails(request_id, details)
         self.wrapper.contractDetailsEnd(request_id)
 
@@ -125,10 +154,36 @@ class FakeClient:
         regulatory_snapshot: bool,
         options: list[object],
     ) -> None:
+        self.last_generic_ticks = generic_ticks
+        self.wrapper.marketDataType(request_id, self.market_data_type)
         self.wrapper.tickPrice(request_id, 1, 199.5, None)
         self.wrapper.tickPrice(request_id, 2, 199.6, None)
         self.wrapper.tickSize(request_id, 0, 100)
+        self.wrapper.tickSize(request_id, 3, 120)
+        self.wrapper.tickPrice(request_id, 4, 199.55, None)
+        self.wrapper.tickSize(request_id, 5, 5)
+        self.wrapper.tickSize(request_id, 8, 1000)
+        self.wrapper.tickString(request_id, 45, "1786718400")
+        if requested.secType == "OPT":
+            self.wrapper.tickSize(request_id, 27, 2500)
+            self.wrapper.tickOptionComputation(
+                request_id,
+                13,
+                0,
+                0.75,
+                0.55,
+                2.05,
+                0.0,
+                0.08,
+                0.02,
+                -0.01,
+                5.0,
+            )
         self.wrapper.tickSnapshotEnd(request_id)
+
+    def reqMarketDataType(self, market_data_type: int) -> None:
+        self.market_data_type = market_data_type
+        self.market_data_type_requests.append(market_data_type)
 
     def cancelMktData(self, request_id: int) -> None:
         self.cancelled.append(("market-data", request_id))
@@ -194,6 +249,20 @@ def test_official_callback_bridge_round_trip() -> None:
         details = await gateway.contract_details(ContractSpec(symbol="AAPL"))
         assert details[0].long_name == "Apple Inc."
 
+        option_details = await gateway.contract_details(
+            ContractSpec(
+                symbol="AAPL",
+                sec_type="OPT",
+                last_trade_date_or_contract_month="20260918",
+                strike=200,
+                right="C",
+            )
+        )
+        assert option_details[0].last_trade_date_or_contract_month == "20260918"
+        assert option_details[0].strike == 200
+        assert option_details[0].right == "C"
+        assert option_details[0].multiplier == "100"
+
         search = await gateway.search_contracts("apple")
         assert search[0].contract.symbol == "AAPL"
         assert search[0].contract.long_name == "Apple Inc."
@@ -209,7 +278,39 @@ def test_official_callback_bridge_round_trip() -> None:
         snapshot = await gateway.market_data_snapshot(
             MarketDataSnapshotRequest(contract=ContractSpec(symbol="AAPL"))
         )
-        assert snapshot == {"bid": 199.5, "ask": 199.6, "bid_size": 100}
+        assert snapshot.market_data_type is MarketDataType.LIVE
+        assert snapshot.fields["bid"] == 199.5
+        assert snapshot.fields["ask_size"] == 120
+
+        option_snapshot = await gateway.market_data_snapshot(
+            MarketDataSnapshotRequest(
+                contract=ContractSpec(
+                    symbol="AAPL",
+                    sec_type="OPT",
+                    last_trade_date_or_contract_month="20260918",
+                    strike=200,
+                    right="C",
+                )
+            )
+        )
+        assert option_snapshot.fields["option_call_open_interest"] == 2500
+        assert option_snapshot.option_computations["model"].delta == 0.55
+
+        delayed_option_snapshot = await gateway.market_data_snapshot(
+            MarketDataSnapshotRequest(
+                contract=ContractSpec(
+                    symbol="AAPL",
+                    sec_type="OPT",
+                    last_trade_date_or_contract_month="20260918",
+                    strike=200,
+                    right="C",
+                ),
+                market_data_type=MarketDataType.DELAYED,
+                generic_ticks=[100, 101, 233],
+            )
+        )
+        assert delayed_option_snapshot.market_data_type is MarketDataType.DELAYED
+        assert FakeClient.instances[-1].last_generic_ticks == "101,106,165"
 
         bars = await gateway.historical_bars(
             HistoricalBarsRequest(
@@ -252,9 +353,167 @@ def test_both_official_error_callback_signatures_fail_request(client_type) -> No
         await gateway.start()
         try:
             await gateway.accounts()
-            with pytest.raises(GatewayRequestError):
+            with pytest.raises(GatewayRequestError) as raised:
                 await gateway.contract_details(ContractSpec(symbol="AAPL"))
+            assert raised.value.code in {200, 201}
+            assert raised.value.public_message.endswith("callback error")
             assert gateway._pending == {}
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+class DelayedFallbackClient(FakeClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        if self.market_data_type == 1:
+            self.wrapper.error(request_id, 354, "Not subscribed to requested market data", "")
+            return
+        self.wrapper.marketDataType(request_id, 3)
+        self.wrapper.tickPrice(request_id, 66, 198.5, None)
+        self.wrapper.tickPrice(request_id, 67, 198.7, None)
+        self.wrapper.tickSize(request_id, 74, 900)
+        self.wrapper.tickString(request_id, 88, "1786714800")
+        self.wrapper.tickSnapshotEnd(request_id)
+
+
+class EmptyLiveFallbackClient(DelayedFallbackClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        if self.market_data_type == 1:
+            self.wrapper.tickSnapshotEnd(request_id)
+            return
+        super().reqMktData(
+            request_id,
+            requested,
+            generic_ticks,
+            snapshot,
+            regulatory_snapshot,
+            options,
+        )
+
+
+class ApiSubscriptionFallbackClient(DelayedFallbackClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        if self.market_data_type == 1:
+            self.wrapper.error(
+                request_id,
+                10089,
+                "Requested market data requires additional subscription for API",
+                "",
+            )
+            return
+        super().reqMktData(
+            request_id,
+            requested,
+            generic_ticks,
+            snapshot,
+            regulatory_snapshot,
+            options,
+        )
+
+
+class PartialSubscriptionClient(FakeClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        self.wrapper.error(
+            request_id,
+            10090,
+            "Part of requested market data for DU111 is not subscribed",
+            "",
+        )
+        super().reqMktData(
+            request_id,
+            requested,
+            generic_ticks,
+            snapshot,
+            regulatory_snapshot,
+            options,
+        )
+
+
+@pytest.mark.parametrize(
+    "client_type",
+    [DelayedFallbackClient, ApiSubscriptionFallbackClient, EmptyLiveFallbackClient],
+)
+def test_auto_market_data_falls_back_to_delayed_quotes(client_type) -> None:
+    async def scenario() -> None:
+        client_type.instances.clear()
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.5, request_timeout_seconds=0.5),
+            IbApiBindings(client_type, FakeWrapper, FakeContract, FakeTickType),
+        )
+        await gateway.start()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(contract=ContractSpec(symbol="AAPL"))
+            )
+            assert snapshot.market_data_type is MarketDataType.DELAYED
+            assert snapshot.fields == {
+                "delayed_bid": 198.5,
+                "delayed_ask": 198.7,
+                "delayed_volume": 900,
+                "delayed_last_timestamp": "1786714800",
+            }
+            assert client_type.instances[-1].market_data_type_requests == [1, 3]
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+def test_partial_market_data_notice_keeps_ticks_and_is_redacted() -> None:
+    async def scenario() -> None:
+        PartialSubscriptionClient.instances.clear()
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.5, request_timeout_seconds=0.5),
+            IbApiBindings(PartialSubscriptionClient, FakeWrapper, FakeContract, FakeTickType),
+        )
+        await gateway.start()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(
+                    contract=ContractSpec(symbol="AAPL"),
+                    market_data_type=MarketDataType.LIVE,
+                )
+            )
+            assert snapshot.fields["bid"] == 199.5
+            assert snapshot.notices == (
+                TwsNotice(
+                    10090,
+                    "Part of requested market data for [redacted account] is not subscribed",
+                ),
+            )
         finally:
             await gateway.stop()
 

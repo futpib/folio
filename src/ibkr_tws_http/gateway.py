@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
@@ -8,6 +10,7 @@ from .models import (
     ContractSpec,
     HistoricalBarsRequest,
     MarketDataSnapshotRequest,
+    MarketDataType,
     OptionChainsRequest,
 )
 
@@ -26,6 +29,27 @@ class GatewayTimeout(GatewayError):
 
 class GatewayRequestError(GatewayError):
     """TWS rejected or failed a request."""
+
+    def __init__(
+        self,
+        message: str,
+        code: int | None = None,
+        sensitive_values: tuple[str, ...] = (),
+    ):
+        super().__init__(message)
+        self.code = code
+        self.public_message = redact_tws_error(message, sensitive_values)
+
+
+_ACCOUNT_ID = re.compile(r"(?<![A-Z0-9])(?:DU|DF|FA|F|U)\d{3,}(?![A-Z0-9])", re.IGNORECASE)
+
+
+def redact_tws_error(message: str, sensitive_values: tuple[str, ...] = ()) -> str:
+    redacted = message
+    for value in sensitive_values:
+        if value:
+            redacted = redacted.replace(value, "[redacted account]")
+    return _ACCOUNT_ID.sub("[redacted account]", redacted)[:500]
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +79,10 @@ class ContractInfo:
     trading_class: str | None
     long_name: str | None = None
     min_tick: float | None = None
+    last_trade_date_or_contract_month: str | None = None
+    strike: float | None = None
+    right: str | None = None
+    multiplier: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +121,33 @@ class HistoricalBar:
     trade_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class OptionComputation:
+    option_price: float | None
+    implied_volatility: float | None
+    delta: float | None
+    gamma: float | None
+    theta: float | None
+    vega: float | None
+    underlying_price: float | None
+    present_value_dividend: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class TwsNotice:
+    code: int
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class MarketDataSnapshot:
+    market_data_type: MarketDataType
+    as_of: datetime
+    fields: dict[str, float | int | str | None]
+    option_computations: dict[str, OptionComputation]
+    notices: tuple[TwsNotice, ...] = ()
+
+
 class Gateway(Protocol):
     async def start(self) -> None: ...
 
@@ -114,6 +169,6 @@ class Gateway(Protocol):
 
     async def market_data_snapshot(
         self, request: MarketDataSnapshotRequest
-    ) -> dict[str, float | int | str | None]: ...
+    ) -> MarketDataSnapshot: ...
 
     async def historical_bars(self, request: HistoricalBarsRequest) -> list[HistoricalBar]: ...

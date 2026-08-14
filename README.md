@@ -78,9 +78,15 @@ uv run ibkr-tws-http-smoke --base-url http://127.0.0.1:9080 --symbol SPY
 
 The smoke test verifies the HTTP health response, TWS connection, exposed
 accounts, positions, contract search and details, and a non-empty option chain.
-It prints account and position counts but no account identifiers. It deliberately
-does not request quotes or historical bars, which can require market-data
-subscriptions in an otherwise healthy TWS session.
+It prints account and position counts but no account identifiers. To also verify
+real option prices using live data with an automatic delayed-data fallback:
+
+```console
+uv run ibkr-tws-http-smoke --symbol XXI --check-market-data --expiration 20280121
+```
+
+Use `--market-data-type delayed-frozen` for the last available delayed quotes
+when the market is closed.
 
 ## API
 
@@ -95,6 +101,7 @@ are intentionally explicit:
 - `GET /v1/contracts/search?pattern=AAPL`
 - `POST /v1/contracts/details`
 - `GET /v1/options/chains`
+- `GET /v1/options/chain-snapshot`
 - `POST /v1/market-data/snapshot`
 - `POST /v1/historical-bars`
 
@@ -107,13 +114,15 @@ curl 'http://127.0.0.1:8080/v1/contracts/search?pattern=apple'
 
 curl 'http://127.0.0.1:8080/v1/options/chains?underlying_symbol=AAPL&underlying_con_id=265598'
 
+curl 'http://127.0.0.1:8080/v1/options/chain-snapshot?symbol=XXI&expiration=20280121&market_data_type=auto'
+
 curl -X POST http://127.0.0.1:8080/v1/contracts/details \
   -H 'content-type: application/json' \
   -d '{"symbol":"AAPL","sec_type":"OPT","last_trade_date_or_contract_month":"20260918","strike":200,"right":"C"}'
 
 curl -X POST http://127.0.0.1:8080/v1/market-data/snapshot \
   -H 'content-type: application/json' \
-  -d '{"contract":{"symbol":"AAPL","sec_type":"STK","exchange":"SMART","currency":"USD"}}'
+  -d '{"contract":{"symbol":"AAPL","sec_type":"STK"},"market_data_type":"auto"}'
 
 curl -X POST http://127.0.0.1:8080/v1/historical-bars \
   -H 'content-type: application/json' \
@@ -126,6 +135,21 @@ contract details to resolve a selected expiry/strike/right into a specific
 option contract. Supplying an empty `exchange` (the default) returns chains
 from all applicable exchanges.
 
+Market snapshots accept `auto`, `live`, `frozen`, `delayed`, or
+`delayed-frozen`. `auto` first requests live data and retries with IBKR's free
+delayed feed when TWS reports missing entitlements or returns an empty snapshot.
+The response identifies both the requested and actual type and exposes `as_of`,
+last-trade time, bid/ask/last prices and sizes, volume, open interest, and bid,
+ask, last, and model option computations containing IV and Greeks. Raw IBKR tick
+fields remain available under `fields`; non-fatal partial-subscription messages
+are returned under `tws_notices` with the same redaction.
+
+The batch option endpoint resolves an underlying and expiry, then snapshots the
+matching calls and puts with at most ten active requests. A request may contain
+up to 40 contracts; use `strike_min` and `strike_max` to narrow larger chains.
+Each quote carries either a snapshot or a structured per-contract TWS error, so
+one unavailable quote does not discard the rest of the chain.
+
 The default policy redacts account IDs as `account`. Configure an alias to make
 multiple accounts distinguishable without returning their real IDs. Empty
 symbol and exchange allowlists mean “allow all”; the security-type allowlist is
@@ -136,8 +160,8 @@ enabled by default.
 The public app only references the read methods defined by its `Gateway`
 protocol. The official adapter implements market/account requests and their
 matching cancellation calls; it contains no placement, modification, exercise,
-or global-cancel operation. TWS error text is logged locally but replaced with a
-generic HTTP error so it cannot leak account identifiers through responses.
+or global-cancel operation. Rejected requests return the exact TWS error code and
+a length-limited message with IBKR account identifiers redacted.
 
 Market-data permissions and pacing rules still apply. Requests time out rather
 than keeping abandoned TWS subscriptions alive, and the adapter reconnects when

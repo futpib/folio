@@ -74,6 +74,20 @@ class FakeClient:
             "&underlying_security_type=STK&exchange="
         ):
             return self.chains
+        if path == (
+            "/v1/options/chain-snapshot?symbol=AAPL&expiration=20260918&exchange=SMART"
+            "&market_data_type=delayed&strike_min=195.0&strike_max=205.0&max_contracts=6"
+        ):
+            return {
+                "quotes": [
+                    {"contract": {"right": "C"}, "snapshot": {"bid": 1.95, "ask": 2.1}},
+                    {
+                        "contract": {"right": "P"},
+                        "snapshot": None,
+                        "error": {"code": 354, "message": "not subscribed"},
+                    },
+                ]
+            }
         raise AssertionError(f"unexpected GET {path}")
 
     def post(self, path: str, payload: Mapping[str, Any]) -> Any:
@@ -136,3 +150,22 @@ def test_smoke_requires_a_non_empty_option_chain() -> None:
 
     with pytest.raises(SmokeFailure, match="no non-empty option chain"):
         run_smoke(client, "AAPL")
+
+
+def test_smoke_can_require_a_real_batch_option_price() -> None:
+    client = FakeClient()
+    messages: list[str] = []
+
+    result = run_smoke(
+        client,
+        "AAPL",
+        messages.append,
+        check_market_data=True,
+        expiration="20260918",
+        market_data_type="delayed",
+    )
+
+    assert result.quoted_contract_count == 1
+    assert (
+        messages[-1] == "Batch option snapshot succeeded (1/2 contracts priced, requested delayed)"
+    )

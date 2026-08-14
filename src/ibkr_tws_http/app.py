@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import asyncio
+import math
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
@@ -16,6 +19,8 @@ from .gateway import (
     GatewayRequestError,
     GatewayTimeout,
     GatewayUnavailable,
+    MarketDataSnapshot,
+    OptionComputation,
 )
 from .models import (
     AccountResponse,
@@ -27,10 +32,18 @@ from .models import (
     HistoricalBarsRequest,
     MarketDataSnapshotRequest,
     MarketDataSnapshotResponse,
+    MarketDataType,
+    OptionChainQuoteResponse,
     OptionChainResponse,
+    OptionChainSnapshotRequest,
+    OptionChainSnapshotResponse,
     OptionChainsRequest,
+    OptionComputationResponse,
+    OptionComputationsResponse,
     PositionResponse,
     StatusResponse,
+    TwsErrorDetailResponse,
+    TwsErrorResponse,
 )
 from .official import OfficialGateway
 from .policy import ExposurePolicy, PolicyDenied
@@ -48,7 +61,140 @@ def _contract_response(contract: ContractInfo) -> ContractResponse:
         trading_class=contract.trading_class,
         long_name=contract.long_name,
         min_tick=contract.min_tick,
+        last_trade_date_or_contract_month=contract.last_trade_date_or_contract_month,
+        strike=contract.strike,
+        right=contract.right,
+        multiplier=contract.multiplier,
     )
+
+
+def _contract_spec(contract: ContractInfo) -> ContractSpec:
+    return ContractSpec(
+        con_id=contract.con_id,
+        symbol=contract.symbol,
+        sec_type=contract.sec_type,
+        exchange=contract.exchange or "SMART",
+        primary_exchange=contract.primary_exchange,
+        currency=contract.currency or "USD",
+        last_trade_date_or_contract_month=contract.last_trade_date_or_contract_month,
+        strike=contract.strike,
+        right=contract.right,
+        multiplier=contract.multiplier,
+        local_symbol=contract.local_symbol,
+        trading_class=contract.trading_class,
+    )
+
+
+def _available_number(
+    fields: dict[str, float | int | str | None],
+    names: Iterable[str],
+    *,
+    nonnegative: bool = False,
+) -> float | int | None:
+    for name in names:
+        value = fields.get(name)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and abs(value) < 1e100
+            and (not nonnegative or value >= 0)
+        ):
+            return value
+    return None
+
+
+def _last_trade_time(fields: dict[str, float | int | str | None]) -> datetime | None:
+    value = fields.get("last_timestamp") or fields.get("delayed_last_timestamp")
+    milliseconds = False
+    if value is None:
+        value = fields.get("last_reg_time")
+        milliseconds = value is not None
+    if value is None:
+        rt_volume = fields.get("rt_volume")
+        if isinstance(rt_volume, str):
+            parts = rt_volume.split(";")
+            if len(parts) >= 3:
+                value = parts[2]
+                milliseconds = True
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if milliseconds or timestamp > 10_000_000_000:
+        timestamp /= 1000
+    try:
+        return datetime.fromtimestamp(timestamp, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _option_computation(value: OptionComputation | None) -> OptionComputationResponse | None:
+    if value is None:
+        return None
+    return OptionComputationResponse(
+        option_price=value.option_price,
+        implied_volatility=value.implied_volatility,
+        delta=value.delta,
+        gamma=value.gamma,
+        theta=value.theta,
+        vega=value.vega,
+        underlying_price=value.underlying_price,
+        present_value_dividend=value.present_value_dividend,
+    )
+
+
+def _market_data_response(
+    contract: ContractSpec,
+    requested_type: MarketDataType,
+    snapshot: MarketDataSnapshot,
+) -> MarketDataSnapshotResponse:
+    fields = snapshot.fields
+    right = contract.right
+    volume_names = ["volume", "delayed_volume"]
+    open_interest_names = ["open_interest", "futures_open_interest"]
+    if right == "C":
+        volume_names.insert(0, "option_call_volume")
+        open_interest_names.insert(0, "option_call_open_interest")
+    elif right == "P":
+        volume_names.insert(0, "option_put_volume")
+        open_interest_names.insert(0, "option_put_open_interest")
+    computations = OptionComputationsResponse(
+        bid=_option_computation(snapshot.option_computations.get("bid")),
+        ask=_option_computation(snapshot.option_computations.get("ask")),
+        last=_option_computation(snapshot.option_computations.get("last")),
+        model=_option_computation(snapshot.option_computations.get("model")),
+    )
+    if not any((computations.bid, computations.ask, computations.last, computations.model)):
+        computations = None
+    return MarketDataSnapshotResponse(
+        contract=contract,
+        requested_market_data_type=requested_type,
+        market_data_type=snapshot.market_data_type,
+        as_of=snapshot.as_of,
+        last_trade_time=_last_trade_time(fields),
+        bid=_available_number(fields, ("bid", "delayed_bid")),
+        ask=_available_number(fields, ("ask", "delayed_ask")),
+        last=_available_number(fields, ("last", "delayed_last")),
+        bid_size=_available_number(fields, ("bid_size", "delayed_bid_size"), nonnegative=True),
+        ask_size=_available_number(fields, ("ask_size", "delayed_ask_size"), nonnegative=True),
+        last_size=_available_number(fields, ("last_size", "delayed_last_size"), nonnegative=True),
+        volume=_available_number(fields, volume_names, nonnegative=True),
+        open_interest=_available_number(fields, open_interest_names, nonnegative=True),
+        option_computations=computations,
+        tws_notices=[
+            TwsErrorDetailResponse(code=notice.code, message=notice.message)
+            for notice in snapshot.notices
+        ],
+        fields=fields,
+    )
+
+
+def _tws_error(error: GatewayRequestError) -> TwsErrorDetailResponse:
+    return TwsErrorDetailResponse(code=error.code, message=error.public_message)
+
+
+TWS_ERROR_RESPONSES = {502: {"model": TwsErrorResponse}}
 
 
 def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
@@ -87,7 +233,10 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
 
     @app.exception_handler(GatewayRequestError)
     async def request_error(request: Request, exc: GatewayRequestError) -> JSONResponse:
-        return JSONResponse(status_code=502, content={"detail": "TWS rejected the request"})
+        return JSONResponse(
+            status_code=502,
+            content=TwsErrorResponse(tws_error=_tws_error(exc)).model_dump(mode="json"),
+        )
 
     @app.exception_handler(GatewayError)
     async def gateway_error(request: Request, exc: GatewayError) -> JSONResponse:
@@ -181,12 +330,146 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             for value in values
         ]
 
-    @app.post("/v1/market-data/snapshot", response_model=MarketDataSnapshotResponse)
+    @app.post(
+        "/v1/market-data/snapshot",
+        response_model=MarketDataSnapshotResponse,
+        responses=TWS_ERROR_RESPONSES,
+    )
     async def market_data(request: MarketDataSnapshotRequest) -> MarketDataSnapshotResponse:
         policy.require_feature("market-data")
         policy.check_contract(request.contract)
-        fields = await active_gateway.market_data_snapshot(request)
-        return MarketDataSnapshotResponse(contract=request.contract, fields=fields)
+        snapshot = await active_gateway.market_data_snapshot(request)
+        return _market_data_response(request.contract, request.market_data_type, snapshot)
+
+    @app.get(
+        "/v1/options/chain-snapshot",
+        response_model=OptionChainSnapshotResponse,
+        responses=TWS_ERROR_RESPONSES,
+    )
+    async def option_chain_snapshot(
+        request: Annotated[OptionChainSnapshotRequest, Query()],
+    ) -> OptionChainSnapshotResponse:
+        policy.require_feature("option-chains")
+        policy.require_feature("market-data")
+        search = policy.filter_contract_search(
+            await active_gateway.search_contracts(request.symbol)
+        )
+        underlyings = [
+            value.contract
+            for value in search
+            if value.contract.symbol == request.symbol
+            and value.contract.sec_type in {"STK", "IND"}
+            and "OPT" in value.derivative_security_types
+        ]
+        underlyings.sort(key=lambda value: 0 if value.sec_type == "STK" else 1)
+        if not underlyings:
+            raise HTTPException(status_code=404, detail="optionable underlying was not found")
+        underlying = underlyings[0]
+
+        chain_request = OptionChainsRequest(
+            underlying_symbol=underlying.symbol,
+            underlying_con_id=underlying.con_id,
+            underlying_security_type=underlying.sec_type,
+            exchange=request.exchange,
+        )
+        policy.check_option_chain(chain_request)
+        chains = policy.filter_option_chains(await active_gateway.option_chains(chain_request))
+        matching_chains = [
+            chain
+            for chain in chains
+            if chain.exchange == request.exchange and request.expiration in chain.expirations
+        ]
+        if not matching_chains:
+            raise HTTPException(
+                status_code=404,
+                detail="option chain was not found for the requested expiration and exchange",
+            )
+        strikes = sorted(
+            {
+                strike
+                for chain in matching_chains
+                for strike in chain.strikes
+                if (request.strike_min is None or strike >= request.strike_min)
+                and (request.strike_max is None or strike <= request.strike_max)
+            }
+        )
+        expected_contracts = len(strikes) * 2
+        if expected_contracts > request.max_contracts:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"option chain contains {expected_contracts} contracts; narrow strike_min "
+                    f"and strike_max or raise max_contracts up to 40"
+                ),
+            )
+
+        option_spec = ContractSpec(
+            symbol=request.symbol,
+            sec_type="OPT",
+            exchange=request.exchange,
+            currency=request.currency,
+            last_trade_date_or_contract_month=request.expiration,
+        )
+        policy.check_contract(option_spec)
+        details = policy.filter_contracts(await active_gateway.contract_details(option_spec))
+        strike_set = set(strikes)
+        contracts = [
+            contract
+            for contract in details
+            if contract.symbol == request.symbol
+            and contract.sec_type == "OPT"
+            and contract.last_trade_date_or_contract_month is not None
+            and contract.last_trade_date_or_contract_month.startswith(request.expiration)
+            and contract.strike in strike_set
+            and contract.right in {"C", "P"}
+        ]
+        contracts.sort(key=lambda value: (value.strike or 0, value.right or ""))
+        if not contracts:
+            raise HTTPException(status_code=404, detail="no option contracts were resolved")
+
+        if len(contracts) > request.max_contracts:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"option chain resolved to {len(contracts)} contracts; narrow strike_min "
+                    f"and strike_max or raise max_contracts up to 40"
+                ),
+            )
+
+        semaphore = asyncio.Semaphore(10)
+
+        async def quote(contract: ContractInfo) -> OptionChainQuoteResponse:
+            contract_spec = _contract_spec(contract)
+            snapshot_request = MarketDataSnapshotRequest(
+                contract=contract_spec,
+                market_data_type=request.market_data_type,
+            )
+            try:
+                async with semaphore:
+                    snapshot = await active_gateway.market_data_snapshot(snapshot_request)
+            except GatewayRequestError as exc:
+                return OptionChainQuoteResponse(
+                    contract=_contract_response(contract),
+                    error=_tws_error(exc),
+                )
+            return OptionChainQuoteResponse(
+                contract=_contract_response(contract),
+                snapshot=_market_data_response(
+                    contract_spec,
+                    request.market_data_type,
+                    snapshot,
+                ),
+            )
+
+        quotes = await asyncio.gather(*(quote(contract) for contract in contracts))
+        return OptionChainSnapshotResponse(
+            underlying=_contract_response(underlying),
+            expiration=request.expiration,
+            exchange=request.exchange,
+            requested_market_data_type=request.market_data_type,
+            as_of=datetime.now(UTC),
+            quotes=quotes,
+        )
 
     @app.post("/v1/historical-bars", response_model=list[HistoricalBarResponse])
     async def historical_bars(request: HistoricalBarsRequest) -> list[HistoricalBarResponse]:

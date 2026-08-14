@@ -62,6 +62,26 @@ uv run ibkr-tws-http --config example-config.toml --check
 `--host`, `--port`, and `--tws-port` override their TOML values. The TWS socket
 itself is always restricted to a loopback host.
 
+## Live smoke test
+
+With the service running and connected to a real TWS or IB Gateway session, run:
+
+```console
+uv run ibkr-tws-http-smoke
+```
+
+Use a different HTTP port or optionable underlying when needed:
+
+```console
+uv run ibkr-tws-http-smoke --base-url http://127.0.0.1:9080 --symbol SPY
+```
+
+The smoke test verifies the HTTP health response, TWS connection, exposed
+accounts, positions, contract search and details, and a non-empty option chain.
+It prints account and position counts but no account identifiers. It deliberately
+does not request quotes or historical bars, which can require market-data
+subscriptions in an otherwise healthy TWS session.
+
 ## API
 
 OpenAPI documentation is served at <http://127.0.0.1:8080/docs>. The endpoints

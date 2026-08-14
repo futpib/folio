@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 ibkr-tws-http = "ibkr_tws_http.main:main"
+ibkr-tws-http-smoke = "ibkr_tws_http.smoke:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ibkr_tws_http"]

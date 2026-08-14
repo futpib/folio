@@ -20,6 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, help="TOML configuration file")
     parser.add_argument("--host", help="HTTP bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, help="HTTP bind port (default: 8080)")
+    parser.add_argument("--tws-port", type=int, help="TWS socket port (default: 7496)")
     parser.add_argument(
         "--check",
         action="store_true",
@@ -40,7 +41,11 @@ def load_settings(args: argparse.Namespace) -> Settings:
         host=args.host if args.host is not None else settings.server.host,
         port=args.port if args.port is not None else settings.server.port,
     )
-    settings = replace(settings, server=server)
+    tws = replace(
+        settings.tws,
+        port=args.tws_port if args.tws_port is not None else settings.tws.port,
+    )
+    settings = replace(settings, server=server, tws=tws)
     settings.validate()
     return settings
 

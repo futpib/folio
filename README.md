@@ -28,7 +28,7 @@ the only difference is version-string formatting (`10.49.02` instead of
 
 In TWS, enable socket clients under **Global Configuration > API > Settings**.
 Also enable TWS's **Read-Only API** setting as defense in depth. The default TWS
-port here is the paper-trading TWS port, `7497`.
+port here is the live-trading TWS port, `7496`.
 
 ## Run
 
@@ -44,6 +44,13 @@ The HTTP listener can be selected on the command line:
 uv run ibkr-tws-http --host 127.0.0.1 --port 9080
 ```
 
+The upstream TWS socket defaults to the live-trading port `7496` and can be
+overridden independently:
+
+```console
+uv run ibkr-tws-http --tws-port 7497
+```
+
 To apply an exposure policy, start from [`example-config.toml`](example-config.toml):
 
 ```console
@@ -52,8 +59,8 @@ uv run ibkr-tws-http --config example-config.toml --host 127.0.0.2 --port 9080
 uv run ibkr-tws-http --config example-config.toml --check
 ```
 
-`--host` and `--port` override `[server]` values in the TOML file. The TWS
-socket itself is always restricted to a loopback host.
+`--host`, `--port`, and `--tws-port` override their TOML values. The TWS socket
+itself is always restricted to a loopback host.
 
 ## API
 

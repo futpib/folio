@@ -93,7 +93,7 @@ class ServerConfig:
 @dataclass(frozen=True, slots=True)
 class TwsConfig:
     host: str = "127.0.0.1"
-    port: int = 7497
+    port: int = 7496
     client_id: int = 37
     connect_timeout_seconds: float = 10.0
     request_timeout_seconds: float = 15.0
@@ -182,7 +182,7 @@ class Settings:
             ),
             tws=TwsConfig(
                 host=str(tws_raw.get("host", "127.0.0.1")),
-                port=int(tws_raw.get("port", 7497)),
+                port=int(tws_raw.get("port", 7496)),
                 client_id=int(tws_raw.get("client_id", 37)),
                 connect_timeout_seconds=float(tws_raw.get("connect_timeout_seconds", 10)),
                 request_timeout_seconds=float(tws_raw.get("request_timeout_seconds", 15)),

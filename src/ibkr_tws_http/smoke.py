@@ -139,16 +139,16 @@ def run_smoke(
     )
     report("Contract details request succeeded")
 
+    chain_query = urlencode(
+        {
+            "underlying_symbol": symbol,
+            "underlying_con_id": con_id,
+            "underlying_security_type": sec_type,
+            "exchange": "",
+        }
+    )
     chains = _list(
-        client.post(
-            "/v1/options/chains",
-            {
-                "underlying_symbol": symbol,
-                "underlying_con_id": con_id,
-                "underlying_security_type": sec_type,
-                "exchange": "",
-            },
-        ),
+        client.get(f"/v1/options/chains?{chain_query}"),
         "/v1/options/chains",
     )
     valid_chains = [

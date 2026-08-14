@@ -162,8 +162,10 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             for value in values
         ]
 
-    @app.post("/v1/options/chains", response_model=list[OptionChainResponse])
-    async def option_chains(request: OptionChainsRequest) -> list[OptionChainResponse]:
+    @app.get("/v1/options/chains", response_model=list[OptionChainResponse])
+    async def option_chains(
+        request: Annotated[OptionChainsRequest, Query()],
+    ) -> list[OptionChainResponse]:
         policy.require_feature("option-chains")
         policy.check_option_chain(request)
         values = policy.filter_option_chains(await active_gateway.option_chains(request))

@@ -175,9 +175,9 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             }
         ]
 
-        response = client.post(
+        response = client.get(
             "/v1/options/chains",
-            json={"underlying_symbol": "aapl", "underlying_con_id": 265598},
+            params={"underlying_symbol": "aapl", "underlying_con_id": 265598},
         )
         assert response.status_code == 200
         assert response.json() == [
@@ -218,6 +218,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "/v1/market-data/snapshot",
             "/v1/historical-bars",
         }
+        assert set(openapi["paths"]["/v1/options/chains"]) == {"get"}
         assert "securitySchemes" not in openapi["components"]
     assert not gateway.started
 
@@ -231,9 +232,9 @@ def test_rejects_out_of_policy_and_naive_historical_time() -> None:
         assert denied.status_code == 403
         assert denied.json() == {"detail": "symbol is not allowed"}
 
-        denied_chain = client.post(
+        denied_chain = client.get(
             "/v1/options/chains",
-            json={"underlying_symbol": "MSFT", "underlying_con_id": 272093},
+            params={"underlying_symbol": "MSFT", "underlying_con_id": 272093},
         )
         assert denied_chain.status_code == 403
         assert denied_chain.json() == {"detail": "symbol is not allowed"}
@@ -255,9 +256,9 @@ def test_disabled_feature_is_not_exposed() -> None:
 def test_option_chains_require_option_security_type() -> None:
     restricted = settings(allowed_security_types=frozenset({"STK"}))
     with TestClient(create_app(restricted, FakeGateway())) as client:
-        response = client.post(
+        response = client.get(
             "/v1/options/chains",
-            json={"underlying_symbol": "AAPL", "underlying_con_id": 265598},
+            params={"underlying_symbol": "AAPL", "underlying_con_id": 265598},
         )
     assert response.status_code == 403
     assert response.json() == {"detail": "security type 'OPT' is not allowed"}

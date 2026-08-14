@@ -94,7 +94,7 @@ are intentionally explicit:
 - `GET /v1/positions`
 - `GET /v1/contracts/search?pattern=AAPL`
 - `POST /v1/contracts/details`
-- `POST /v1/options/chains`
+- `GET /v1/options/chains`
 - `POST /v1/market-data/snapshot`
 - `POST /v1/historical-bars`
 
@@ -105,9 +105,7 @@ curl http://127.0.0.1:8080/v1/positions
 
 curl 'http://127.0.0.1:8080/v1/contracts/search?pattern=apple'
 
-curl -X POST http://127.0.0.1:8080/v1/options/chains \
-  -H 'content-type: application/json' \
-  -d '{"underlying_symbol":"AAPL","underlying_con_id":265598}'
+curl 'http://127.0.0.1:8080/v1/options/chains?underlying_symbol=AAPL&underlying_con_id=265598'
 
 curl -X POST http://127.0.0.1:8080/v1/contracts/details \
   -H 'content-type: application/json' \

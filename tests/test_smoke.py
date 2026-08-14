@@ -69,14 +69,17 @@ class FakeClient:
                     "derivative_security_types": ["OPT"],
                 },
             ]
+        if path == (
+            "/v1/options/chains?underlying_symbol=AAPL&underlying_con_id=265598"
+            "&underlying_security_type=STK&exchange="
+        ):
+            return self.chains
         raise AssertionError(f"unexpected GET {path}")
 
     def post(self, path: str, payload: Mapping[str, Any]) -> Any:
         self.requests.append(("POST", path, payload))
         if path == "/v1/contracts/details":
             return [{"con_id": 265598, "symbol": "AAPL", "sec_type": "STK"}]
-        if path == "/v1/options/chains":
-            return self.chains
         raise AssertionError(f"unexpected POST {path}")
 
 
@@ -108,12 +111,12 @@ def test_smoke_exercises_live_read_only_flow_without_exposing_account_ids() -> N
             "primary_exchange": "NASDAQ",
         },
     )
-    assert client.requests[-1][2] == {
-        "underlying_symbol": "AAPL",
-        "underlying_con_id": 265598,
-        "underlying_security_type": "STK",
-        "exchange": "",
-    }
+    assert client.requests[-1] == (
+        "GET",
+        "/v1/options/chains?underlying_symbol=AAPL&underlying_con_id=265598"
+        "&underlying_security_type=STK&exchange=",
+        None,
+    )
 
 
 def test_smoke_fails_before_tws_requests_when_disconnected() -> None:

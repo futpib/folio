@@ -283,7 +283,7 @@ class OfficialGateway:
             generic_tick_values &= self._DELAYED_GENERIC_TICKS
         pending.enrichment_requested = bool(generic_tick_values)
         generic_ticks = ",".join(str(tick) for tick in sorted(generic_tick_values))
-        streaming = bool(generic_tick_values)
+        streaming = not request.regulatory_snapshot
         market_data_type_id = self._MARKET_DATA_TYPE_IDS[market_data_type]
         try:
 
@@ -397,11 +397,17 @@ class OfficialGateway:
                     raise GatewayUnavailable("TWS market data request was interrupted")
 
                 now = time.monotonic()
-                if snapshot.quote_complete and now - updated_at >= settle_seconds:
+                if (
+                    snapshot.market_quote_complete or snapshot.model_complete
+                ) and now - updated_at >= settle_seconds:
                     return replace(
                         snapshot,
                         as_of=datetime.now(UTC),
-                        complete=snapshot.quote_complete and snapshot.enrichment_complete,
+                        complete=(
+                            snapshot.market_quote_complete
+                            and snapshot.model_complete
+                            and snapshot.enrichment_complete
+                        ),
                     )
                 if now >= deadline:
                     if self._has_market_data(snapshot):
@@ -803,17 +809,21 @@ class OfficialGateway:
             self._set_result(pending.future, snapshot)
 
     def _snapshot(self, pending: _Pending, *, complete: bool) -> MarketDataSnapshot:
-        quote_complete = self._has_usable_market_price_values(
+        market_quote_complete = self._market_quote_complete(
             pending.fields,
             pending.option_computations,
         )
+        model_complete = self._model_complete(pending)
         enrichment_complete = self._enrichment_complete(pending)
         return MarketDataSnapshot(
             market_data_type=pending.market_data_type,
             as_of=datetime.now(UTC),
-            quote_complete=quote_complete,
+            market_quote_complete=market_quote_complete,
+            model_complete=model_complete,
             enrichment_complete=enrichment_complete,
-            complete=complete and quote_complete and enrichment_complete,
+            complete=(
+                complete and market_quote_complete and model_complete and enrichment_complete
+            ),
             fields=dict(pending.fields),
             option_computations=dict(pending.option_computations),
             notices=tuple(pending.notices),
@@ -938,34 +948,69 @@ class OfficialGateway:
             snapshot.option_computations,
         )
 
-    @staticmethod
+    @classmethod
     def _has_usable_market_price_values(
+        cls,
         fields: dict[str, float | int | str | None],
         option_computations: dict[str, OptionComputation],
     ) -> bool:
-        price_names = (
-            "bid",
-            "ask",
-            "last",
-            "delayed_bid",
-            "delayed_ask",
-            "delayed_last",
+        if cls._market_quote_complete(fields, option_computations):
+            return True
+        for name in (
             "mark_price",
             "creditman_mark_price",
             "creditman_slow_mark_price",
-        )
-        for name in price_names:
+        ):
             value = fields.get(name)
-            if (
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and math.isfinite(value)
-                and abs(value) < 1e100
-                and value != -1
-            ):
+            if cls._usable_price(value):
                 return True
         model = option_computations.get("model")
-        return model is not None and model.option_price is not None
+        return model is not None and cls._usable_price(model.option_price)
+
+    @classmethod
+    def _market_quote_complete(
+        cls,
+        fields: dict[str, float | int | str | None],
+        option_computations: dict[str, OptionComputation],
+    ) -> bool:
+        for name in ("bid", "ask", "last", "delayed_bid", "delayed_ask", "delayed_last"):
+            if cls._usable_price(fields.get(name)):
+                return True
+        return any(
+            computation is not None and cls._usable_price(computation.option_price)
+            for computation in (
+                option_computations.get("bid"),
+                option_computations.get("ask"),
+                option_computations.get("last"),
+            )
+        )
+
+    @staticmethod
+    def _usable_price(value: Any) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and abs(value) < 1e100
+            and value != -1
+        )
+
+    @staticmethod
+    def _model_complete(pending: _Pending) -> bool:
+        if not pending.enrichment_expected:
+            return True
+        model = pending.option_computations.get("model")
+        return model is not None and all(
+            value is not None
+            for value in (
+                model.option_price,
+                model.implied_volatility,
+                model.delta,
+                model.gamma,
+                model.theta,
+                model.vega,
+            )
+        )
 
     @staticmethod
     def _enrichment_complete(pending: _Pending) -> bool:
@@ -989,15 +1034,7 @@ class OfficialGateway:
             name in pending.fields
             for name in ("mark_price", "creditman_mark_price", "creditman_slow_mark_price")
         )
-        has_greeks = any(
-            computation.implied_volatility is not None
-            and computation.delta is not None
-            and computation.gamma is not None
-            and computation.theta is not None
-            and computation.vega is not None
-            for computation in pending.option_computations.values()
-        )
-        return has_volume and has_open_interest and has_mark and has_greeks
+        return has_volume and has_open_interest and has_mark
 
     @classmethod
     def _has_market_data(cls, snapshot: MarketDataSnapshot) -> bool:

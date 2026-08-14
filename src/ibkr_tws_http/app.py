@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from statistics import median
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -146,6 +148,25 @@ def _option_computation(value: OptionComputation | None) -> OptionComputationRes
     )
 
 
+def _option_side_price(
+    fields: dict[str, float | int | str | None],
+    names: Iterable[str],
+    computation: OptionComputation | None,
+) -> float | int | None:
+    value = _available_number(fields, names)
+    if value is not None or computation is None:
+        return value
+    option_price = computation.option_price
+    if (
+        option_price is None
+        or not math.isfinite(option_price)
+        or abs(option_price) > 1e100
+        or option_price == -1
+    ):
+        return None
+    return option_price
+
+
 def _market_data_response(
     contract: ContractSpec,
     requested_type: MarketDataType,
@@ -173,14 +194,28 @@ def _market_data_response(
         contract=contract,
         requested_market_data_type=requested_type,
         market_data_type=snapshot.market_data_type,
-        quote_complete=snapshot.quote_complete,
+        market_quote_complete=snapshot.market_quote_complete,
+        quote_complete=snapshot.market_quote_complete,
+        model_complete=(snapshot.model_complete if contract.sec_type == "OPT" else None),
         enrichment_complete=snapshot.enrichment_complete,
         complete=snapshot.complete,
         collected_at=snapshot.as_of,
         last_trade_time=_last_trade_time(fields),
-        bid=_available_number(fields, ("bid", "delayed_bid")),
-        ask=_available_number(fields, ("ask", "delayed_ask")),
-        last=_available_number(fields, ("last", "delayed_last")),
+        bid=_option_side_price(
+            fields,
+            ("bid", "delayed_bid"),
+            snapshot.option_computations.get("bid"),
+        ),
+        ask=_option_side_price(
+            fields,
+            ("ask", "delayed_ask"),
+            snapshot.option_computations.get("ask"),
+        ),
+        last=_option_side_price(
+            fields,
+            ("last", "delayed_last"),
+            snapshot.option_computations.get("last"),
+        ),
         mark=_available_number(
             fields,
             ("mark_price", "creditman_mark_price", "creditman_slow_mark_price"),
@@ -477,67 +512,109 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
                 None,
             )
 
-        async def quote(contract: ContractInfo) -> OptionChainQuoteResponse:
-            contract_spec = _contract_spec(contract)
-            snapshot, error = await snapshot_contract(contract_spec)
-            return OptionChainQuoteResponse(
-                contract=_contract_response(contract),
-                snapshot=snapshot,
-                error=error,
-            )
-
         collection_started_at = datetime.now(UTC)
         underlying_spec = _contract_spec(underlying)
-        underlying_task = asyncio.create_task(snapshot_contract(underlying_spec))
-        quote_tasks = [asyncio.create_task(quote(contract)) for contract in contracts]
-        tasks = [underlying_task, *quote_tasks]
-        try:
-            done, pending = await asyncio.wait(
-                tasks,
-                timeout=settings.tws.request_timeout_seconds,
-            )
-        except BaseException:
-            for task in tasks:
+        specs = [underlying_spec, *(_contract_spec(contract) for contract in contracts)]
+        collection_timeout = request.timeout_seconds or min(
+            settings.tws.request_timeout_seconds * 2,
+            120,
+        )
+        deadline = time.monotonic() + collection_timeout
+        results: dict[
+            int,
+            tuple[MarketDataSnapshotResponse | None, TwsErrorDetailResponse | None],
+        ] = {}
+        attempts = [0] * len(specs)
+
+        async def collect_wave(indices: list[int], timeout: float) -> None:
+            tasks = {
+                asyncio.create_task(snapshot_contract(specs[index])): index for index in indices
+            }
+            for index in indices:
+                attempts[index] += 1
+            try:
+                done, pending = await asyncio.wait(tasks, timeout=max(0, timeout))
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            for task in pending:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                results[tasks[task]] = task.result()
+
+        all_indices = list(range(len(specs)))
+        await collect_wave(
+            all_indices,
+            min(collection_timeout / 2, deadline - time.monotonic()),
+        )
+        retry_indices = [
+            index
+            for index in all_indices
+            if index not in results
+            or (
+                results[index][0] is None
+                and results[index][1] is not None
+                and results[index][1].code is None
+            )
+        ]
+        retried_indices: list[int] = []
+        if retry_indices and time.monotonic() < deadline:
+            retried_indices = retry_indices
+            await collect_wave(retry_indices, deadline - time.monotonic())
 
         deadline_error = TwsErrorDetailResponse(
             code=None,
             message="batch market data collection deadline reached",
         )
-        if underlying_task in done:
-            underlying_snapshot, underlying_error = underlying_task.result()
-        else:
-            underlying_snapshot, underlying_error = None, deadline_error
+        underlying_snapshot, underlying_error = results.get(0, (None, deadline_error))
         quotes = [
-            (
-                task.result()
-                if task in done
-                else OptionChainQuoteResponse(
-                    contract=_contract_response(contract),
-                    error=deadline_error,
-                )
+            OptionChainQuoteResponse(
+                contract=_contract_response(contract),
+                snapshot=results.get(index, (None, deadline_error))[0],
+                error=results.get(index, (None, deadline_error))[1],
+                attempts=attempts[index],
             )
-            for contract, task in zip(contracts, quote_tasks, strict=True)
+            for index, contract in enumerate(contracts, start=1)
         ]
-        quote_complete = (
+        market_quote_complete = (
             underlying_snapshot is not None
-            and underlying_snapshot.quote_complete
+            and underlying_snapshot.market_quote_complete
             and all(
-                quote.snapshot is not None and quote.snapshot.quote_complete for quote in quotes
-            )
-        )
-        enrichment_complete = (
-            underlying_snapshot is not None
-            and underlying_snapshot.enrichment_complete
-            and all(
-                quote.snapshot is not None and quote.snapshot.enrichment_complete
+                quote.snapshot is not None and quote.snapshot.market_quote_complete
                 for quote in quotes
             )
+        )
+        model_complete = all(
+            quote.snapshot is not None and quote.snapshot.model_complete is True for quote in quotes
+        )
+        enrichment_complete = all(
+            quote.snapshot is not None and quote.snapshot.enrichment_complete for quote in quotes
+        )
+        reference_prices = [
+            (computation.underlying_price, quote.snapshot.collected_at)
+            for quote in quotes
+            if quote.snapshot is not None
+            and quote.snapshot.option_computations is not None
+            and (computation := quote.snapshot.option_computations.model) is not None
+            and computation.underlying_price is not None
+            and math.isfinite(computation.underlying_price)
+            and computation.underlying_price > 0
+        ]
+        use_reference_fallback = (
+            underlying_snapshot is None or not underlying_snapshot.market_quote_complete
+        )
+        reference_underlying_price = (
+            float(median(value for value, _ in reference_prices))
+            if use_reference_fallback and reference_prices
+            else None
+        )
+        reference_collected_at = (
+            max(collected_at for _, collected_at in reference_prices)
+            if reference_underlying_price is not None
+            else None
         )
         return OptionChainSnapshotResponse(
             underlying=_contract_response(underlying),
@@ -546,11 +623,24 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             expiration=request.expiration,
             exchange=request.exchange,
             requested_market_data_type=request.market_data_type,
-            quote_complete=quote_complete,
+            market_quote_complete=market_quote_complete,
+            quote_complete=market_quote_complete,
+            model_complete=model_complete,
             enrichment_complete=enrichment_complete,
-            complete=quote_complete and enrichment_complete,
+            complete=market_quote_complete and model_complete and enrichment_complete,
+            collection_timeout_seconds=collection_timeout,
+            retried_contracts=len(retried_indices),
             collection_started_at=collection_started_at,
             collected_at=datetime.now(UTC),
+            underlying_attempts=attempts[0],
+            reference_underlying_price=reference_underlying_price,
+            reference_underlying_price_source=(
+                "option_model_median" if reference_underlying_price is not None else None
+            ),
+            reference_underlying_price_collected_at=reference_collected_at,
+            reference_underlying_price_samples=(
+                len(reference_prices) if reference_underlying_price is not None else 0
+            ),
             quotes=quotes,
         )
 

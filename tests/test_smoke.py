@@ -43,7 +43,7 @@ class FakeClient:
             return {"tws_connected": self.connected, "server_version": 204}
         if path == "/openapi.json":
             return {
-                "info": {"version": "0.5.0"},
+                "info": {"version": "0.6.0"},
                 "paths": {
                     endpoint: {method: {}} for endpoint, method in EXPECTED_API_OPERATIONS.items()
                 },
@@ -99,11 +99,15 @@ class FakeClient:
         ):
             return {
                 "complete": False,
+                "market_quote_complete": False,
                 "quote_complete": False,
+                "model_complete": False,
                 "enrichment_complete": False,
                 "underlying_snapshot": {
                     "complete": True,
+                    "market_quote_complete": True,
                     "quote_complete": True,
+                    "model_complete": None,
                     "enrichment_complete": True,
                     "market_data_type": "live",
                     "bid": 199.5,
@@ -116,7 +120,9 @@ class FakeClient:
                         "contract": {"right": "C"},
                         "snapshot": {
                             "complete": True,
+                            "market_quote_complete": True,
                             "quote_complete": True,
+                            "model_complete": True,
                             "enrichment_complete": True,
                             "bid": 1.95,
                             "ask": 2.1,
@@ -142,7 +148,9 @@ class FakeClient:
                     "delayed" if payload["market_data_type"] == "delayed" else "live"
                 ),
                 "complete": True,
+                "market_quote_complete": True,
                 "quote_complete": True,
+                "model_complete": None,
                 "enrichment_complete": True,
                 "collected_at": "2026-08-14T14:00:00Z",
                 "bid": 199.5,
@@ -158,7 +166,7 @@ def test_smoke_exercises_live_read_only_flow_without_exposing_account_ids() -> N
 
     result = run_smoke(client, "aapl", messages.append)
 
-    assert result.api_version == "0.5.0"
+    assert result.api_version == "0.6.0"
     assert result.server_version == 204
     assert result.account_count == 1
     assert result.account_summary_count == 1

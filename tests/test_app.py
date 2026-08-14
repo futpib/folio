@@ -142,7 +142,8 @@ class FakeGateway:
         return MarketDataSnapshot(
             market_data_type=(MarketDataType.DELAYED if delayed else MarketDataType.LIVE),
             as_of=datetime(2026, 8, 14, 14, 0, tzinfo=UTC),
-            quote_complete=True,
+            market_quote_complete=True,
+            model_complete=True,
             enrichment_complete=enrichment_complete,
             complete=enrichment_complete,
             fields={
@@ -271,7 +272,9 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         snapshot = response.json()
         assert snapshot["requested_market_data_type"] == "delayed"
         assert snapshot["market_data_type"] == "delayed"
+        assert snapshot["market_quote_complete"] is True
         assert snapshot["quote_complete"] is True
+        assert snapshot["model_complete"] is None
         assert snapshot["enrichment_complete"] is True
         assert snapshot["complete"] is True
         assert snapshot["collected_at"] == "2026-08-14T14:00:00Z"
@@ -287,6 +290,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
                 "symbol": "aapl",
                 "expiration": "20260918",
                 "market_data_type": "delayed",
+                "timeout_seconds": 5,
             },
         )
         assert response.status_code == 200
@@ -295,9 +299,15 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert chain_snapshot["underlying_snapshot"]["last"] == 199.55
         assert chain_snapshot["underlying_error"] is None
         assert chain_snapshot["requested_market_data_type"] == "delayed"
+        assert chain_snapshot["market_quote_complete"] is True
         assert chain_snapshot["quote_complete"] is True
+        assert chain_snapshot["model_complete"] is True
         assert chain_snapshot["enrichment_complete"] is False
         assert chain_snapshot["complete"] is False
+        assert chain_snapshot["collection_timeout_seconds"] == 5
+        assert chain_snapshot["retried_contracts"] == 0
+        assert chain_snapshot["underlying_attempts"] == 1
+        assert chain_snapshot["reference_underlying_price"] is None
         assert chain_snapshot["collection_started_at"] <= chain_snapshot["collected_at"]
         assert len(chain_snapshot["quotes"]) == 6
         assert chain_snapshot["quotes"][0]["contract"]["strike"] == 195.0
@@ -319,7 +329,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert response.json()[0]["volume"] == "1000"
 
         openapi = client.get("/openapi.json").json()
-        assert openapi["info"]["version"] == "0.5.0"
+        assert openapi["info"]["version"] == "0.6.0"
         assert set(openapi["paths"]) == {
             "/healthz",
             "/v1/status",
@@ -336,7 +346,9 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert set(openapi["paths"]["/v1/options/chains"]) == {"get"}
         market_data_schema = openapi["components"]["schemas"]["MarketDataSnapshotResponse"]
         assert {
+            "market_quote_complete",
             "quote_complete",
+            "model_complete",
             "enrichment_complete",
             "complete",
             "collected_at",
@@ -459,6 +471,69 @@ class HangingQuoteGateway(FakeGateway):
             self.active_quotes -= 1
 
 
+class SideComputationGateway(FakeGateway):
+    async def market_data_snapshot(self, request):
+        if request.contract.sec_type != "OPT":
+            return await super().market_data_snapshot(request)
+        computation_values = {
+            name: OptionComputation(
+                option_price=price,
+                implied_volatility=0.75,
+                delta=0.55,
+                gamma=0.08,
+                theta=-0.01,
+                vega=0.02,
+                underlying_price=200.0,
+                present_value_dividend=0.0,
+            )
+            for name, price in (("bid", 1.7), ("ask", 1.9), ("last", 1.85), ("model", 1.827))
+        }
+        return MarketDataSnapshot(
+            market_data_type=MarketDataType.DELAYED,
+            as_of=datetime(2026, 8, 14, 14, 0, tzinfo=UTC),
+            market_quote_complete=True,
+            model_complete=True,
+            enrichment_complete=False,
+            complete=False,
+            fields={},
+            option_computations=computation_values,
+        )
+
+
+class MissingUnderlyingGateway(FakeGateway):
+    async def market_data_snapshot(self, request):
+        if request.contract.sec_type != "OPT":
+            raise GatewayTimeout("underlying timed out")
+        return await super().market_data_snapshot(request)
+
+
+class ModelOnlyOptionGateway(FakeGateway):
+    async def market_data_snapshot(self, request):
+        if request.contract.sec_type != "OPT":
+            return await super().market_data_snapshot(request)
+        return MarketDataSnapshot(
+            market_data_type=MarketDataType.DELAYED,
+            as_of=datetime(2026, 8, 14, 14, 0, tzinfo=UTC),
+            market_quote_complete=False,
+            model_complete=True,
+            enrichment_complete=False,
+            complete=False,
+            fields={},
+            option_computations={
+                "model": OptionComputation(
+                    option_price=1.827,
+                    implied_volatility=0.75,
+                    delta=0.55,
+                    gamma=0.08,
+                    theta=-0.01,
+                    vega=0.02,
+                    underlying_price=200.0,
+                    present_value_dividend=0.0,
+                )
+            },
+        )
+
+
 def test_batch_snapshot_keeps_per_contract_errors_and_redacts_accounts() -> None:
     with TestClient(create_app(settings(), PartialQuoteErrorGateway())) as client:
         response = client.get(
@@ -484,9 +559,12 @@ def test_batch_snapshot_keeps_per_contract_timeouts() -> None:
         )
 
     assert response.status_code == 200
-    assert response.json()["complete"] is False
-    errors = [quote["error"] for quote in response.json()["quotes"] if quote["error"]]
+    payload = response.json()
+    assert payload["complete"] is False
+    assert payload["retried_contracts"] == 3
+    errors = [quote["error"] for quote in payload["quotes"] if quote["error"]]
     assert errors == [{"code": None, "message": "TWS market data request timed out"}] * 3
+    assert [quote["attempts"] for quote in payload["quotes"] if quote["error"]] == [2, 2, 2]
 
 
 def test_batch_snapshot_uses_one_concurrent_collection_deadline() -> None:
@@ -508,9 +586,13 @@ def test_batch_snapshot_uses_one_concurrent_collection_deadline() -> None:
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["market_quote_complete"] is False
     assert payload["quote_complete"] is False
+    assert payload["model_complete"] is False
     assert payload["enrichment_complete"] is False
     assert payload["complete"] is False
+    assert payload["retried_contracts"] == 7
+    assert payload["underlying_attempts"] == 2
     assert payload["underlying_error"] == {
         "code": None,
         "message": "batch market data collection deadline reached",
@@ -518,6 +600,74 @@ def test_batch_snapshot_uses_one_concurrent_collection_deadline() -> None:
     assert {(quote["error"]["code"], quote["error"]["message"]) for quote in payload["quotes"]} == {
         (None, "batch market data collection deadline reached")
     }
+    assert {quote["attempts"] for quote in payload["quotes"]} == {2}
     assert gateway.max_active_quotes == 7
     assert gateway.active_quotes == 0
     assert elapsed < 1
+
+
+def test_option_side_computations_populate_top_level_prices() -> None:
+    with TestClient(create_app(settings(), SideComputationGateway())) as client:
+        response = client.post(
+            "/v1/market-data/snapshot",
+            json={
+                "contract": {
+                    "symbol": "AAPL",
+                    "sec_type": "OPT",
+                    "last_trade_date_or_contract_month": "20260918",
+                    "strike": 200,
+                    "right": "C",
+                },
+                "market_data_type": "delayed",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert (payload["bid"], payload["ask"], payload["last"]) == (1.7, 1.9, 1.85)
+    assert payload["market_quote_complete"] is True
+    assert payload["quote_complete"] is True
+    assert payload["model_complete"] is True
+    assert payload["enrichment_complete"] is False
+
+
+def test_batch_retries_underlying_and_exposes_option_model_reference_price() -> None:
+    with TestClient(create_app(settings(), MissingUnderlyingGateway())) as client:
+        response = client.get(
+            "/v1/options/chain-snapshot",
+            params={"symbol": "AAPL", "expiration": "20260918"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["underlying_snapshot"] is None
+    assert payload["underlying_attempts"] == 2
+    assert payload["retried_contracts"] == 1
+    assert payload["reference_underlying_price"] == 200
+    assert payload["reference_underlying_price_source"] == "option_model_median"
+    assert payload["reference_underlying_price_collected_at"] == "2026-08-14T14:00:00Z"
+    assert payload["reference_underlying_price_samples"] == 6
+    assert payload["market_quote_complete"] is False
+    assert payload["model_complete"] is True
+
+
+def test_batch_does_not_label_model_only_options_as_market_quotes() -> None:
+    with TestClient(create_app(settings(), ModelOnlyOptionGateway())) as client:
+        response = client.get(
+            "/v1/options/chain-snapshot",
+            params={"symbol": "AAPL", "expiration": "20260918"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["underlying_snapshot"] is not None
+    assert payload["market_quote_complete"] is False
+    assert payload["quote_complete"] is False
+    assert payload["model_complete"] is True
+    assert payload["complete"] is False
+    for quote in payload["quotes"]:
+        snapshot = quote["snapshot"]
+        assert snapshot["market_quote_complete"] is False
+        assert snapshot["quote_complete"] is False
+        assert snapshot["model_complete"] is True
+        assert (snapshot["bid"], snapshot["ask"], snapshot["last"]) == (None, None, None)

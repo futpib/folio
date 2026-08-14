@@ -39,6 +39,9 @@ class FakeTickType:
             4: "LAST",
             5: "LAST_SIZE",
             8: "VOLUME",
+            10: "BID_OPTION",
+            11: "ASK_OPTION",
+            12: "LAST_OPTION",
             13: "MODEL_OPTION",
             27: "OPTION_CALL_OPEN_INTEREST",
             29: "OPTION_CALL_VOLUME",
@@ -303,7 +306,8 @@ def test_official_callback_bridge_round_trip() -> None:
         )
         assert option_snapshot.fields["option_call_open_interest"] == 2500
         assert option_snapshot.option_computations["model"].delta == 0.55
-        assert option_snapshot.quote_complete is True
+        assert option_snapshot.market_quote_complete is True
+        assert option_snapshot.model_complete is True
         assert option_snapshot.enrichment_complete is True
         assert option_snapshot.complete is True
         assert FakeClient.instances[-1].market_data_requests[-1] == (
@@ -326,14 +330,15 @@ def test_official_callback_bridge_round_trip() -> None:
             )
         )
         assert delayed_option_snapshot.market_data_type is MarketDataType.DELAYED
-        assert delayed_option_snapshot.quote_complete is True
+        assert delayed_option_snapshot.market_quote_complete is True
+        assert delayed_option_snapshot.model_complete is True
         assert delayed_option_snapshot.enrichment_complete is False
         assert delayed_option_snapshot.complete is False
         assert FakeClient.instances[-1].last_generic_ticks == ""
         assert FakeClient.instances[-1].market_data_requests[-1] == (
             "OPT",
             "",
-            True,
+            False,
         )
 
         bars = await gateway.historical_bars(
@@ -646,7 +651,8 @@ def test_auto_option_quotes_retry_delayed_without_generic_ticks(live_error_code:
                 )
             )
             assert snapshot.market_data_type is MarketDataType.DELAYED
-            assert snapshot.quote_complete is True
+            assert snapshot.market_quote_complete is True
+            assert snapshot.model_complete is True
             assert snapshot.enrichment_complete is False
             assert snapshot.complete is False
             assert snapshot.fields["delayed_bid"] == 0.75
@@ -660,7 +666,7 @@ def test_auto_option_quotes_retry_delayed_without_generic_ticks(live_error_code:
             client = CleanDelayedOptionFallbackClient.instances[-1]
             assert client.market_data_requests == [
                 ("OPT", "100,101,106,221", False),
-                ("OPT", "", True),
+                ("OPT", "", False),
             ]
             assert client.market_data_type_requests == [1, 3]
         finally:
@@ -688,13 +694,14 @@ def test_auto_underlying_quote_retries_after_2186() -> None:
                 MarketDataSnapshotRequest(contract=ContractSpec(symbol="XXI"))
             )
             assert snapshot.market_data_type is MarketDataType.DELAYED
-            assert snapshot.quote_complete is True
+            assert snapshot.market_quote_complete is True
+            assert snapshot.model_complete is True
             assert snapshot.enrichment_complete is True
             assert snapshot.complete is True
             client = CleanDelayedOptionFallbackClient.instances[-1]
             assert client.market_data_requests == [
-                ("STK", "", True),
-                ("STK", "", True),
+                ("STK", "", False),
+                ("STK", "", False),
             ]
         finally:
             await gateway.stop()
@@ -728,6 +735,55 @@ class PartialStreamingMarketDataClient(FakeClient):
         assert requested.secType == "OPT"
         assert snapshot is False
         self.wrapper.tickSize(request_id, 27, 2500)
+
+
+class ComputationOnlyMarketDataClient(FakeClient):
+    include_sides = False
+
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        assert requested.secType == "OPT"
+        assert snapshot is False
+        tick_types = (10, 11, 12) if self.include_sides else ()
+        prices = (1.7, 1.9, 1.85) if self.include_sides else ()
+        for tick_type, price in zip(tick_types, prices, strict=True):
+            self.wrapper.tickOptionComputation(
+                request_id,
+                tick_type,
+                0,
+                0.75,
+                0.55,
+                price,
+                0.0,
+                0.08,
+                0.02,
+                -0.01,
+                4.8567,
+            )
+        self.wrapper.tickOptionComputation(
+            request_id,
+            13,
+            0,
+            0.75,
+            0.55,
+            1.827,
+            0.0,
+            0.08,
+            0.02,
+            -0.01,
+            4.8567,
+        )
+
+
+class SideComputationOnlyMarketDataClient(ComputationOnlyMarketDataClient):
+    include_sides = True
 
 
 def test_empty_market_data_is_a_timeout_instead_of_a_clean_snapshot() -> None:
@@ -770,7 +826,8 @@ def test_streaming_market_data_returns_observable_partial_result_at_deadline() -
                     market_data_type=MarketDataType.LIVE,
                 )
             )
-            assert snapshot.quote_complete is False
+            assert snapshot.market_quote_complete is False
+            assert snapshot.model_complete is False
             assert snapshot.enrichment_complete is False
             assert snapshot.complete is False
             assert snapshot.fields["option_call_open_interest"] == 2500
@@ -778,6 +835,75 @@ def test_streaming_market_data_returns_observable_partial_result_at_deadline() -
                 None,
                 "market data collection reached its deadline; partial data returned",
             )
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("client_type", "market_quote_complete"),
+    [
+        (ComputationOnlyMarketDataClient, False),
+        (SideComputationOnlyMarketDataClient, True),
+    ],
+)
+def test_option_side_computations_are_market_quotes_but_model_only_is_not(
+    client_type,
+    market_quote_complete: bool,
+) -> None:
+    async def scenario() -> None:
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.2, request_timeout_seconds=0.2),
+            IbApiBindings(client_type, FakeWrapper, FakeContract, FakeTickType),
+        )
+        await gateway.start()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(
+                    contract=ContractSpec(
+                        symbol="XXI",
+                        sec_type="OPT",
+                        last_trade_date_or_contract_month="20280121",
+                        strike=5,
+                        right="C",
+                    ),
+                    market_data_type=MarketDataType.DELAYED,
+                )
+            )
+            assert snapshot.market_quote_complete is market_quote_complete
+            assert snapshot.model_complete is True
+            assert snapshot.enrichment_complete is False
+            assert snapshot.complete is False
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+def test_auto_option_quote_accepts_side_computation_prices_without_fallback() -> None:
+    async def scenario() -> None:
+        SideComputationOnlyMarketDataClient.instances.clear()
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.2, request_timeout_seconds=0.2),
+            IbApiBindings(
+                SideComputationOnlyMarketDataClient,
+                FakeWrapper,
+                FakeContract,
+                FakeTickType,
+            ),
+        )
+        await gateway.start()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(contract=ContractSpec(symbol="XXI", sec_type="OPT"))
+            )
+            assert snapshot.market_data_type is MarketDataType.LIVE
+            assert snapshot.market_quote_complete is True
+            assert snapshot.option_computations["bid"].option_price == 1.7
+            assert SideComputationOnlyMarketDataClient.instances[-1].market_data_type_requests == [
+                1
+            ]
         finally:
             await gateway.stop()
 

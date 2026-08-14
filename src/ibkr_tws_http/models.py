@@ -84,6 +84,14 @@ class OptionChainSnapshotRequest(StrictModel):
     strike_min: float | None = Field(default=None, ge=0)
     strike_max: float | None = Field(default=None, ge=0)
     max_contracts: int = Field(default=40, ge=1, le=40)
+    timeout_seconds: float | None = Field(
+        default=None,
+        ge=1,
+        le=120,
+        description=(
+            "Global batch collection window; defaults to twice the configured TWS request timeout"
+        ),
+    )
 
     @field_validator("symbol", "exchange", "currency", mode="before")
     @classmethod
@@ -206,8 +214,19 @@ class MarketDataSnapshotResponse(StrictModel):
     contract: ContractSpec
     requested_market_data_type: MarketDataType
     market_data_type: MarketDataType
-    quote_complete: bool
-    enrichment_complete: bool
+    market_quote_complete: bool = Field(
+        description="An actual bid, ask, or last price was received",
+    )
+    quote_complete: bool = Field(
+        description="Compatibility alias for market_quote_complete",
+    )
+    model_complete: bool | None = Field(
+        default=None,
+        description="Option model price, IV, and Greeks are complete; null when not applicable",
+    )
+    enrichment_complete: bool = Field(
+        description="Requested option volume, open interest, and mark fields are complete",
+    )
     complete: bool
     collected_at: datetime
     last_trade_time: datetime | None = None
@@ -238,6 +257,7 @@ class OptionChainQuoteResponse(StrictModel):
     contract: ContractResponse
     snapshot: MarketDataSnapshotResponse | None = None
     error: TwsErrorDetailResponse | None = None
+    attempts: int = Field(ge=1, le=2)
 
     @model_validator(mode="after")
     def require_snapshot_or_error(self) -> OptionChainQuoteResponse:
@@ -253,11 +273,20 @@ class OptionChainSnapshotResponse(StrictModel):
     expiration: str
     exchange: str
     requested_market_data_type: MarketDataType
+    market_quote_complete: bool
     quote_complete: bool
+    model_complete: bool
     enrichment_complete: bool
     complete: bool
+    collection_timeout_seconds: float
+    retried_contracts: int = Field(ge=0)
     collection_started_at: datetime
     collected_at: datetime
+    underlying_attempts: int = Field(ge=1, le=2)
+    reference_underlying_price: float | None = None
+    reference_underlying_price_source: Literal["option_model_median"] | None = None
+    reference_underlying_price_collected_at: datetime | None = None
+    reference_underlying_price_samples: int = Field(default=0, ge=0)
     quotes: list[OptionChainQuoteResponse]
 
     @model_validator(mode="after")

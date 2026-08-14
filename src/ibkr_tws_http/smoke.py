@@ -207,7 +207,7 @@ def run_smoke(
             f"market snapshot returned no usable price for {symbol}",
         )
         _expect(
-            underlying_snapshot.get("quote_complete") is True,
+            underlying_snapshot.get("market_quote_complete") is True,
             f"market snapshot returned an incomplete quote for {symbol}",
         )
         report(f"Underlying market snapshot succeeded ({underlying_market_data_type})")
@@ -277,18 +277,25 @@ def run_smoke(
             client.get(f"/v1/options/chain-snapshot?{quote_query}"),
             "/v1/options/chain-snapshot",
         )
-        batch_underlying = _object(
-            chain_snapshot.get("underlying_snapshot"),
-            "/v1/options/chain-snapshot underlying_snapshot",
-        )
+        batch_underlying = chain_snapshot.get("underlying_snapshot")
+        if isinstance(batch_underlying, dict):
+            _expect(
+                any(
+                    batch_underlying.get(field) is not None
+                    for field in ("bid", "ask", "last", "mark")
+                ),
+                f"batch option snapshot returned no usable underlying price for {symbol}",
+            )
+        else:
+            _expect(
+                chain_snapshot.get("reference_underlying_price") is not None
+                and chain_snapshot.get("reference_underlying_price_source")
+                == "option_model_median",
+                f"batch option snapshot returned no underlying reference price for {symbol}",
+            )
         _expect(
-            any(
-                batch_underlying.get(field) is not None for field in ("bid", "ask", "last", "mark")
-            ),
-            f"batch option snapshot returned no usable underlying price for {symbol}",
-        )
-        _expect(
-            isinstance(chain_snapshot.get("quote_complete"), bool)
+            isinstance(chain_snapshot.get("market_quote_complete"), bool)
+            and isinstance(chain_snapshot.get("model_complete"), bool)
             and isinstance(chain_snapshot.get("enrichment_complete"), bool),
             "/v1/options/chain-snapshot returned invalid completeness indicators",
         )

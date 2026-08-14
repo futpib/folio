@@ -737,7 +737,7 @@ class PartialStreamingMarketDataClient(FakeClient):
         self.wrapper.tickSize(request_id, 27, 2500)
 
 
-class SlowDelayedUnderlyingFallbackClient(FakeClient):
+class ImplicitDelayedUnderlyingFallbackClient(FakeClient):
     def reqMktData(
         self,
         request_id: int,
@@ -750,14 +750,14 @@ class SlowDelayedUnderlyingFallbackClient(FakeClient):
         assert requested.secType == "STK"
         assert snapshot is False
         self.market_data_requests.append((requested.secType, generic_ticks, snapshot))
-        if self.market_data_type == 1:
-            self.wrapper.error(
-                request_id,
-                2186,
-                "Live data unavailable; delayed data will follow",
-                "",
-            )
+        if self.market_data_type != 1:
             return
+        self.wrapper.error(
+            request_id,
+            2186,
+            "Live data unavailable; delayed data will follow",
+            "",
+        )
 
         def send_delayed_quote() -> None:
             self.wrapper.marketDataType(request_id, 3)
@@ -873,13 +873,13 @@ def test_streaming_market_data_returns_observable_partial_result_at_deadline() -
     asyncio.run(scenario())
 
 
-def test_auto_underlying_waits_for_delayed_ticks_after_live_fallback() -> None:
+def test_auto_underlying_keeps_2186_request_for_implicit_delayed_ticks() -> None:
     async def scenario() -> None:
-        SlowDelayedUnderlyingFallbackClient.instances.clear()
+        ImplicitDelayedUnderlyingFallbackClient.instances.clear()
         gateway = OfficialGateway(
             TwsConfig(connect_timeout_seconds=0.4, request_timeout_seconds=0.4),
             IbApiBindings(
-                SlowDelayedUnderlyingFallbackClient,
+                ImplicitDelayedUnderlyingFallbackClient,
                 FakeWrapper,
                 FakeContract,
                 FakeTickType,
@@ -894,9 +894,12 @@ def test_auto_underlying_waits_for_delayed_ticks_after_live_fallback() -> None:
             assert snapshot.market_quote_complete is True
             assert snapshot.fields["delayed_bid"] == 198.5
             assert snapshot.fields["delayed_ask"] == 198.7
-            assert SlowDelayedUnderlyingFallbackClient.instances[-1].market_data_requests == [
-                ("STK", "", False),
-                ("STK", "", False),
+            assert snapshot.notices[0] == TwsNotice(
+                2186,
+                "Live data unavailable; delayed data will follow",
+            )
+            assert ImplicitDelayedUnderlyingFallbackClient.instances[-1].market_data_requests == [
+                ("STK", "", False)
             ]
         finally:
             await gateway.stop()

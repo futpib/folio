@@ -680,11 +680,19 @@ class OfficialGateway:
             numeric_code = -1
         with self._pending_lock:
             request = self._pending.get(request_id) if isinstance(request_id, int) else None
+            is_implicit_delayed_notice = (
+                request is not None
+                and request.auto_fallback
+                and request.requested_market_data_type is MarketDataType.LIVE
+                and not request.enrichment_expected
+                and numeric_code == 2186
+            )
             triggers_auto_fallback = (
                 request is not None
                 and request.auto_fallback
                 and request.requested_market_data_type is MarketDataType.LIVE
                 and numeric_code in self._AUTO_DELAYED_CODES
+                and not is_implicit_delayed_notice
             )
             is_delayed_fallback_notice = (
                 request is not None
@@ -692,12 +700,17 @@ class OfficialGateway:
                 in {MarketDataType.DELAYED, MarketDataType.DELAYED_FROZEN}
                 and numeric_code in self._DELAYED_FALLBACK_NOTICES
             )
+        if numeric_code == 300 and request is None:
+            logger.debug("TWS acknowledged cancellation of request %s", request_id)
+            return
         if numeric_code in self._INFORMATIONAL_CODES:
             logger.info("TWS notice %s: %s", numeric_code, message)
             return
         if (
-            numeric_code in self._NON_FATAL_REQUEST_CODES and not triggers_auto_fallback
-        ) or is_delayed_fallback_notice:
+            (numeric_code in self._NON_FATAL_REQUEST_CODES and not triggers_auto_fallback)
+            or is_delayed_fallback_notice
+            or is_implicit_delayed_notice
+        ):
             logger.info("TWS request notice %s: %s", numeric_code, message)
             if isinstance(request_id, int) and request_id >= 0:
                 with self._client_lock:

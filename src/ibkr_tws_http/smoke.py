@@ -10,6 +10,20 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+EXPECTED_API_OPERATIONS = {
+    "/healthz": "get",
+    "/v1/status": "get",
+    "/v1/accounts": "get",
+    "/v1/account-summary": "get",
+    "/v1/positions": "get",
+    "/v1/contracts/search": "get",
+    "/v1/contracts/details": "post",
+    "/v1/options/chains": "get",
+    "/v1/options/chain-snapshot": "get",
+    "/v1/market-data/snapshot": "post",
+    "/v1/historical-bars": "post",
+}
+
 
 class SmokeFailure(RuntimeError):
     """The live service did not satisfy a smoke-test assertion."""
@@ -62,8 +76,10 @@ class UrlLibApiClient:
 
 @dataclass(frozen=True)
 class SmokeResult:
+    api_version: str
     server_version: int | None
     account_count: int
+    account_summary_count: int
     position_count: int
     symbol: str
     underlying_con_id: int
@@ -71,6 +87,7 @@ class SmokeResult:
     expiration_count: int
     strike_count: int
     quoted_contract_count: int | None = None
+    underlying_market_data_type: str | None = None
 
 
 def run_smoke(
@@ -78,7 +95,7 @@ def run_smoke(
     symbol: str,
     report: Callable[[str], None] = lambda message: None,
     *,
-    check_market_data: bool = False,
+    check_market_data: bool = True,
     expiration: str | None = None,
     market_data_type: str = "auto",
 ) -> SmokeResult:
@@ -97,6 +114,16 @@ def run_smoke(
     )
     report(f"TWS is connected (server version {server_version or 'unknown'})")
 
+    openapi = _object(client.get("/openapi.json"), "/openapi.json")
+    info = _object(openapi.get("info"), "/openapi.json info")
+    api_version = info.get("version")
+    _expect(isinstance(api_version, str) and api_version, "/openapi.json has no API version")
+    paths = _object(openapi.get("paths"), "/openapi.json paths")
+    for path, method in EXPECTED_API_OPERATIONS.items():
+        operations = _object(paths.get(path), f"/openapi.json path {path}")
+        _expect(method in operations, f"/openapi.json does not expose {method.upper()} {path}")
+    report(f"OpenAPI contract is complete (service version {api_version})")
+
     accounts = _list(client.get("/v1/accounts"), "/v1/accounts")
     _expect(accounts, "/v1/accounts returned no accounts after applying the exposure policy")
     _expect(
@@ -107,6 +134,20 @@ def run_smoke(
         "/v1/accounts returned an invalid response",
     )
     report(f"Accounts request succeeded ({len(accounts)} exposed)")
+
+    account_summary = _list(client.get("/v1/account-summary"), "/v1/account-summary")
+    _expect(
+        all(
+            isinstance(value, dict)
+            and all(
+                isinstance(value.get(field), str)
+                for field in ("account", "tag", "value", "currency")
+            )
+            for value in account_summary
+        ),
+        "/v1/account-summary returned an invalid response",
+    )
+    report(f"Account summary request succeeded ({len(account_summary)} values returned)")
 
     positions = _list(client.get("/v1/positions"), "/v1/positions")
     report(f"Positions request succeeded ({len(positions)} returned)")
@@ -143,6 +184,26 @@ def run_smoke(
         f"contract details did not resolve contract {con_id}",
     )
     report("Contract details request succeeded")
+
+    underlying_market_data_type = None
+    if check_market_data:
+        underlying_snapshot = _object(
+            client.post(
+                "/v1/market-data/snapshot",
+                {"contract": detail_request, "market_data_type": market_data_type},
+            ),
+            "/v1/market-data/snapshot",
+        )
+        underlying_market_data_type = underlying_snapshot.get("market_data_type")
+        _expect(
+            underlying_market_data_type in {"live", "frozen", "delayed", "delayed-frozen"},
+            "/v1/market-data/snapshot returned an invalid market data type",
+        )
+        _expect(
+            any(underlying_snapshot.get(field) is not None for field in ("bid", "ask", "last")),
+            f"market snapshot returned no usable price for {symbol}",
+        )
+        report(f"Underlying market snapshot succeeded ({underlying_market_data_type})")
 
     chain_query = urlencode(
         {
@@ -229,8 +290,10 @@ def run_smoke(
         )
 
     return SmokeResult(
+        api_version=api_version,
         server_version=server_version,
         account_count=len(accounts),
+        account_summary_count=len(account_summary),
         position_count=len(positions),
         symbol=symbol,
         underlying_con_id=con_id,
@@ -238,6 +301,7 @@ def run_smoke(
         expiration_count=len(expirations),
         strike_count=len(strikes),
         quoted_contract_count=quoted_contract_count,
+        underlying_market_data_type=underlying_market_data_type,
     )
 
 
@@ -306,17 +370,26 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=30.0,
+        default=60.0,
         help="timeout for each HTTP request in seconds (default: %(default)s)",
     )
-    parser.add_argument(
+    market_data_group = parser.add_mutually_exclusive_group()
+    market_data_group.add_argument(
         "--check-market-data",
+        dest="check_market_data",
         action="store_true",
-        help="also require usable prices from a small batch option snapshot",
+        default=True,
+        help="require underlying and batch option prices (default)",
+    )
+    market_data_group.add_argument(
+        "--skip-market-data",
+        dest="check_market_data",
+        action="store_false",
+        help="skip quote checks and test metadata endpoints only",
     )
     parser.add_argument(
         "--expiration",
-        help="YYYYMMDD option expiration for --check-market-data (default: nearest SMART expiry)",
+        help="YYYYMMDD option expiration for quote checks (default: nearest SMART expiry)",
     )
     parser.add_argument(
         "--market-data-type",

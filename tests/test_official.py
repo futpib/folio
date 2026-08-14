@@ -436,6 +436,27 @@ class ApiSubscriptionFallbackClient(DelayedFallbackClient):
         )
 
 
+class ClosedMarketFallbackClient(DelayedFallbackClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        if self.market_data_type in {1, 3}:
+            self.wrapper.tickPrice(request_id, 1 if self.market_data_type == 1 else 66, -1, None)
+            self.wrapper.tickSnapshotEnd(request_id)
+            return
+        self.wrapper.marketDataType(request_id, 4)
+        self.wrapper.tickPrice(request_id, 66, 198.5, None)
+        self.wrapper.tickPrice(request_id, 67, 198.7, None)
+        self.wrapper.tickString(request_id, 88, "1786714800")
+        self.wrapper.tickSnapshotEnd(request_id)
+
+
 class PartialSubscriptionClient(FakeClient):
     def reqMktData(
         self,
@@ -514,6 +535,27 @@ def test_partial_market_data_notice_keeps_ticks_and_is_redacted() -> None:
                     "Part of requested market data for [redacted account] is not subscribed",
                 ),
             )
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+def test_auto_market_data_reaches_delayed_frozen_when_market_is_closed() -> None:
+    async def scenario() -> None:
+        ClosedMarketFallbackClient.instances.clear()
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.5, request_timeout_seconds=0.5),
+            IbApiBindings(ClosedMarketFallbackClient, FakeWrapper, FakeContract, FakeTickType),
+        )
+        await gateway.start()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(contract=ContractSpec(symbol="AAPL"))
+            )
+            assert snapshot.market_data_type is MarketDataType.DELAYED_FROZEN
+            assert snapshot.fields["delayed_bid"] == 198.5
+            assert ClosedMarketFallbackClient.instances[-1].market_data_type_requests == [1, 3, 4]
         finally:
             await gateway.stop()
 

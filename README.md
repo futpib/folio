@@ -77,16 +77,20 @@ uv run ibkr-tws-http-smoke --base-url http://127.0.0.1:9080 --symbol SPY
 ```
 
 The smoke test verifies the HTTP health response, TWS connection, exposed
-accounts, positions, contract search and details, and a non-empty option chain.
-It prints account and position counts but no account identifiers. To also verify
-real option prices using live data with an automatic delayed-data fallback:
+OpenAPI contract, accounts and account summary, positions, contract search and
+details, option-chain metadata, an underlying quote, and a small batch of option
+quotes. It prints counts but no account identifiers. No flags are needed; live
+quotes automatically fall back through delayed and delayed-frozen data.
+
+Choose a different underlying or expiry when needed:
 
 ```console
-uv run ibkr-tws-http-smoke --symbol XXI --check-market-data --expiration 20280121
+uv run ibkr-tws-http-smoke --symbol XXI --expiration 20280121
 ```
 
-Use `--market-data-type delayed-frozen` for the last available delayed quotes
-when the market is closed.
+Use `--skip-market-data` for a metadata-only diagnostic. Historical bars are
+validated in OpenAPI but are not requested because IBKR requires live market-data
+entitlements and provides no delayed historical-data fallback.
 
 ## API
 
@@ -137,7 +141,8 @@ from all applicable exchanges.
 
 Market snapshots accept `auto`, `live`, `frozen`, `delayed`, or
 `delayed-frozen`. `auto` first requests live data and retries with IBKR's free
-delayed feed when TWS reports missing entitlements or returns an empty snapshot.
+delayed feed when TWS reports missing entitlements or returns no usable price,
+then tries delayed-frozen data for a closed market.
 The response identifies both the requested and actual type and exposes `as_of`,
 last-trade time, bid/ask/last prices and sizes, volume, open interest, and bid,
 ask, last, and model option computations containing IV and Greeks. Raw IBKR tick

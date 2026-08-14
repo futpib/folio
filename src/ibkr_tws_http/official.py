@@ -214,15 +214,22 @@ class OfficialGateway:
         if request.market_data_type is not MarketDataType.AUTO:
             return await self._market_data_snapshot_once(request, request.market_data_type)
 
-        try:
-            snapshot = await self._market_data_snapshot_once(request, MarketDataType.LIVE)
-        except GatewayRequestError as exc:
-            if exc.code not in self._AUTO_DELAYED_CODES:
-                raise
-        else:
-            if snapshot.fields or snapshot.option_computations:
+        fallback_types = (
+            MarketDataType.LIVE,
+            MarketDataType.DELAYED,
+            MarketDataType.DELAYED_FROZEN,
+        )
+        for index, market_data_type in enumerate(fallback_types):
+            final_attempt = index == len(fallback_types) - 1
+            try:
+                snapshot = await self._market_data_snapshot_once(request, market_data_type)
+            except GatewayRequestError as exc:
+                if final_attempt or exc.code not in self._AUTO_DELAYED_CODES:
+                    raise
+                continue
+            if final_attempt or self._has_usable_market_price(snapshot):
                 return snapshot
-        return await self._market_data_snapshot_once(request, MarketDataType.DELAYED)
+        raise AssertionError("market data fallback loop did not return")
 
     async def _market_data_snapshot_once(
         self,
@@ -814,3 +821,17 @@ class OfficialGateway:
         if maximum is not None and number > maximum:
             return None
         return number
+
+    @staticmethod
+    def _has_usable_market_price(snapshot: MarketDataSnapshot) -> bool:
+        for name in ("bid", "ask", "last", "delayed_bid", "delayed_ask", "delayed_last"):
+            value = snapshot.fields.get(name)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and abs(value) < 1e100
+                and value != -1
+            ):
+                return True
+        return False

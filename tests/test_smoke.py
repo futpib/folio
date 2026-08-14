@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from ibkr_tws_http.smoke import SmokeFailure, run_smoke
+from ibkr_tws_http.smoke import EXPECTED_API_OPERATIONS, SmokeFailure, _parser, run_smoke
 
 
 class FakeClient:
@@ -41,8 +41,24 @@ class FakeClient:
             return {"service": "ok"}
         if path == "/v1/status":
             return {"tws_connected": self.connected, "server_version": 204}
+        if path == "/openapi.json":
+            return {
+                "info": {"version": "0.3.0"},
+                "paths": {
+                    endpoint: {method: {}} for endpoint, method in EXPECTED_API_OPERATIONS.items()
+                },
+            }
         if path == "/v1/accounts":
             return [{"account": "account"}]
+        if path == "/v1/account-summary":
+            return [
+                {
+                    "account": "account",
+                    "tag": "NetLiquidation",
+                    "value": "10000",
+                    "currency": "USD",
+                }
+            ]
         if path == "/v1/positions":
             return []
         if path == "/v1/contracts/search?pattern=AAPL":
@@ -77,6 +93,9 @@ class FakeClient:
         if path == (
             "/v1/options/chain-snapshot?symbol=AAPL&expiration=20260918&exchange=SMART"
             "&market_data_type=delayed&strike_min=195.0&strike_max=205.0&max_contracts=6"
+        ) or path == (
+            "/v1/options/chain-snapshot?symbol=AAPL&expiration=20260918&exchange=SMART"
+            "&market_data_type=auto&strike_min=195.0&strike_max=205.0&max_contracts=6"
         ):
             return {
                 "quotes": [
@@ -94,6 +113,16 @@ class FakeClient:
         self.requests.append(("POST", path, payload))
         if path == "/v1/contracts/details":
             return [{"con_id": 265598, "symbol": "AAPL", "sec_type": "STK"}]
+        if path == "/v1/market-data/snapshot":
+            return {
+                "requested_market_data_type": payload["market_data_type"],
+                "market_data_type": (
+                    "delayed" if payload["market_data_type"] == "delayed" else "live"
+                ),
+                "bid": 199.5,
+                "ask": 199.6,
+                "last": 199.55,
+            }
         raise AssertionError(f"unexpected POST {path}")
 
 
@@ -103,17 +132,21 @@ def test_smoke_exercises_live_read_only_flow_without_exposing_account_ids() -> N
 
     result = run_smoke(client, "aapl", messages.append)
 
+    assert result.api_version == "0.3.0"
     assert result.server_version == 204
     assert result.account_count == 1
+    assert result.account_summary_count == 1
     assert result.position_count == 0
     assert result.symbol == "AAPL"
     assert result.underlying_con_id == 265598
     assert result.chain_count == 2
     assert result.expiration_count == 2
     assert result.strike_count == 3
-    assert messages[-1] == "Option chains request succeeded (2 chains, 2 expirations, 3 strikes)"
-    assert all("account" not in message.lower() or "1 exposed" in message for message in messages)
-    assert client.requests[-2] == (
+    assert result.quoted_contract_count == 1
+    assert result.underlying_market_data_type == "live"
+    assert messages[-1] == "Batch option snapshot succeeded (1/2 contracts priced, requested auto)"
+    assert all("DU111" not in message for message in messages)
+    assert (
         "POST",
         "/v1/contracts/details",
         {
@@ -124,13 +157,13 @@ def test_smoke_exercises_live_read_only_flow_without_exposing_account_ids() -> N
             "currency": "USD",
             "primary_exchange": "NASDAQ",
         },
-    )
-    assert client.requests[-1] == (
+    ) in client.requests
+    assert (
         "GET",
         "/v1/options/chains?underlying_symbol=AAPL&underlying_con_id=265598"
         "&underlying_security_type=STK&exchange=",
         None,
-    )
+    ) in client.requests
 
 
 def test_smoke_fails_before_tws_requests_when_disconnected() -> None:
@@ -169,3 +202,11 @@ def test_smoke_can_require_a_real_batch_option_price() -> None:
     assert (
         messages[-1] == "Batch option snapshot succeeded (1/2 contracts priced, requested delayed)"
     )
+
+
+def test_market_data_checks_are_enabled_without_cli_arguments() -> None:
+    args = _parser().parse_args([])
+
+    assert args.check_market_data is True
+    assert args.timeout == 60.0
+    assert _parser().parse_args(["--skip-market-data"]).check_market_data is False

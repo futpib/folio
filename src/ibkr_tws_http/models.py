@@ -84,13 +84,17 @@ class OptionChainSnapshotRequest(StrictModel):
     strike_min: float | None = Field(default=None, ge=0)
     strike_max: float | None = Field(default=None, ge=0)
     max_contracts: int = Field(default=40, ge=1, le=40)
+    max_concurrency: int = Field(
+        default=10,
+        ge=1,
+        le=40,
+        description="Maximum simultaneous underlying and option quote collections",
+    )
     timeout_seconds: float | None = Field(
         default=None,
         ge=1,
         le=120,
-        description=(
-            "Global batch collection window; defaults to twice the configured TWS request timeout"
-        ),
+        description="Global batch collection window; defaults to at most 10 seconds",
     )
 
     @field_validator("symbol", "exchange", "currency", mode="before")
@@ -279,6 +283,10 @@ class OptionChainSnapshotResponse(StrictModel):
     enrichment_complete: bool
     complete: bool
     collection_timeout_seconds: float
+    max_concurrency: int
+    preflight_attempted: bool
+    preflight_market_data_type: MarketDataType | None = None
+    preflight_seconds: float = Field(ge=0)
     retried_contracts: int = Field(ge=0)
     collection_started_at: datetime
     collected_at: datetime

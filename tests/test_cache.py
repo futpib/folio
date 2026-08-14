@@ -229,7 +229,9 @@ def test_gateway_lru_remembers_delayed_route_beyond_quote_microcache() -> None:
     async def scenario() -> None:
         backend = DelayedRouteGateway()
         gateway = CachingGateway(backend, quote_ttl_seconds=0.01)
-        request = MarketDataSnapshotRequest(contract=ContractSpec(symbol="AAPL"))
+        request = MarketDataSnapshotRequest(
+            contract=ContractSpec(symbol="AAPL", sec_type="OPT", strike=200, right="C")
+        )
         await gateway.start()
 
         await gateway.market_data_snapshot(request)
@@ -269,7 +271,9 @@ def test_gateway_retries_auto_when_cached_delayed_route_stops_working() -> None:
     async def scenario() -> None:
         backend = DelayedRouteGateway()
         gateway = CachingGateway(backend, quote_ttl_seconds=0.01)
-        request = MarketDataSnapshotRequest(contract=ContractSpec(symbol="AAPL"))
+        request = MarketDataSnapshotRequest(
+            contract=ContractSpec(symbol="AAPL", sec_type="OPT", strike=200, right="C")
+        )
         await gateway.start()
 
         await gateway.market_data_snapshot(request)
@@ -280,6 +284,26 @@ def test_gateway_retries_auto_when_cached_delayed_route_stops_working() -> None:
         assert backend.requested_market_data_types == [
             MarketDataType.AUTO,
             MarketDataType.DELAYED,
+            MarketDataType.AUTO,
+        ]
+        await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+def test_gateway_does_not_replace_implicit_delayed_stock_route() -> None:
+    async def scenario() -> None:
+        backend = DelayedRouteGateway()
+        gateway = CachingGateway(backend, quote_ttl_seconds=0.01)
+        request = MarketDataSnapshotRequest(contract=ContractSpec(symbol="AAPL"))
+        await gateway.start()
+
+        await gateway.market_data_snapshot(request)
+        await asyncio.sleep(0.02)
+        await gateway.market_data_snapshot(request)
+
+        assert backend.requested_market_data_types == [
+            MarketDataType.AUTO,
             MarketDataType.AUTO,
         ]
         await gateway.stop()

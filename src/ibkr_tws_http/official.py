@@ -92,7 +92,7 @@ class OfficialGateway:
         value: key for key, value in _MARKET_DATA_TYPE_IDS.items()
     }
     _DELAYED_GENERIC_TICKS = frozenset({101, 106, 165, 221, 232, 236, 258})
-    _STREAM_SETTLE_SECONDS = 0.5
+    _STREAM_CAPTURE_SECONDS = 0.5
     _STREAM_POLL_SECONDS = 0.05
 
     def __init__(self, config: TwsConfig, bindings: IbApiBindings | None = None):
@@ -379,10 +379,11 @@ class OfficialGateway:
     ) -> MarketDataSnapshot:
         started_at = time.monotonic()
         deadline = started_at + self._config.request_timeout_seconds
-        settle_seconds = min(
-            self._STREAM_SETTLE_SECONDS,
+        capture_seconds = min(
+            self._STREAM_CAPTURE_SECONDS,
             self._config.request_timeout_seconds / 2,
         )
+        first_usable_at: float | None = None
         try:
             while True:
                 if pending.future.done():
@@ -392,15 +393,16 @@ class OfficialGateway:
                     snapshot = (
                         self._snapshot(current, complete=False) if current is pending else None
                     )
-                    updated_at = pending.updated_at
                 if snapshot is None:
                     raise GatewayUnavailable("TWS market data request was interrupted")
 
                 now = time.monotonic()
-                if (
-                    snapshot.market_quote_complete
-                    or (pending.enrichment_expected and snapshot.model_complete)
-                ) and now - updated_at >= settle_seconds:
+                has_usable_data = snapshot.market_quote_complete or (
+                    pending.enrichment_expected and snapshot.model_complete
+                )
+                if has_usable_data and first_usable_at is None:
+                    first_usable_at = now
+                if self._stream_fields_complete(pending, snapshot):
                     return replace(
                         snapshot,
                         as_of=datetime.now(UTC),
@@ -409,6 +411,11 @@ class OfficialGateway:
                             and snapshot.model_complete
                             and snapshot.enrichment_complete
                         ),
+                    )
+                if first_usable_at is not None and now - first_usable_at >= capture_seconds:
+                    return self._mark_incomplete(
+                        snapshot,
+                        "market data capture window ended; partial data returned",
                     )
                 if now >= deadline:
                     if self._has_market_data(snapshot):
@@ -1049,6 +1056,53 @@ class OfficialGateway:
             for name in ("mark_price", "creditman_mark_price", "creditman_slow_mark_price")
         )
         return has_volume and has_open_interest and has_mark
+
+    @classmethod
+    def _stream_fields_complete(
+        cls,
+        pending: _Pending,
+        snapshot: MarketDataSnapshot,
+    ) -> bool:
+        if not pending.enrichment_expected:
+            return cls._has_two_sided_quote_or_last(
+                snapshot.fields,
+                snapshot.option_computations,
+            )
+        market_fields_complete = cls._has_two_sided_quote_or_last(
+            snapshot.fields,
+            snapshot.option_computations,
+        )
+        if pending.enrichment_requested:
+            return (
+                market_fields_complete and snapshot.model_complete and snapshot.enrichment_complete
+            )
+        return market_fields_complete and snapshot.model_complete
+
+    @classmethod
+    def _has_two_sided_quote_or_last(
+        cls,
+        fields: dict[str, float | int | str | None],
+        option_computations: dict[str, OptionComputation],
+    ) -> bool:
+        if cls._usable_price(fields.get("last")) or cls._usable_price(fields.get("delayed_last")):
+            return True
+        has_bid = cls._usable_price(fields.get("bid")) or cls._usable_price(
+            fields.get("delayed_bid")
+        )
+        has_ask = cls._usable_price(fields.get("ask")) or cls._usable_price(
+            fields.get("delayed_ask")
+        )
+        if has_bid and has_ask:
+            return True
+        bid = option_computations.get("bid")
+        ask = option_computations.get("ask")
+        last = option_computations.get("last")
+        return (last is not None and cls._usable_price(last.option_price)) or (
+            bid is not None
+            and ask is not None
+            and cls._usable_price(bid.option_price)
+            and cls._usable_price(ask.option_price)
+        )
 
     @classmethod
     def _has_market_data(cls, snapshot: MarketDataSnapshot) -> bool:

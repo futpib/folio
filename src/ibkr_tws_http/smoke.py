@@ -299,6 +299,17 @@ def run_smoke(
             and isinstance(chain_snapshot.get("enrichment_complete"), bool),
             "/v1/options/chain-snapshot returned invalid completeness indicators",
         )
+        _expect(
+            isinstance(chain_snapshot.get("collection_timeout_seconds"), (int, float))
+            and isinstance(chain_snapshot.get("max_concurrency"), int)
+            and isinstance(chain_snapshot.get("preflight_attempted"), bool),
+            "/v1/options/chain-snapshot returned invalid collection diagnostics",
+        )
+        if market_data_type == "auto":
+            _expect(
+                chain_snapshot.get("preflight_attempted") is True,
+                "/v1/options/chain-snapshot did not run the automatic data preflight",
+            )
         quotes = _list(chain_snapshot.get("quotes"), "/v1/options/chain-snapshot quotes")
         priced_quotes = [
             quote

@@ -96,7 +96,7 @@ entitlements and provides no delayed historical-data fallback.
 
 The service keeps bounded process-local LRU caches and never writes cached data
 to disk. Contract details, contract searches, option-chain definitions, and
-successful delayed-route decisions use a five-minute TTL with at most 512
+successful option delayed-route decisions use a five-minute TTL with at most 512
 entries per cache. Successful market snapshots use a one-second, 512-entry
 microcache; `collected_at` remains the collection time of the cached value.
 
@@ -180,23 +180,30 @@ containing null fields.
 Option quotes use short-lived streaming subscriptions because IBKR rejects
 generic option ticks on one-shot snapshots. The adapter collects the initial
 price, volume, open-interest, IV, and Greek burst, marks deadline-limited partial
-results incomplete, and always cancels the subscription. If live enrichment is
-unavailable, `auto` cancels that request and starts a clean delayed stream
-without generic ticks. Stock and option requests use this same short-lived
-streaming lifecycle so delayed quotes are not dependent on a one-shot snapshot
-end callback. Delayed bid/ask/last and side option computations can therefore
-produce `market_quote_complete: true`; model ticks are reported separately and
-optional enrichment can remain false.
+results incomplete, and always cancels the subscription. Collection ends as
+soon as all applicable fields arrive, or after a fixed 500 ms capture window
+from the first usable tick; continuing updates do not extend the window. If live
+enrichment is unavailable, `auto` cancels that request and starts a clean
+delayed stream without generic ticks. Stock and option requests use this same
+short-lived streaming lifecycle so delayed quotes are not dependent on a
+one-shot snapshot end callback. Delayed bid/ask/last and side option
+computations can therefore produce `market_quote_complete: true`; model ticks
+are reported separately and optional enrichment can remain false.
 
-The batch option endpoint resolves an underlying and expiry, then starts the
-underlying and every selected call and put concurrently. `timeout_seconds`
-selects a bounded 1–120 second global collection window; its default is twice
-the configured TWS request timeout, capped at 120 seconds (30 seconds with the
-default configuration).
-The first half is one concurrent collection wave, followed by one concurrent
-retry of only unresolved or timed-out contracts in the remaining window.
-`collection_timeout_seconds`, `retried_contracts`, and each row's `attempts`
-make that behavior observable.
+The batch option endpoint resolves an underlying and expiry, then probes one
+central option before fan-out when `market_data_type=auto`. A delayed result is
+reused so the other options skip redundant live-entitlement failures. The
+underlying and remaining options are collected with at most `max_concurrency`
+active requests (default 10), which paces larger chains without serializing the
+whole expiry.
+
+`timeout_seconds` selects a bounded 1–120 second global collection window; its
+default is the smaller of 10 seconds and the configured TWS request timeout.
+The preflight can use up to 20% of that window capped at two seconds. The first
+wave then receives 60% of the remaining time capped at five seconds, followed
+by one retry of only unresolved or timed-out contracts in the final window.
+`collection_timeout_seconds`, `preflight_market_data_type`,
+`retried_contracts`, and each row's `attempts` make that behavior observable.
 
 `collection_started_at` and `collected_at` bound the collection cohort, and the
 embedded underlying snapshot has its own exchange tick time. If the direct

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -769,6 +770,29 @@ class ImplicitDelayedUnderlyingFallbackClient(FakeClient):
         timer.start()
 
 
+class ContinuouslyUpdatingUnderlyingClient(FakeClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        assert requested.secType == "STK"
+        assert snapshot is False
+        self.wrapper.marketDataType(request_id, 3)
+        self.wrapper.tickPrice(request_id, 66, 198.5, None)
+        for index, delay in enumerate((0.05, 0.1, 0.15, 0.2, 0.25, 0.3), start=1):
+            timer = threading.Timer(
+                delay,
+                lambda value=index: self.wrapper.tickSize(request_id, 0, value),
+            )
+            timer.daemon = True
+            timer.start()
+
+
 class ComputationOnlyMarketDataClient(FakeClient):
     include_sides = False
 
@@ -901,6 +925,40 @@ def test_auto_underlying_keeps_2186_request_for_implicit_delayed_ticks() -> None
             assert ImplicitDelayedUnderlyingFallbackClient.instances[-1].market_data_requests == [
                 ("STK", "", False)
             ]
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+def test_stream_capture_window_is_not_extended_by_continuous_ticks() -> None:
+    async def scenario() -> None:
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.4, request_timeout_seconds=0.4),
+            IbApiBindings(
+                ContinuouslyUpdatingUnderlyingClient,
+                FakeWrapper,
+                FakeContract,
+                FakeTickType,
+            ),
+        )
+        await gateway.start()
+        started_at = time.monotonic()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(
+                    contract=ContractSpec(symbol="AAPL"),
+                    market_data_type=MarketDataType.DELAYED,
+                )
+            )
+            elapsed = time.monotonic() - started_at
+            assert snapshot.market_quote_complete is True
+            assert snapshot.complete is False
+            assert snapshot.notices[-1] == TwsNotice(
+                None,
+                "market data capture window ended; partial data returned",
+            )
+            assert elapsed < 0.35
         finally:
             await gateway.stop()
 

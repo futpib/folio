@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -21,6 +22,7 @@ from ibkr_tws_http.gateway import (
     OptionChain,
     OptionComputation,
     Position,
+    TwsNotice,
 )
 from ibkr_tws_http.models import MarketDataType
 
@@ -63,6 +65,7 @@ class FakeGateway:
         self.summary_tags: frozenset[str] | None = None
         self.last_contract = None
         self.option_chain_requests = []
+        self.market_data_requests = []
 
     async def start(self) -> None:
         self.started = True
@@ -124,6 +127,7 @@ class FakeGateway:
 
     async def market_data_snapshot(self, request):
         self.last_contract = request.contract
+        self.market_data_requests.append(request)
         delayed = request.market_data_type is MarketDataType.DELAYED
         prefix = "delayed_" if delayed else ""
         computations = {}
@@ -329,7 +333,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert response.json()[0]["volume"] == "1000"
 
         openapi = client.get("/openapi.json").json()
-        assert openapi["info"]["version"] == "0.7.0"
+        assert openapi["info"]["version"] == "0.8.0"
         assert set(openapi["paths"]) == {
             "/healthz",
             "/v1/status",
@@ -534,6 +538,16 @@ class ModelOnlyOptionGateway(FakeGateway):
         )
 
 
+class EntitlementPreflightGateway(FakeGateway):
+    async def market_data_snapshot(self, request):
+        if request.contract.sec_type == "OPT" and request.market_data_type is MarketDataType.AUTO:
+            snapshot = await super().market_data_snapshot(
+                request.model_copy(update={"market_data_type": MarketDataType.DELAYED})
+            )
+            return replace(snapshot, notices=(TwsNotice(2186, "using delayed data"),))
+        return await super().market_data_snapshot(request)
+
+
 def test_batch_snapshot_keeps_per_contract_errors_and_redacts_accounts() -> None:
     with TestClient(create_app(settings(), PartialQuoteErrorGateway())) as client:
         response = client.get(
@@ -544,6 +558,8 @@ def test_batch_snapshot_keeps_per_contract_errors_and_redacts_accounts() -> None
     payload = response.json()
     quotes = payload["quotes"]
     assert payload["complete"] is False
+    assert payload["collection_timeout_seconds"] == 10
+    assert payload["preflight_attempted"] is True
     assert payload["underlying_snapshot"] is not None
     assert len([quote for quote in quotes if quote["snapshot"] is not None]) == 3
     errors = [quote["error"] for quote in quotes if quote["error"] is not None]
@@ -580,7 +596,12 @@ def test_batch_snapshot_uses_one_concurrent_collection_deadline() -> None:
     with TestClient(create_app(deadline_settings, gateway)) as client:
         response = client.get(
             "/v1/options/chain-snapshot",
-            params={"symbol": "AAPL", "expiration": "20260918"},
+            params={
+                "symbol": "AAPL",
+                "expiration": "20260918",
+                "market_data_type": "delayed",
+                "max_concurrency": 3,
+            },
         )
     elapsed = time.monotonic() - started_at
 
@@ -592,6 +613,8 @@ def test_batch_snapshot_uses_one_concurrent_collection_deadline() -> None:
     assert payload["enrichment_complete"] is False
     assert payload["complete"] is False
     assert payload["retried_contracts"] == 7
+    assert payload["max_concurrency"] == 3
+    assert payload["preflight_attempted"] is False
     assert payload["underlying_attempts"] == 2
     assert payload["underlying_error"] == {
         "code": None,
@@ -601,7 +624,7 @@ def test_batch_snapshot_uses_one_concurrent_collection_deadline() -> None:
         (None, "batch market data collection deadline reached")
     }
     assert {quote["attempts"] for quote in payload["quotes"]} == {2}
-    assert gateway.max_active_quotes == 7
+    assert gateway.max_active_quotes == 3
     assert gateway.active_quotes == 0
     assert elapsed < 1
 
@@ -671,3 +694,25 @@ def test_batch_does_not_label_model_only_options_as_market_quotes() -> None:
         assert snapshot["quote_complete"] is False
         assert snapshot["model_complete"] is True
         assert (snapshot["bid"], snapshot["ask"], snapshot["last"]) == (None, None, None)
+
+
+def test_batch_preflight_populates_delayed_route_before_quote_fanout() -> None:
+    gateway = EntitlementPreflightGateway()
+    with TestClient(create_app(settings(), gateway)) as client:
+        response = client.get(
+            "/v1/options/chain-snapshot",
+            params={"symbol": "AAPL", "expiration": "20260918"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["preflight_attempted"] is True
+    assert payload["preflight_market_data_type"] == "delayed"
+    assert payload["preflight_seconds"] >= 0
+    option_requests = [
+        request for request in gateway.market_data_requests if request.contract.sec_type == "OPT"
+    ]
+    assert option_requests[0].market_data_type is MarketDataType.DELAYED
+    assert all(
+        request.market_data_type is MarketDataType.DELAYED for request in option_requests[1:]
+    )

@@ -281,6 +281,7 @@ class CachingGateway:
             request.market_data_type is not MarketDataType.AUTO
             or request.regulatory_snapshot
             or contract.symbol is None
+            or contract.sec_type != "OPT"
         ):
             return None
         return "|".join(

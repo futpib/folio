@@ -43,7 +43,7 @@ class FakeClient:
             return {"tws_connected": self.connected, "server_version": 204}
         if path == "/openapi.json":
             return {
-                "info": {"version": "0.7.0"},
+                "info": {"version": "0.8.0"},
                 "paths": {
                     endpoint: {method: {}} for endpoint, method in EXPECTED_API_OPERATIONS.items()
                 },
@@ -103,6 +103,11 @@ class FakeClient:
                 "quote_complete": False,
                 "model_complete": False,
                 "enrichment_complete": False,
+                "collection_timeout_seconds": 10,
+                "max_concurrency": 10,
+                "preflight_attempted": path.find("market_data_type=auto") >= 0,
+                "preflight_market_data_type": "delayed",
+                "preflight_seconds": 0.2,
                 "underlying_snapshot": {
                     "complete": True,
                     "market_quote_complete": True,
@@ -166,7 +171,7 @@ def test_smoke_exercises_live_read_only_flow_without_exposing_account_ids() -> N
 
     result = run_smoke(client, "aapl", messages.append)
 
-    assert result.api_version == "0.7.0"
+    assert result.api_version == "0.8.0"
     assert result.server_version == 204
     assert result.account_count == 1
     assert result.account_summary_count == 1

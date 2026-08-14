@@ -493,6 +493,8 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
                 ),
             )
 
+        quote_slots = asyncio.Semaphore(request.max_concurrency)
+
         async def snapshot_contract(
             contract_spec: ContractSpec,
         ) -> tuple[MarketDataSnapshotResponse | None, TwsErrorDetailResponse | None]:
@@ -501,7 +503,8 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
                 market_data_type=request.market_data_type,
             )
             try:
-                snapshot = await active_gateway.market_data_snapshot(snapshot_request)
+                async with quote_slots:
+                    snapshot = await active_gateway.market_data_snapshot(snapshot_request)
             except (GatewayRequestError, GatewayTimeout) as exc:
                 return None, _market_data_error(exc)
             return (
@@ -517,8 +520,8 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
         underlying_spec = _contract_spec(underlying)
         specs = [underlying_spec, *(_contract_spec(contract) for contract in contracts)]
         collection_timeout = request.timeout_seconds or min(
-            settings.tws.request_timeout_seconds * 2,
-            120,
+            settings.tws.request_timeout_seconds,
+            10,
         )
         deadline = time.monotonic() + collection_timeout
         results: dict[
@@ -527,7 +530,9 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
         ] = {}
         attempts = [0] * len(specs)
 
-        async def collect_wave(indices: list[int], timeout: float) -> None:
+        async def collect_wave(indices: list[int], timeout: float) -> set[int]:
+            if not indices:
+                return set()
             tasks = {
                 asyncio.create_task(snapshot_contract(specs[index])): index for index in indices
             }
@@ -545,11 +550,33 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             await asyncio.gather(*pending, return_exceptions=True)
             for task in done:
                 results[tasks[task]] = task.result()
+            return {tasks[task] for task in done}
 
         all_indices = list(range(len(specs)))
+        preflight_attempted = request.market_data_type is MarketDataType.AUTO
+        preflight_market_data_type = None
+        preflight_seconds = 0.0
+        preflight_index = 1 + len(contracts) // 2
+        if preflight_attempted:
+            preflight_started_at = time.monotonic()
+            preflight_budget = min(
+                2.0,
+                max(0, deadline - preflight_started_at) * 0.2,
+            )
+            completed = await collect_wave([preflight_index], preflight_budget)
+            preflight_seconds = time.monotonic() - preflight_started_at
+            if preflight_index in completed:
+                preflight_snapshot = results[preflight_index][0]
+                if preflight_snapshot is not None:
+                    preflight_market_data_type = preflight_snapshot.market_data_type
+
+        first_wave_indices = [
+            index for index in all_indices if not preflight_attempted or index != preflight_index
+        ]
+        remaining = max(0, deadline - time.monotonic())
         await collect_wave(
-            all_indices,
-            min(collection_timeout / 2, deadline - time.monotonic()),
+            first_wave_indices,
+            min(5.0, remaining * 0.6),
         )
         retry_indices = [
             index
@@ -630,6 +657,10 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             enrichment_complete=enrichment_complete,
             complete=market_quote_complete and model_complete and enrichment_complete,
             collection_timeout_seconds=collection_timeout,
+            max_concurrency=request.max_concurrency,
+            preflight_attempted=preflight_attempted,
+            preflight_market_data_type=preflight_market_data_type,
+            preflight_seconds=preflight_seconds,
             retried_contracts=len(retried_indices),
             collection_started_at=collection_started_at,
             collected_at=datetime.now(UTC),

@@ -92,6 +92,20 @@ Use `--skip-market-data` for a metadata-only diagnostic. Historical bars are
 validated in OpenAPI but are not requested because IBKR requires live market-data
 entitlements and provides no delayed historical-data fallback.
 
+## In-memory cache
+
+The service keeps bounded process-local LRU caches and never writes cached data
+to disk. Contract details, contract searches, option-chain definitions, and
+successful delayed-route decisions use a five-minute TTL with at most 512
+entries per cache. Successful market snapshots use a one-second, 512-entry
+microcache; `collected_at` remains the collection time of the cached value.
+
+Metadata loads are single-flight, so concurrent identical requests share one
+TWS operation. Quote collection remains independently cancellable, which is
+required by the batch deadline and retry behavior. Errors, accounts, account
+summary, positions, and historical bars are not cached. Every cache is cleared
+when the process stops or the observed TWS connection identity changes.
+
 ## API
 
 OpenAPI documentation is served at <http://127.0.0.1:8080/docs>. The endpoints

@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .cache import CachingGateway
 from .config import Settings
 from .gateway import (
     ContractInfo,
@@ -254,7 +255,7 @@ TWS_ERROR_RESPONSES = {
 
 def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
     settings.validate()
-    active_gateway = gateway or OfficialGateway(settings.tws)
+    active_gateway = CachingGateway(gateway or OfficialGateway(settings.tws))
     policy = ExposurePolicy(settings.exposure)
 
     @asynccontextmanager

@@ -10,7 +10,7 @@ import pytest
 from ibkr_tws_http.config import TwsConfig
 from ibkr_tws_http.gateway import GatewayRequestError
 from ibkr_tws_http.models import ContractSpec, HistoricalBarsRequest, MarketDataSnapshotRequest
-from ibkr_tws_http.official import IbApiBindings, OfficialGateway
+from ibkr_tws_http.official import IbApiBindings, OfficialGateway, load_ibapi
 
 
 class FakeWrapper:
@@ -133,6 +133,15 @@ class FakeClient:
 
     def cancelHistoricalData(self, request_id: int) -> None:
         self.cancelled.append(("historical", request_id))
+
+
+def test_loads_vendored_official_client() -> None:
+    import ibapi
+
+    bindings = load_ibapi()
+    assert ibapi.__version__ == "10.49.02"
+    assert bindings.client.__module__ == "ibapi.client"
+    assert bindings.wrapper.__module__ == "ibapi.wrapper"
 
 
 def test_official_callback_bridge_round_trip() -> None:

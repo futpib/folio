@@ -11,6 +11,8 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
   "fastapi>=0.115,<1",
+  "ibapi @ git+https://github.com/deepentropy/ibapi.git@e27eff9c8cd9da7d91ffabaa4db86fec683956e7",
+  "protobuf==5.29.5",
   "uvicorn[standard]>=0.34,<1",
 ]
 
@@ -27,6 +29,9 @@ ibkr-tws-http = "ibkr_tws_http.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ibkr_tws_http"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"

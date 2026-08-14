@@ -11,16 +11,20 @@ read every resource permitted by the exposure policy.
 
 ## Install
 
-Python 3.11 or newer and the official TWS API package are required. Download the
-TWS API from IBKR, then install its Python client alongside this project:
+Python 3.11 or newer is required. One command installs the service and every
+dependency:
 
 ```console
 uv sync --extra dev
-uv pip install /path/to/TWS\ API/source/pythonclient
 ```
 
-The PyPI package named `ibapi` is not declared as a dependency because IBKR
-distributes the current official client in its TWS API download.
+The current official client is not available from IBKR as a package index or
+Git dependency. The lockfile therefore pins the exact commit of an automated
+[Git mirror](https://github.com/deepentropy/ibapi/tree/e27eff9c8cd9da7d91ffabaa4db86fec683956e7)
+of IBKR's 10.49.2 release. Its API source was compared with the
+[official download](https://interactivebrokers.github.io/downloads/twsapi_macunix.1049.02.zip):
+the only difference is version-string formatting (`10.49.02` instead of
+`10.49.2`). The old PyPI package named `ibapi` is not used.
 
 In TWS, enable socket clients under **Global Configuration > API > Settings**.
 Also enable TWS's **Read-Only API** setting as defense in depth. The default TWS
@@ -31,25 +35,22 @@ port here is the paper-trading TWS port, `7497`.
 No configuration file is required:
 
 ```console
-uv run --no-sync ibkr-tws-http
+uv run ibkr-tws-http
 ```
 
 The HTTP listener can be selected on the command line:
 
 ```console
-uv run --no-sync ibkr-tws-http --host 127.0.0.1 --port 9080
+uv run ibkr-tws-http --host 127.0.0.1 --port 9080
 ```
 
 To apply an exposure policy, start from [`example-config.toml`](example-config.toml):
 
 ```console
-uv run --no-sync ibkr-tws-http --config example-config.toml
-uv run --no-sync ibkr-tws-http --config example-config.toml --host 127.0.0.2 --port 9080
-uv run --no-sync ibkr-tws-http --config example-config.toml --check
+uv run ibkr-tws-http --config example-config.toml
+uv run ibkr-tws-http --config example-config.toml --host 127.0.0.2 --port 9080
+uv run ibkr-tws-http --config example-config.toml --check
 ```
-
-`--no-sync` preserves the separately installed official `ibapi` package; a
-subsequent `uv sync` removes packages that are not present in the lockfile.
 
 `--host` and `--port` override `[server]` values in the TOML file. The TWS
 socket itself is always restricted to a loopback host.

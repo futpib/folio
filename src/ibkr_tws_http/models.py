@@ -206,7 +206,8 @@ class MarketDataSnapshotResponse(StrictModel):
     contract: ContractSpec
     requested_market_data_type: MarketDataType
     market_data_type: MarketDataType
-    as_of: datetime
+    complete: bool
+    collected_at: datetime
     last_trade_time: datetime | None = None
     bid: float | None = None
     ask: float | None = None
@@ -226,6 +227,10 @@ class TwsErrorResponse(StrictModel):
     tws_error: TwsErrorDetailResponse
 
 
+class GatewayTimeoutResponse(StrictModel):
+    detail: Literal["TWS request timed out"] = "TWS request timed out"
+
+
 class OptionChainQuoteResponse(StrictModel):
     contract: ContractResponse
     snapshot: MarketDataSnapshotResponse | None = None
@@ -240,11 +245,21 @@ class OptionChainQuoteResponse(StrictModel):
 
 class OptionChainSnapshotResponse(StrictModel):
     underlying: ContractResponse
+    underlying_snapshot: MarketDataSnapshotResponse | None = None
+    underlying_error: TwsErrorDetailResponse | None = None
     expiration: str
     exchange: str
     requested_market_data_type: MarketDataType
-    as_of: datetime
+    complete: bool
+    collection_started_at: datetime
+    collected_at: datetime
     quotes: list[OptionChainQuoteResponse]
+
+    @model_validator(mode="after")
+    def require_underlying_snapshot_or_error(self) -> OptionChainSnapshotResponse:
+        if (self.underlying_snapshot is None) == (self.underlying_error is None):
+            raise ValueError("exactly one of underlying_snapshot or underlying_error is required")
+        return self
 
 
 class HistoricalBarResponse(StrictModel):

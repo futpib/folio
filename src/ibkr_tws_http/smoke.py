@@ -203,6 +203,10 @@ def run_smoke(
             any(underlying_snapshot.get(field) is not None for field in ("bid", "ask", "last")),
             f"market snapshot returned no usable price for {symbol}",
         )
+        _expect(
+            underlying_snapshot.get("complete") is True,
+            f"market snapshot returned an incomplete result for {symbol}",
+        )
         report(f"Underlying market snapshot succeeded ({underlying_market_data_type})")
 
     chain_query = urlencode(
@@ -269,6 +273,18 @@ def run_smoke(
         chain_snapshot = _object(
             client.get(f"/v1/options/chain-snapshot?{quote_query}"),
             "/v1/options/chain-snapshot",
+        )
+        batch_underlying = _object(
+            chain_snapshot.get("underlying_snapshot"),
+            "/v1/options/chain-snapshot underlying_snapshot",
+        )
+        _expect(
+            any(batch_underlying.get(field) is not None for field in ("bid", "ask", "last")),
+            f"batch option snapshot returned no usable underlying price for {symbol}",
+        )
+        _expect(
+            isinstance(chain_snapshot.get("complete"), bool),
+            "/v1/options/chain-snapshot returned no completeness indicator",
         )
         quotes = _list(chain_snapshot.get("quotes"), "/v1/options/chain-snapshot quotes")
         priced_quotes = [

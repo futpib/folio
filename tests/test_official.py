@@ -8,7 +8,7 @@ from typing import ClassVar
 import pytest
 
 from ibkr_tws_http.config import TwsConfig
-from ibkr_tws_http.gateway import GatewayRequestError, TwsNotice
+from ibkr_tws_http.gateway import GatewayRequestError, GatewayTimeout, TwsNotice
 from ibkr_tws_http.models import (
     ContractSpec,
     HistoricalBarsRequest,
@@ -74,6 +74,7 @@ class FakeClient:
         self.market_data_type = 1
         self.market_data_type_requests: list[int] = []
         self.last_generic_ticks = ""
+        self.market_data_requests: list[tuple[str, str, bool]] = []
         type(self).instances.append(self)
 
     def connect(self, host: str, port: int, clientId: int) -> bool:
@@ -155,6 +156,7 @@ class FakeClient:
         options: list[object],
     ) -> None:
         self.last_generic_ticks = generic_ticks
+        self.market_data_requests.append((requested.secType, generic_ticks, snapshot))
         self.wrapper.marketDataType(request_id, self.market_data_type)
         self.wrapper.tickPrice(request_id, 1, 199.5, None)
         self.wrapper.tickPrice(request_id, 2, 199.6, None)
@@ -179,7 +181,8 @@ class FakeClient:
                 -0.01,
                 5.0,
             )
-        self.wrapper.tickSnapshotEnd(request_id)
+        if snapshot:
+            self.wrapper.tickSnapshotEnd(request_id)
 
     def reqMarketDataType(self, market_data_type: int) -> None:
         self.market_data_type = market_data_type
@@ -295,6 +298,12 @@ def test_official_callback_bridge_round_trip() -> None:
         )
         assert option_snapshot.fields["option_call_open_interest"] == 2500
         assert option_snapshot.option_computations["model"].delta == 0.55
+        assert option_snapshot.complete is True
+        assert FakeClient.instances[-1].market_data_requests[-1] == (
+            "OPT",
+            "100,101,106,221",
+            False,
+        )
 
         delayed_option_snapshot = await gateway.market_data_snapshot(
             MarketDataSnapshotRequest(
@@ -310,7 +319,12 @@ def test_official_callback_bridge_round_trip() -> None:
             )
         )
         assert delayed_option_snapshot.market_data_type is MarketDataType.DELAYED
-        assert FakeClient.instances[-1].last_generic_ticks == "101,106,165"
+        assert FakeClient.instances[-1].last_generic_ticks == "101,106,221"
+        assert FakeClient.instances[-1].market_data_requests[-1] == (
+            "OPT",
+            "101,106,221",
+            False,
+        )
 
         bars = await gateway.historical_bars(
             HistoricalBarsRequest(
@@ -436,6 +450,34 @@ class ApiSubscriptionFallbackClient(DelayedFallbackClient):
         )
 
 
+class DelayedNotEnabledFallbackClient(ApiSubscriptionFallbackClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        if self.market_data_type == 1:
+            self.wrapper.error(
+                request_id,
+                10168,
+                "Requested market data is not subscribed. Delayed market data is not enabled",
+                "",
+            )
+            return
+        super().reqMktData(
+            request_id,
+            requested,
+            generic_ticks,
+            snapshot,
+            regulatory_snapshot,
+            options,
+        )
+
+
 class ClosedMarketFallbackClient(DelayedFallbackClient):
     def reqMktData(
         self,
@@ -485,7 +527,12 @@ class PartialSubscriptionClient(FakeClient):
 
 @pytest.mark.parametrize(
     "client_type",
-    [DelayedFallbackClient, ApiSubscriptionFallbackClient, EmptyLiveFallbackClient],
+    [
+        DelayedFallbackClient,
+        ApiSubscriptionFallbackClient,
+        DelayedNotEnabledFallbackClient,
+        EmptyLiveFallbackClient,
+    ],
 )
 def test_auto_market_data_falls_back_to_delayed_quotes(client_type) -> None:
     async def scenario() -> None:
@@ -507,6 +554,99 @@ def test_auto_market_data_falls_back_to_delayed_quotes(client_type) -> None:
                 "delayed_last_timestamp": "1786714800",
             }
             assert client_type.instances[-1].market_data_type_requests == [1, 3]
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+class EmptyMarketDataClient(FakeClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        self.wrapper.tickSnapshotEnd(request_id)
+
+
+class PartialStreamingMarketDataClient(FakeClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        assert requested.secType == "OPT"
+        assert snapshot is False
+        self.wrapper.tickSize(request_id, 27, 2500)
+        self.wrapper.tickOptionComputation(
+            request_id,
+            13,
+            0,
+            0.75,
+            0.55,
+            2.05,
+            0.0,
+            0.08,
+            0.02,
+            -0.01,
+            5.0,
+        )
+
+
+def test_empty_market_data_is_a_timeout_instead_of_a_clean_snapshot() -> None:
+    async def scenario() -> None:
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.1, request_timeout_seconds=0.1),
+            IbApiBindings(EmptyMarketDataClient, FakeWrapper, FakeContract, FakeTickType),
+        )
+        await gateway.start()
+        try:
+            with pytest.raises(GatewayTimeout, match="returned no market data"):
+                await gateway.market_data_snapshot(
+                    MarketDataSnapshotRequest(
+                        contract=ContractSpec(symbol="AAPL"),
+                        market_data_type=MarketDataType.DELAYED,
+                    )
+                )
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_market_data_returns_observable_partial_result_at_deadline() -> None:
+    async def scenario() -> None:
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.1, request_timeout_seconds=0.1),
+            IbApiBindings(
+                PartialStreamingMarketDataClient,
+                FakeWrapper,
+                FakeContract,
+                FakeTickType,
+            ),
+        )
+        await gateway.start()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(
+                    contract=ContractSpec(symbol="AAPL", sec_type="OPT"),
+                    market_data_type=MarketDataType.LIVE,
+                )
+            )
+            assert snapshot.complete is False
+            assert snapshot.fields["option_call_open_interest"] == 2500
+            assert snapshot.notices[-1] == TwsNotice(
+                None,
+                "market data collection reached its deadline; partial data returned",
+            )
         finally:
             await gateway.stop()
 

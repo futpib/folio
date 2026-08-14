@@ -137,23 +137,37 @@ Use contract search to find the underlying contract ID, query its option chains
 for available exchanges, trading classes, expirations, and strikes, then use
 contract details to resolve a selected expiry/strike/right into a specific
 option contract. Supplying an empty `exchange` (the default) returns chains
-from all applicable exchanges.
+from all applicable exchanges. The batch endpoint always performs this broad
+discovery first, selects the requested returned chain (normally `SMART`), and
+uses that exchange only when resolving and quoting its contracts.
 
 Market snapshots accept `auto`, `live`, `frozen`, `delayed`, or
 `delayed-frozen`. `auto` first requests live data and retries with IBKR's free
 delayed feed when TWS reports missing entitlements or returns no usable price,
 then tries delayed-frozen data for a closed market.
-The response identifies both the requested and actual type and exposes `as_of`,
-last-trade time, bid/ask/last prices and sizes, volume, open interest, and bid,
-ask, last, and model option computations containing IV and Greeks. Raw IBKR tick
-fields remain available under `fields`; non-fatal partial-subscription messages
-are returned under `tws_notices` with the same redaction.
+The response identifies both the requested and actual type. `collected_at` is
+the server collection time, while `last_trade_time` is the exchange tick time.
+It also exposes an explicit `complete` flag, bid/ask/last prices and sizes,
+volume, open interest, and bid, ask, last, and model option computations
+containing IV and Greeks. Raw IBKR tick fields remain available under `fields`;
+non-fatal partial-subscription and partial-collection messages are returned under
+`tws_notices` with the same redaction. A wholly empty snapshot is an HTTP 504,
+not a successful response containing null fields.
 
-The batch option endpoint resolves an underlying and expiry, then snapshots the
-matching calls and puts with at most ten active requests. A request may contain
-up to 40 contracts; use `strike_min` and `strike_max` to narrow larger chains.
-Each quote carries either a snapshot or a structured per-contract TWS error, so
-one unavailable quote does not discard the rest of the chain.
+Option quotes use short-lived streaming subscriptions because IBKR rejects
+generic option ticks on one-shot snapshots. The adapter collects the initial
+price, volume, open-interest, IV, and Greek burst, marks deadline-limited partial
+results incomplete, and always cancels the subscription.
+
+The batch option endpoint resolves an underlying and expiry, then collects the
+underlying and matching calls and puts together with at most ten active
+requests. `collection_started_at` and `collected_at` bound that collection
+cohort, and the embedded underlying snapshot has its own exchange tick time. A
+request may contain up to 40 option contracts; use `strike_min` and `strike_max`
+to narrow larger chains. Each quote carries either a snapshot or a structured
+per-contract TWS error, including timeouts, so one unavailable strike does not
+discard the rest of the chain. The batch `complete` flag is false when any
+component is partial or unavailable.
 
 The default policy redacts account IDs as `account`. Configure an alias to make
 multiple accounts distinguishable without returning their real IDs. Empty

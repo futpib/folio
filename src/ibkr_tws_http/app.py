@@ -28,6 +28,7 @@ from .models import (
     ContractResponse,
     ContractSearchResponse,
     ContractSpec,
+    GatewayTimeoutResponse,
     HistoricalBarResponse,
     HistoricalBarsRequest,
     MarketDataSnapshotRequest,
@@ -98,6 +99,7 @@ def _available_number(
             and not isinstance(value, bool)
             and math.isfinite(value)
             and abs(value) < 1e100
+            and value != -1
             and (not nonnegative or value >= 0)
         ):
             return value
@@ -171,7 +173,8 @@ def _market_data_response(
         contract=contract,
         requested_market_data_type=requested_type,
         market_data_type=snapshot.market_data_type,
-        as_of=snapshot.as_of,
+        complete=snapshot.complete,
+        collected_at=snapshot.as_of,
         last_trade_time=_last_trade_time(fields),
         bid=_available_number(fields, ("bid", "delayed_bid")),
         ask=_available_number(fields, ("ask", "delayed_ask")),
@@ -194,7 +197,18 @@ def _tws_error(error: GatewayRequestError) -> TwsErrorDetailResponse:
     return TwsErrorDetailResponse(code=error.code, message=error.public_message)
 
 
-TWS_ERROR_RESPONSES = {502: {"model": TwsErrorResponse}}
+def _market_data_error(
+    error: GatewayRequestError | GatewayTimeout,
+) -> TwsErrorDetailResponse:
+    if isinstance(error, GatewayRequestError):
+        return _tws_error(error)
+    return TwsErrorDetailResponse(code=None, message="TWS market data request timed out")
+
+
+TWS_ERROR_RESPONSES = {
+    502: {"model": TwsErrorResponse},
+    504: {"model": GatewayTimeoutResponse},
+}
 
 
 def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
@@ -366,14 +380,15 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="optionable underlying was not found")
         underlying = underlyings[0]
 
-        chain_request = OptionChainsRequest(
+        requested_chain = OptionChainsRequest(
             underlying_symbol=underlying.symbol,
             underlying_con_id=underlying.con_id,
             underlying_security_type=underlying.sec_type,
             exchange=request.exchange,
         )
-        policy.check_option_chain(chain_request)
-        chains = policy.filter_option_chains(await active_gateway.option_chains(chain_request))
+        policy.check_option_chain(requested_chain)
+        discovery_request = requested_chain.model_copy(update={"exchange": ""})
+        chains = policy.filter_option_chains(await active_gateway.option_chains(discovery_request))
         matching_chains = [
             chain
             for chain in chains
@@ -438,8 +453,9 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
 
         semaphore = asyncio.Semaphore(10)
 
-        async def quote(contract: ContractInfo) -> OptionChainQuoteResponse:
-            contract_spec = _contract_spec(contract)
+        async def snapshot_contract(
+            contract_spec: ContractSpec,
+        ) -> tuple[MarketDataSnapshotResponse | None, TwsErrorDetailResponse | None]:
             snapshot_request = MarketDataSnapshotRequest(
                 contract=contract_spec,
                 market_data_type=request.market_data_type,
@@ -447,27 +463,49 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             try:
                 async with semaphore:
                     snapshot = await active_gateway.market_data_snapshot(snapshot_request)
-            except GatewayRequestError as exc:
-                return OptionChainQuoteResponse(
-                    contract=_contract_response(contract),
-                    error=_tws_error(exc),
-                )
-            return OptionChainQuoteResponse(
-                contract=_contract_response(contract),
-                snapshot=_market_data_response(
+            except (GatewayRequestError, GatewayTimeout) as exc:
+                return None, _market_data_error(exc)
+            return (
+                _market_data_response(
                     contract_spec,
                     request.market_data_type,
                     snapshot,
                 ),
+                None,
             )
 
-        quotes = await asyncio.gather(*(quote(contract) for contract in contracts))
+        async def quote(contract: ContractInfo) -> OptionChainQuoteResponse:
+            contract_spec = _contract_spec(contract)
+            snapshot, error = await snapshot_contract(contract_spec)
+            return OptionChainQuoteResponse(
+                contract=_contract_response(contract),
+                snapshot=snapshot,
+                error=error,
+            )
+
+        collection_started_at = datetime.now(UTC)
+        underlying_spec = _contract_spec(underlying)
+        results = await asyncio.gather(
+            snapshot_contract(underlying_spec),
+            *(quote(contract) for contract in contracts),
+        )
+        underlying_snapshot, underlying_error = results[0]
+        quotes = list(results[1:])
+        complete = (
+            underlying_snapshot is not None
+            and underlying_snapshot.complete
+            and all(quote.snapshot is not None and quote.snapshot.complete for quote in quotes)
+        )
         return OptionChainSnapshotResponse(
             underlying=_contract_response(underlying),
+            underlying_snapshot=underlying_snapshot,
+            underlying_error=underlying_error,
             expiration=request.expiration,
             exchange=request.exchange,
             requested_market_data_type=request.market_data_type,
-            as_of=datetime.now(UTC),
+            complete=complete,
+            collection_started_at=collection_started_at,
+            collected_at=datetime.now(UTC),
             quotes=quotes,
         )
 

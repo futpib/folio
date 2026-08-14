@@ -43,7 +43,7 @@ class FakeClient:
             return {"tws_connected": self.connected, "server_version": 204}
         if path == "/openapi.json":
             return {
-                "info": {"version": "0.3.0"},
+                "info": {"version": "0.4.0"},
                 "paths": {
                     endpoint: {method: {}} for endpoint, method in EXPECTED_API_OPERATIONS.items()
                 },
@@ -98,14 +98,26 @@ class FakeClient:
             "&market_data_type=auto&strike_min=195.0&strike_max=205.0&max_contracts=6"
         ):
             return {
+                "complete": False,
+                "underlying_snapshot": {
+                    "complete": True,
+                    "market_data_type": "live",
+                    "bid": 199.5,
+                    "ask": 199.6,
+                    "last": 199.55,
+                },
+                "underlying_error": None,
                 "quotes": [
-                    {"contract": {"right": "C"}, "snapshot": {"bid": 1.95, "ask": 2.1}},
+                    {
+                        "contract": {"right": "C"},
+                        "snapshot": {"complete": True, "bid": 1.95, "ask": 2.1},
+                    },
                     {
                         "contract": {"right": "P"},
                         "snapshot": None,
                         "error": {"code": 354, "message": "not subscribed"},
                     },
-                ]
+                ],
             }
         raise AssertionError(f"unexpected GET {path}")
 
@@ -119,6 +131,8 @@ class FakeClient:
                 "market_data_type": (
                     "delayed" if payload["market_data_type"] == "delayed" else "live"
                 ),
+                "complete": True,
+                "collected_at": "2026-08-14T14:00:00Z",
                 "bid": 199.5,
                 "ask": 199.6,
                 "last": 199.55,
@@ -132,7 +146,7 @@ def test_smoke_exercises_live_read_only_flow_without_exposing_account_ids() -> N
 
     result = run_smoke(client, "aapl", messages.append)
 
-    assert result.api_version == "0.3.0"
+    assert result.api_version == "0.4.0"
     assert result.server_version == 204
     assert result.account_count == 1
     assert result.account_summary_count == 1

@@ -135,7 +135,7 @@ class OptionComputation:
 
 @dataclass(frozen=True, slots=True)
 class TwsNotice:
-    code: int
+    code: int | None
     message: str
 
 
@@ -143,6 +143,7 @@ class TwsNotice:
 class MarketDataSnapshot:
     market_data_type: MarketDataType
     as_of: datetime
+    complete: bool
     fields: dict[str, float | int | str | None]
     option_computations: dict[str, OptionComputation]
     notices: tuple[TwsNotice, ...] = ()

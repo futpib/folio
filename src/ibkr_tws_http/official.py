@@ -4,9 +4,10 @@ import asyncio
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, ClassVar
@@ -68,12 +69,13 @@ class _Pending:
     market_data_type: MarketDataType = MarketDataType.LIVE
     option_computations: dict[str, OptionComputation] = field(default_factory=dict)
     notices: list[TwsNotice] = field(default_factory=list)
+    updated_at: float = field(default_factory=time.monotonic)
 
 
 class OfficialGateway:
     _INFORMATIONAL_CODES = frozenset({1101, 1102, 2104, 2106, 2107, 2108, 2158})
     _NON_FATAL_REQUEST_CODES = frozenset({10090, 10091, 10167})
-    _AUTO_DELAYED_CODES = frozenset({354, 10089, 10167, 10197})
+    _AUTO_DELAYED_CODES = frozenset({354, 10089, 10167, 10168, 10197})
     _MARKET_DATA_TYPE_IDS: ClassVar[dict[MarketDataType, int]] = {
         MarketDataType.LIVE: 1,
         MarketDataType.FROZEN: 2,
@@ -84,6 +86,8 @@ class OfficialGateway:
         value: key for key, value in _MARKET_DATA_TYPE_IDS.items()
     }
     _DELAYED_GENERIC_TICKS = frozenset({101, 106, 165, 221, 232, 236, 258})
+    _STREAM_SETTLE_SECONDS = 0.5
+    _STREAM_POLL_SECONDS = 0.05
 
     def __init__(self, config: TwsConfig, bindings: IbApiBindings | None = None):
         self._config = config
@@ -212,24 +216,45 @@ class OfficialGateway:
 
     async def market_data_snapshot(self, request: MarketDataSnapshotRequest) -> MarketDataSnapshot:
         if request.market_data_type is not MarketDataType.AUTO:
-            return await self._market_data_snapshot_once(request, request.market_data_type)
+            snapshot = await self._market_data_snapshot_once(request, request.market_data_type)
+            if self._has_market_data(snapshot):
+                return snapshot
+            raise GatewayTimeout("TWS returned no market data")
 
         fallback_types = (
             MarketDataType.LIVE,
             MarketDataType.DELAYED,
             MarketDataType.DELAYED_FROZEN,
         )
+        partial_snapshot = None
         for index, market_data_type in enumerate(fallback_types):
             final_attempt = index == len(fallback_types) - 1
             try:
                 snapshot = await self._market_data_snapshot_once(request, market_data_type)
             except GatewayRequestError as exc:
-                if final_attempt or exc.code not in self._AUTO_DELAYED_CODES:
+                if exc.code not in self._AUTO_DELAYED_CODES:
+                    raise
+                if final_attempt and partial_snapshot is not None:
+                    break
+                if final_attempt:
                     raise
                 continue
-            if final_attempt or self._has_usable_market_price(snapshot):
+            except GatewayTimeout:
+                if final_attempt and partial_snapshot is not None:
+                    break
+                if final_attempt:
+                    raise
+                continue
+            if self._has_usable_market_price(snapshot):
                 return snapshot
-        raise AssertionError("market data fallback loop did not return")
+            if self._has_market_data(snapshot):
+                partial_snapshot = snapshot
+        if partial_snapshot is not None:
+            return self._mark_incomplete(
+                partial_snapshot,
+                "no usable bid, ask, or last price was received",
+            )
+        raise GatewayTimeout("TWS returned no market data")
 
     async def _market_data_snapshot_once(
         self,
@@ -240,12 +265,11 @@ class OfficialGateway:
         pending.market_data_type = market_data_type
         generic_tick_values = set(request.generic_ticks)
         if request.contract.sec_type == "OPT":
-            generic_tick_values.update({101, 106, 165})
-            if market_data_type in {MarketDataType.LIVE, MarketDataType.FROZEN}:
-                generic_tick_values.update({100, 233})
+            generic_tick_values.update({100, 101, 106, 221})
         if market_data_type in {MarketDataType.DELAYED, MarketDataType.DELAYED_FROZEN}:
             generic_tick_values &= self._DELAYED_GENERIC_TICKS
         generic_ticks = ",".join(str(tick) for tick in sorted(generic_tick_values))
+        streaming = bool(generic_tick_values)
         market_data_type_id = self._MARKET_DATA_TYPE_IDS[market_data_type]
         try:
 
@@ -257,7 +281,7 @@ class OfficialGateway:
                     request_id,
                     self._make_contract(request.contract),
                     generic_ticks,
-                    True,
+                    not streaming,
                     request.regulatory_snapshot,
                     [],
                 )
@@ -266,6 +290,8 @@ class OfficialGateway:
                 client,
                 request_snapshot,
             )
+            if streaming:
+                return await self._wait_streaming_market_data(request_id, pending)
             return await self._wait(request_id, pending)
         finally:
             self._discard(request_id, pending)
@@ -327,6 +353,46 @@ class OfficialGateway:
             )
         except TimeoutError as exc:
             raise GatewayTimeout(f"TWS request {request_id} timed out") from exc
+        finally:
+            with self._pending_lock:
+                if self._pending.get(request_id) is pending:
+                    del self._pending[request_id]
+
+    async def _wait_streaming_market_data(
+        self,
+        request_id: int,
+        pending: _Pending,
+    ) -> MarketDataSnapshot:
+        started_at = time.monotonic()
+        deadline = started_at + self._config.request_timeout_seconds
+        settle_seconds = min(
+            self._STREAM_SETTLE_SECONDS,
+            self._config.request_timeout_seconds / 2,
+        )
+        try:
+            while True:
+                if pending.future.done():
+                    return pending.future.result()
+                with self._pending_lock:
+                    current = self._pending.get(request_id)
+                    snapshot = (
+                        self._snapshot(current, complete=False) if current is pending else None
+                    )
+                    updated_at = pending.updated_at
+                if snapshot is None:
+                    raise GatewayUnavailable("TWS market data request was interrupted")
+
+                now = time.monotonic()
+                if self._has_usable_market_price(snapshot) and now - updated_at >= settle_seconds:
+                    return replace(snapshot, complete=True, as_of=datetime.now(UTC))
+                if now >= deadline:
+                    if self._has_market_data(snapshot):
+                        return self._mark_incomplete(
+                            snapshot,
+                            "market data collection reached its deadline; partial data returned",
+                        )
+                    raise GatewayTimeout(f"TWS market data request {request_id} timed out")
+                await asyncio.sleep(min(self._STREAM_POLL_SECONDS, deadline - now))
         finally:
             with self._pending_lock:
                 if self._pending.get(request_id) is pending:
@@ -654,6 +720,7 @@ class OfficialGateway:
             pending = self._pending.get(request_id)
             if pending is not None:
                 pending.fields[name] = value
+                pending.updated_at = time.monotonic()
 
     def _set_market_data_type(self, request_id: int, market_data_type: int) -> None:
         value = self._MARKET_DATA_TYPES_BY_ID.get(market_data_type)
@@ -686,6 +753,7 @@ class OfficialGateway:
             pending = self._pending.get(request_id)
             if pending is not None:
                 pending.option_computations[category] = computation
+                pending.updated_at = time.monotonic()
 
     def _append_notice(self, request_id: int, notice: TwsNotice) -> None:
         with self._pending_lock:
@@ -696,19 +764,20 @@ class OfficialGateway:
     def _complete_fields(self, request_id: int) -> None:
         with self._pending_lock:
             pending = self._pending.get(request_id)
-            snapshot = (
-                MarketDataSnapshot(
-                    market_data_type=pending.market_data_type,
-                    as_of=datetime.now(UTC),
-                    fields=dict(pending.fields),
-                    option_computations=dict(pending.option_computations),
-                    notices=tuple(pending.notices),
-                )
-                if pending is not None
-                else None
-            )
+            snapshot = self._snapshot(pending, complete=True) if pending is not None else None
         if pending is not None:
             self._set_result(pending.future, snapshot)
+
+    @staticmethod
+    def _snapshot(pending: _Pending, *, complete: bool) -> MarketDataSnapshot:
+        return MarketDataSnapshot(
+            market_data_type=pending.market_data_type,
+            as_of=datetime.now(UTC),
+            complete=complete,
+            fields=dict(pending.fields),
+            option_computations=dict(pending.option_computations),
+            notices=tuple(pending.notices),
+        )
 
     def _append_position(self, position: Position) -> None:
         with self._pending_lock:
@@ -835,3 +904,40 @@ class OfficialGateway:
             ):
                 return True
         return False
+
+    @classmethod
+    def _has_market_data(cls, snapshot: MarketDataSnapshot) -> bool:
+        for value in snapshot.fields.values():
+            if isinstance(value, str) and value:
+                return True
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and abs(value) < 1e100
+                and value != -1
+            ):
+                return True
+        computation_fields = (
+            "option_price",
+            "implied_volatility",
+            "delta",
+            "gamma",
+            "theta",
+            "vega",
+            "underlying_price",
+            "present_value_dividend",
+        )
+        return any(
+            any(getattr(computation, name) is not None for name in computation_fields)
+            for computation in snapshot.option_computations.values()
+        )
+
+    @staticmethod
+    def _mark_incomplete(snapshot: MarketDataSnapshot, message: str) -> MarketDataSnapshot:
+        return replace(
+            snapshot,
+            complete=False,
+            as_of=datetime.now(UTC),
+            notices=(*snapshot.notices, TwsNotice(None, message)),
+        )

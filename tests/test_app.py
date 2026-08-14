@@ -13,6 +13,7 @@ from ibkr_tws_http.gateway import (
     ContractSearchResult,
     GatewayRequestError,
     GatewayStatus,
+    GatewayTimeout,
     HistoricalBar,
     MarketDataSnapshot,
     OptionChain,
@@ -59,6 +60,7 @@ class FakeGateway:
         self.started = False
         self.summary_tags: frozenset[str] | None = None
         self.last_contract = None
+        self.option_chain_requests = []
 
     async def start(self) -> None:
         self.started = True
@@ -104,6 +106,9 @@ class FakeGateway:
         ]
 
     async def option_chains(self, request) -> list[OptionChain]:
+        self.option_chain_requests.append(request)
+        if request.exchange:
+            return []
         return [
             OptionChain(
                 exchange="SMART",
@@ -134,6 +139,7 @@ class FakeGateway:
         return MarketDataSnapshot(
             market_data_type=(MarketDataType.DELAYED if delayed else MarketDataType.LIVE),
             as_of=datetime(2026, 8, 14, 14, 0, tzinfo=UTC),
+            complete=True,
             fields={
                 f"{prefix}bid": 199.5,
                 f"{prefix}ask": 199.6,
@@ -260,6 +266,9 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         snapshot = response.json()
         assert snapshot["requested_market_data_type"] == "delayed"
         assert snapshot["market_data_type"] == "delayed"
+        assert snapshot["complete"] is True
+        assert snapshot["collected_at"] == "2026-08-14T14:00:00Z"
+        assert "as_of" not in snapshot
         assert snapshot["bid"] == 199.5
         assert snapshot["ask_size"] == 120
         assert snapshot["volume"] == 1000
@@ -276,7 +285,11 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert response.status_code == 200
         chain_snapshot = response.json()
         assert chain_snapshot["underlying"]["con_id"] == 265598
+        assert chain_snapshot["underlying_snapshot"]["last"] == 199.55
+        assert chain_snapshot["underlying_error"] is None
         assert chain_snapshot["requested_market_data_type"] == "delayed"
+        assert chain_snapshot["complete"] is True
+        assert chain_snapshot["collection_started_at"] <= chain_snapshot["collected_at"]
         assert len(chain_snapshot["quotes"]) == 6
         assert chain_snapshot["quotes"][0]["contract"]["strike"] == 195.0
         assert (
@@ -287,6 +300,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         )
         assert chain_snapshot["quotes"][0]["snapshot"]["open_interest"] == 2500
         assert chain_snapshot["quotes"][1]["snapshot"]["open_interest"] == 1250
+        assert gateway.option_chain_requests[-1].exchange == ""
 
         response = client.post(
             "/v1/historical-bars",
@@ -296,6 +310,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert response.json()[0]["volume"] == "1000"
 
         openapi = client.get("/openapi.json").json()
+        assert openapi["info"]["version"] == "0.4.0"
         assert set(openapi["paths"]) == {
             "/healthz",
             "/v1/status",
@@ -310,6 +325,15 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "/v1/historical-bars",
         }
         assert set(openapi["paths"]["/v1/options/chains"]) == {"get"}
+        market_data_schema = openapi["components"]["schemas"]["MarketDataSnapshotResponse"]
+        assert {"complete", "collected_at"} <= set(market_data_schema["properties"])
+        assert "as_of" not in market_data_schema["properties"]
+        assert (
+            openapi["paths"]["/v1/market-data/snapshot"]["post"]["responses"]["504"]["content"][
+                "application/json"
+            ]["schema"]["$ref"]
+            == "#/components/schemas/GatewayTimeoutResponse"
+        )
         assert "securitySchemes" not in openapi["components"]
     assert not gateway.started
 
@@ -399,6 +423,13 @@ class PartialQuoteErrorGateway(FakeGateway):
         return await super().market_data_snapshot(request)
 
 
+class PartialQuoteTimeoutGateway(FakeGateway):
+    async def market_data_snapshot(self, request):
+        if request.contract.right == "P":
+            raise GatewayTimeout("request 42 timed out")
+        return await super().market_data_snapshot(request)
+
+
 def test_batch_snapshot_keeps_per_contract_errors_and_redacts_accounts() -> None:
     with TestClient(create_app(settings(), PartialQuoteErrorGateway())) as client:
         response = client.get(
@@ -406,8 +437,24 @@ def test_batch_snapshot_keeps_per_contract_errors_and_redacts_accounts() -> None
             params={"symbol": "AAPL", "expiration": "20260918"},
         )
     assert response.status_code == 200
-    quotes = response.json()["quotes"]
+    payload = response.json()
+    quotes = payload["quotes"]
+    assert payload["complete"] is False
+    assert payload["underlying_snapshot"] is not None
     assert len([quote for quote in quotes if quote["snapshot"] is not None]) == 3
     errors = [quote["error"] for quote in quotes if quote["error"] is not None]
     assert errors == [{"code": 354, "message": "No market data for [redacted account]"}] * 3
     assert "DU111" not in response.text
+
+
+def test_batch_snapshot_keeps_per_contract_timeouts() -> None:
+    with TestClient(create_app(settings(), PartialQuoteTimeoutGateway())) as client:
+        response = client.get(
+            "/v1/options/chain-snapshot",
+            params={"symbol": "AAPL", "expiration": "20260918"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["complete"] is False
+    errors = [quote["error"] for quote in response.json()["quotes"] if quote["error"]]
+    assert errors == [{"code": None, "message": "TWS market data request timed out"}] * 3

@@ -737,6 +737,38 @@ class PartialStreamingMarketDataClient(FakeClient):
         self.wrapper.tickSize(request_id, 27, 2500)
 
 
+class SlowDelayedUnderlyingFallbackClient(FakeClient):
+    def reqMktData(
+        self,
+        request_id: int,
+        requested: FakeContract,
+        generic_ticks: str,
+        snapshot: bool,
+        regulatory_snapshot: bool,
+        options: list[object],
+    ) -> None:
+        assert requested.secType == "STK"
+        assert snapshot is False
+        self.market_data_requests.append((requested.secType, generic_ticks, snapshot))
+        if self.market_data_type == 1:
+            self.wrapper.error(
+                request_id,
+                2186,
+                "Live data unavailable; delayed data will follow",
+                "",
+            )
+            return
+
+        def send_delayed_quote() -> None:
+            self.wrapper.marketDataType(request_id, 3)
+            self.wrapper.tickPrice(request_id, 66, 198.5, None)
+            self.wrapper.tickPrice(request_id, 67, 198.7, None)
+
+        timer = threading.Timer(0.25, send_delayed_quote)
+        timer.daemon = True
+        timer.start()
+
+
 class ComputationOnlyMarketDataClient(FakeClient):
     include_sides = False
 
@@ -835,6 +867,37 @@ def test_streaming_market_data_returns_observable_partial_result_at_deadline() -
                 None,
                 "market data collection reached its deadline; partial data returned",
             )
+        finally:
+            await gateway.stop()
+
+    asyncio.run(scenario())
+
+
+def test_auto_underlying_waits_for_delayed_ticks_after_live_fallback() -> None:
+    async def scenario() -> None:
+        SlowDelayedUnderlyingFallbackClient.instances.clear()
+        gateway = OfficialGateway(
+            TwsConfig(connect_timeout_seconds=0.4, request_timeout_seconds=0.4),
+            IbApiBindings(
+                SlowDelayedUnderlyingFallbackClient,
+                FakeWrapper,
+                FakeContract,
+                FakeTickType,
+            ),
+        )
+        await gateway.start()
+        try:
+            snapshot = await gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(contract=ContractSpec(symbol="AAPL"))
+            )
+            assert snapshot.market_data_type is MarketDataType.DELAYED
+            assert snapshot.market_quote_complete is True
+            assert snapshot.fields["delayed_bid"] == 198.5
+            assert snapshot.fields["delayed_ask"] == 198.7
+            assert SlowDelayedUnderlyingFallbackClient.instances[-1].market_data_requests == [
+                ("STK", "", False),
+                ("STK", "", False),
+            ]
         finally:
             await gateway.stop()
 

@@ -398,7 +398,8 @@ class OfficialGateway:
 
                 now = time.monotonic()
                 if (
-                    snapshot.market_quote_complete or snapshot.model_complete
+                    snapshot.market_quote_complete
+                    or (pending.enrichment_expected and snapshot.model_complete)
                 ) and now - updated_at >= settle_seconds:
                     return replace(
                         snapshot,

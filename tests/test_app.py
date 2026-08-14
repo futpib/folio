@@ -329,7 +329,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert response.json()[0]["volume"] == "1000"
 
         openapi = client.get("/openapi.json").json()
-        assert openapi["info"]["version"] == "0.6.0"
+        assert openapi["info"]["version"] == "0.6.1"
         assert set(openapi["paths"]) == {
             "/healthz",
             "/v1/status",

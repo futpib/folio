@@ -92,9 +92,26 @@ Use `--skip-market-data` for a metadata-only diagnostic. Historical bars are
 validated in OpenAPI but are not requested because IBKR requires live market-data
 entitlements and provides no delayed historical-data fallback.
 
+## Deterministic TWS mock
+
+Run a local test service without TWS, subscriptions, or market hours:
+
+```console
+uv run ibkr-tws-http-mock --port 18080 \
+  --history-path /tmp/ibkr-tws-http-mock.sqlite3
+```
+
+The mock operates at the official `EClient`/`EWrapper` callback boundary, so it
+exercises the production gateway rather than returning canned HTTP payloads. It
+reproduces the observed no-subscription behaviors: live entitlement errors
+10091/10167, delayed model-only option computations, absent bid/ask timestamps,
+transient streams with no ticks, a missing underlying stream, and exact-option
+historical-data errors 162/2188. Put streams return data on their second attempt,
+which makes batch fairness and retry behavior deterministic.
+
 ## In-memory cache
 
-The service keeps bounded process-local LRU caches and never writes cached data
+The service keeps bounded process-local LRU caches and never writes cache entries
 to disk. Contract details, contract searches, option-chain definitions, and
 successful option delayed-route decisions use a five-minute TTL with at most 512
 entries per cache. Successful market snapshots use a one-second, 512-entry
@@ -106,6 +123,11 @@ required by the batch deadline and retry behavior. Errors, accounts, account
 summary, positions, and historical bars are not cached. Every cache is cleared
 when the process stops or the observed TWS connection identity changes.
 
+An optional SQLite observation journal is separate from these caches. Set
+`history.path` to record quality-gated option IV only when an API request obtains
+it. There is no polling loop or background recorder, and the history response
+explicitly labels its coverage as sparse and request-driven.
+
 ## API
 
 OpenAPI documentation is served at <http://127.0.0.1:8080/docs>. The endpoints
@@ -113,6 +135,7 @@ are intentionally explicit:
 
 - `GET /healthz`
 - `GET /v1/status`
+- `GET /v1/capabilities`
 - `GET /v1/accounts`
 - `GET /v1/account-summary`
 - `GET /v1/positions`
@@ -120,6 +143,9 @@ are intentionally explicit:
 - `POST /v1/contracts/details`
 - `GET /v1/options/chains`
 - `GET /v1/options/chain-snapshot`
+- `GET /v1/options/portfolio-snapshot`
+- `POST /v1/options/volatility-comparison`
+- `POST /v1/options/observed-history`
 - `POST /v1/market-data/snapshot`
 - `POST /v1/historical-bars`
 - `POST /v1/volatility/history`
@@ -134,6 +160,8 @@ curl 'http://127.0.0.1:8080/v1/contracts/search?pattern=apple'
 curl 'http://127.0.0.1:8080/v1/options/chains?underlying_symbol=AAPL&underlying_con_id=265598'
 
 curl 'http://127.0.0.1:8080/v1/options/chain-snapshot?symbol=XXI&expiration=20280121&market_data_type=auto&timeout_seconds=30'
+
+curl 'http://127.0.0.1:8080/v1/options/portfolio-snapshot?market_data_type=auto&timeout_seconds=30'
 
 curl -X POST http://127.0.0.1:8080/v1/contracts/details \
   -H 'content-type: application/json' \
@@ -150,6 +178,14 @@ curl -X POST http://127.0.0.1:8080/v1/historical-bars \
 curl -X POST http://127.0.0.1:8080/v1/volatility/history \
   -H 'content-type: application/json' \
   -d '{"contract":{"symbol":"AAPL"},"duration":"1 M","bar_size":"1 day"}'
+
+curl -X POST http://127.0.0.1:8080/v1/options/volatility-comparison \
+  -H 'content-type: application/json' \
+  -d '{"option_contract":{"con_id":829400001,"sec_type":"OPT"},"underlying_contract":{"con_id":837468789,"symbol":"XXI","sec_type":"STK"}}'
+
+curl -X POST http://127.0.0.1:8080/v1/options/observed-history \
+  -H 'content-type: application/json' \
+  -d '{"contract":{"con_id":829400001,"sec_type":"OPT"}}'
 ```
 
 The volatility-history wrapper makes IBKR's two useful underlying volatility
@@ -162,6 +198,17 @@ consecutive expirations; it is not the historical IV of a particular option.
 IBKR exposes these historical series for stock, ETF, and index underlyings. The
 endpoint makes two bounded, one-shot historical requests and does not run a
 background recorder.
+
+The comparison endpoint pairs one current, quality-gated exact-option IV with
+those underlying series. It reports premiums, ratios, a percentile, and a
+z-score. Its response states that this is a comparison with IBKR's 30-day
+underlying series, not reconstructed history for the exact option.
+
+The portfolio endpoint reads the currently exposed positions, deduplicates held
+option contracts, and requests only those `conId`s. It returns account aliases,
+position sizes, per-contract attempts and errors, and an explicit coverage
+percentage. It avoids full-chain discovery when the caller only needs held
+contracts.
 
 Use contract search to find the underlying contract ID, query its option chains
 for available exchanges, trading classes, expirations, and strikes, then use
@@ -219,16 +266,18 @@ are reported separately and optional enrichment can remain false.
 
 The batch option endpoint resolves an underlying and expiry, then probes one
 central option before fan-out when `market_data_type=auto`. A delayed result is
-reused so the other options skip redundant live-entitlement failures. The
-underlying and remaining options are collected with at most `max_concurrency`
-active requests (default 10), which paces larger chains without serializing the
-whole expiry.
+reused so the other options skip redundant live-entitlement failures. Options
+are scheduled before the less reliable underlying request. At most
+`max_concurrency` requests (default 10) are active at once.
 
 `timeout_seconds` selects a bounded 1–120 second global collection window; its
 default is the smaller of 10 seconds and the configured TWS request timeout.
-The preflight can use up to 20% of that window capped at two seconds. The first
-wave then receives 60% of the remaining time capped at five seconds, followed
-by one retry of only unresolved or timed-out contracts in the final window.
+The preflight can use up to 20% of that window capped at two seconds. The
+adaptive first wave divides 65% of the remaining window across enough bounded
+groups to start every contract before any retry. Only timed-out or unresolved
+contracts enter the final wave, again with a fair per-contract slice. Slow early
+contracts therefore cannot consume every worker twice while later strikes never
+start.
 `collection_timeout_seconds`, `preflight_market_data_type`,
 `retried_contracts`, and each row's `attempts` make that behavior observable.
 
@@ -244,6 +293,13 @@ per-contract TWS error, so one unavailable strike does not discard the rest of
 the chain. Batch market-quote, model, enrichment, and aggregate completeness are
 reported separately. Missing live subscriptions remain visible through TWS
 error codes; the service does not manufacture live data from delayed ticks.
+
+`GET /v1/capabilities` summarizes evidence observed by this process. It reports
+whether live quotes, delayed option models, and exact-option historical data are
+available, including the TWS codes supporting an unavailable result. It also
+reports whether request-driven history is enabled and how many observations are
+stored. An initial `unknown` means the process has not yet exercised that path;
+it is not a claim that an entitlement exists.
 
 The default policy redacts account IDs as `account`. Configure an alias to make
 multiple accounts distinguishable without returning their real IDs. Empty

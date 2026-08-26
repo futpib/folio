@@ -155,6 +155,59 @@ class VolatilityHistoryRequest(StrictModel):
         return self
 
 
+class PortfolioOptionSnapshotRequest(StrictModel):
+    market_data_type: MarketDataType = MarketDataType.AUTO
+    max_concurrency: int = Field(default=10, ge=1, le=40)
+    timeout_seconds: float | None = Field(default=None, ge=1, le=120)
+
+
+class OptionVolatilityComparisonRequest(StrictModel):
+    option_contract: ContractSpec
+    underlying_contract: ContractSpec
+    market_data_type: MarketDataType = MarketDataType.AUTO
+    end: datetime | None = None
+    duration: str = Field(default="1 M", min_length=3, max_length=32)
+    bar_size: str = Field(default="1 day", min_length=3, max_length=32)
+    regular_trading_hours_only: bool = True
+
+    @field_validator("end")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("end must include a UTC offset")
+        return value
+
+    @model_validator(mode="after")
+    def require_option_and_underlying(self) -> OptionVolatilityComparisonRequest:
+        if self.option_contract.sec_type != "OPT":
+            raise ValueError("option_contract must have sec_type OPT")
+        if self.underlying_contract.sec_type not in {"STK", "IND"}:
+            raise ValueError("underlying_contract must have sec_type STK or IND")
+        return self
+
+
+class ObservedOptionHistoryRequest(StrictModel):
+    contract: ContractSpec
+    start: datetime | None = None
+    end: datetime | None = None
+    limit: int = Field(default=1000, ge=1, le=10000)
+
+    @field_validator("start", "end")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("history bounds must include a UTC offset")
+        return value
+
+    @model_validator(mode="after")
+    def require_option(self) -> ObservedOptionHistoryRequest:
+        if self.contract.sec_type != "OPT":
+            raise ValueError("observed option history supports only OPT contracts")
+        if self.start is not None and self.end is not None and self.start > self.end:
+            raise ValueError("start must not exceed end")
+        return self
+
+
 class StatusResponse(StrictModel):
     service: Literal["ok"] = "ok"
     tws_connected: bool
@@ -368,6 +421,35 @@ class OptionChainSnapshotResponse(StrictModel):
         return self
 
 
+class PortfolioOptionQuoteResponse(StrictModel):
+    account: str
+    position: Decimal
+    average_cost: float
+    contract: ContractResponse
+    snapshot: MarketDataSnapshotResponse | None = None
+    error: TwsErrorDetailResponse | None = None
+    attempts: int = Field(ge=1, le=2)
+
+    @model_validator(mode="after")
+    def require_snapshot_or_error(self) -> PortfolioOptionQuoteResponse:
+        if (self.snapshot is None) == (self.error is None):
+            raise ValueError("exactly one of snapshot or error is required")
+        return self
+
+
+class PortfolioOptionSnapshotResponse(StrictModel):
+    requested_market_data_type: MarketDataType
+    position_count: int = Field(ge=0)
+    returned_count: int = Field(ge=0)
+    coverage_percentage: float = Field(ge=0, le=100)
+    collection_timeout_seconds: float
+    max_concurrency: int
+    retried_contracts: int = Field(ge=0)
+    collection_started_at: datetime
+    collected_at: datetime
+    quotes: list[PortfolioOptionQuoteResponse]
+
+
 class HistoricalBarResponse(StrictModel):
     time: str
     open: float
@@ -398,3 +480,73 @@ class VolatilityHistoryResponse(StrictModel):
     regular_trading_hours_only: bool
     implied_volatility: VolatilitySeriesResponse
     historical_volatility: VolatilitySeriesResponse
+
+
+class VolatilityComparisonMetricsResponse(StrictModel):
+    units: Literal["decimal"] = "decimal"
+    current_option_implied_volatility: float | None = None
+    current_option_implied_volatility_source: Literal["market_mid", "model"] | None = None
+    latest_underlying_implied_volatility: float | None = None
+    latest_underlying_historical_volatility: float | None = None
+    option_premium_to_underlying_implied: float | None = None
+    option_ratio_to_underlying_implied: float | None = None
+    option_premium_to_underlying_historical: float | None = None
+    option_ratio_to_underlying_historical: float | None = None
+    option_percentile_in_underlying_implied_history: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+    option_z_score_in_underlying_implied_history: float | None = None
+    comparison_note: Literal[
+        "The current exact-option IV is compared with IB's 30-day underlying volatility series; "
+        "this is not historical IV for the exact option."
+    ] = (
+        "The current exact-option IV is compared with IB's 30-day underlying volatility series; "
+        "this is not historical IV for the exact option."
+    )
+
+
+class OptionVolatilityComparisonResponse(StrictModel):
+    option_snapshot: MarketDataSnapshotResponse
+    underlying_history: VolatilityHistoryResponse
+    metrics: VolatilityComparisonMetricsResponse
+
+
+class ObservedOptionSnapshotResponse(StrictModel):
+    collected_at: datetime
+    implied_volatility: float
+    source: Literal["market_mid", "model"]
+    bid: float | None = None
+    ask: float | None = None
+    quote_observed_at: datetime | None = None
+    quote_age_seconds: float | None = None
+    spread_percentage: float | None = None
+
+
+class ObservedOptionHistoryResponse(StrictModel):
+    contract: ContractSpec
+    continuous_coverage: Literal[False] = False
+    coverage_note: Literal[
+        "Request-driven observations only; gaps mean the API was not asked for this contract."
+    ] = "Request-driven observations only; gaps mean the API was not asked for this contract."
+    first_observation_at: datetime | None = None
+    last_observation_at: datetime | None = None
+    samples: list[ObservedOptionSnapshotResponse]
+
+
+class CapabilityStatusResponse(StrictModel):
+    status: Literal["unknown", "available", "unavailable"]
+    evidence_codes: list[int] = Field(default_factory=list)
+
+
+class CapabilitiesResponse(StrictModel):
+    tws_connected: bool
+    live_market_quotes: CapabilityStatusResponse
+    delayed_option_model: CapabilityStatusResponse
+    exact_option_historical_data: CapabilityStatusResponse
+    opportunistic_option_history_enabled: bool
+    opportunistic_option_history_samples: int = Field(ge=0)
+    adaptive_batch_scheduler: Literal[True] = True
+    continuous_uptime_required: Literal[False] = False
+    additional_market_data_subscriptions_required: Literal[False] = False

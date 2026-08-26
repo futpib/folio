@@ -120,6 +120,15 @@ class TwsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoryConfig:
+    path: Path | None = None
+
+    def validate(self) -> None:
+        if self.path is not None and not self.path.name:
+            raise ConfigError("history.path must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class ExposureConfig:
     features: frozenset[str] = DEFAULT_FEATURES
     allowed_accounts: frozenset[str] = frozenset()
@@ -151,11 +160,13 @@ class ExposureConfig:
 class Settings:
     server: ServerConfig
     tws: TwsConfig = field(default_factory=TwsConfig)
+    history: HistoryConfig = field(default_factory=HistoryConfig)
     exposure: ExposureConfig = field(default_factory=ExposureConfig)
 
     def validate(self) -> None:
         self.server.validate()
         self.tws.validate()
+        self.history.validate()
         self.exposure.validate()
 
     @classmethod
@@ -171,6 +182,7 @@ class Settings:
 
         server_raw = _table(raw, "server")
         tws_raw = _table(raw, "tws")
+        history_raw = _table(raw, "history")
         exposure_raw = _table(raw, "exposure")
 
         aliases = exposure_raw.get("account_aliases", {})
@@ -191,6 +203,13 @@ class Settings:
                 connect_timeout_seconds=float(tws_raw.get("connect_timeout_seconds", 10)),
                 request_timeout_seconds=float(tws_raw.get("request_timeout_seconds", 15)),
                 reconnect_delay_seconds=float(tws_raw.get("reconnect_delay_seconds", 5)),
+            ),
+            history=HistoryConfig(
+                path=(
+                    Path(str(history_raw["path"])).expanduser()
+                    if history_raw.get("path") is not None
+                    else None
+                ),
             ),
             exposure=ExposureConfig(
                 features=_string_set(exposure_raw, "features", DEFAULT_FEATURES),

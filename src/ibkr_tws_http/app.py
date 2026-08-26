@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import math
-import time
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from statistics import median
+from statistics import mean, median, pstdev
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .batch import BatchItemResult, collect_market_data_batch
 from .cache import CachingGateway
 from .config import Settings
+from .diagnostics import CapabilityTracker
 from .gateway import (
     ContractInfo,
     Gateway,
@@ -26,9 +27,11 @@ from .gateway import (
     MarketDataSnapshot,
     OptionComputation,
 )
+from .history import OptionSnapshotJournal
 from .models import (
     AccountResponse,
     AccountValueResponse,
+    CapabilitiesResponse,
     ContractResponse,
     ContractSearchResponse,
     ContractSpec,
@@ -39,6 +42,8 @@ from .models import (
     MarketDataSnapshotRequest,
     MarketDataSnapshotResponse,
     MarketDataType,
+    ObservedOptionHistoryRequest,
+    ObservedOptionHistoryResponse,
     OptionChainQuoteResponse,
     OptionChainResponse,
     OptionChainSnapshotRequest,
@@ -46,10 +51,16 @@ from .models import (
     OptionChainsRequest,
     OptionComputationResponse,
     OptionComputationsResponse,
+    OptionVolatilityComparisonRequest,
+    OptionVolatilityComparisonResponse,
+    PortfolioOptionQuoteResponse,
+    PortfolioOptionSnapshotRequest,
+    PortfolioOptionSnapshotResponse,
     PositionResponse,
     StatusResponse,
     TwsErrorDetailResponse,
     TwsErrorResponse,
+    VolatilityComparisonMetricsResponse,
     VolatilityHistoryRequest,
     VolatilityHistoryResponse,
     VolatilitySeriesResponse,
@@ -364,6 +375,73 @@ def _historical_bar_response(value: HistoricalBar) -> HistoricalBarResponse:
     )
 
 
+def _volatility_history_response(
+    request: VolatilityHistoryRequest,
+    implied_values: list[HistoricalBar],
+    historical_values: list[HistoricalBar],
+) -> VolatilityHistoryResponse:
+    return VolatilityHistoryResponse(
+        contract=request.contract,
+        end=request.end,
+        duration=request.duration,
+        bar_size=request.bar_size,
+        regular_trading_hours_only=request.regular_trading_hours_only,
+        implied_volatility=VolatilitySeriesResponse(
+            data_type="OPTION_IMPLIED_VOLATILITY",
+            name="ib_30_day_at_market_implied_volatility",
+            bars=[_historical_bar_response(value) for value in implied_values],
+        ),
+        historical_volatility=VolatilitySeriesResponse(
+            data_type="HISTORICAL_VOLATILITY",
+            name="ib_30_day_historical_volatility",
+            bars=[_historical_bar_response(value) for value in historical_values],
+        ),
+    )
+
+
+def _positive_closes(values: list[HistoricalBar]) -> list[float]:
+    return [value.close for value in values if math.isfinite(value.close) and value.close > 0]
+
+
+def _volatility_comparison_metrics(
+    snapshot: MarketDataSnapshotResponse,
+    implied_values: list[HistoricalBar],
+    historical_values: list[HistoricalBar],
+) -> VolatilityComparisonMetricsResponse:
+    option_iv = snapshot.implied_volatility
+    current = option_iv.value if option_iv is not None else None
+    implied = _positive_closes(implied_values)
+    historical = _positive_closes(historical_values)
+    latest_implied = implied[-1] if implied else None
+    latest_historical = historical[-1] if historical else None
+
+    def premium(reference: float | None) -> float | None:
+        return current - reference if current is not None and reference is not None else None
+
+    def ratio(reference: float | None) -> float | None:
+        return current / reference if current is not None and reference is not None else None
+
+    percentile = None
+    z_score = None
+    if current is not None and implied:
+        percentile = sum(value <= current for value in implied) / len(implied) * 100
+        deviation = pstdev(implied)
+        if deviation > 0:
+            z_score = (current - mean(implied)) / deviation
+    return VolatilityComparisonMetricsResponse(
+        current_option_implied_volatility=current,
+        current_option_implied_volatility_source=(option_iv.source if option_iv else None),
+        latest_underlying_implied_volatility=latest_implied,
+        latest_underlying_historical_volatility=latest_historical,
+        option_premium_to_underlying_implied=premium(latest_implied),
+        option_ratio_to_underlying_implied=ratio(latest_implied),
+        option_premium_to_underlying_historical=premium(latest_historical),
+        option_ratio_to_underlying_historical=ratio(latest_historical),
+        option_percentile_in_underlying_implied_history=percentile,
+        option_z_score_in_underlying_implied_history=z_score,
+    )
+
+
 TWS_ERROR_RESPONSES = {
     502: {"model": TwsErrorResponse},
     504: {"model": GatewayTimeoutResponse},
@@ -374,14 +452,20 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
     settings.validate()
     active_gateway = CachingGateway(gateway or OfficialGateway(settings.tws))
     policy = ExposurePolicy(settings.exposure)
+    journal = OptionSnapshotJournal(settings.history.path)
+    capabilities = CapabilityTracker()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        await active_gateway.start()
+        await journal.start()
         try:
-            yield
+            await active_gateway.start()
+            try:
+                yield
+            finally:
+                await active_gateway.stop()
         finally:
-            await active_gateway.stop()
+            await journal.stop()
 
     app = FastAPI(
         title="IBKR TWS HTTP",
@@ -391,6 +475,40 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
     )
     app.state.gateway = active_gateway
     app.state.settings = settings
+    app.state.journal = journal
+    app.state.capabilities = capabilities
+
+    async def observe_snapshot(snapshot: MarketDataSnapshotResponse) -> None:
+        capabilities.observe_snapshot(snapshot)
+        await journal.record(snapshot)
+
+    def observe_batch_error(result: BatchItemResult) -> None:
+        if isinstance(result.error, GatewayRequestError):
+            capabilities.observe_error(result.error)
+
+    async def load_volatility_history(
+        request: VolatilityHistoryRequest,
+    ) -> tuple[VolatilityHistoryResponse, list[HistoricalBar], list[HistoricalBar]]:
+        common = {
+            "contract": request.contract,
+            "end": request.end,
+            "duration": request.duration,
+            "bar_size": request.bar_size,
+            "regular_trading_hours_only": request.regular_trading_hours_only,
+        }
+        implied_values, historical_values = await asyncio.gather(
+            active_gateway.historical_bars(
+                HistoricalBarsRequest(**common, data_type="OPTION_IMPLIED_VOLATILITY")
+            ),
+            active_gateway.historical_bars(
+                HistoricalBarsRequest(**common, data_type="HISTORICAL_VOLATILITY")
+            ),
+        )
+        return (
+            _volatility_history_response(request, implied_values, historical_values),
+            implied_values,
+            historical_values,
+        )
 
     @app.exception_handler(PolicyDenied)
     async def policy_error(request: Request, exc: PolicyDenied) -> JSONResponse:
@@ -406,6 +524,7 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
 
     @app.exception_handler(GatewayRequestError)
     async def request_error(request: Request, exc: GatewayRequestError) -> JSONResponse:
+        capabilities.observe_error(exc)
         return JSONResponse(
             status_code=502,
             content=TwsErrorResponse(tws_error=_tws_error(exc)).model_dump(mode="json"),
@@ -427,6 +546,15 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             tws_connected=current.connected,
             server_version=current.server_version,
             connection_time=current.connection_time,
+        )
+
+    @app.get("/v1/capabilities", response_model=CapabilitiesResponse)
+    async def capability_status() -> CapabilitiesResponse:
+        current = active_gateway.status()
+        return capabilities.response(
+            tws_connected=current.connected,
+            journal_enabled=journal.enabled,
+            journal_samples=await journal.count(),
         )
 
     @app.get("/v1/accounts", response_model=list[AccountResponse])
@@ -512,7 +640,9 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
         policy.require_feature("market-data")
         policy.check_contract(request.contract)
         snapshot = await active_gateway.market_data_snapshot(request)
-        return _market_data_response(request.contract, request.market_data_type, snapshot)
+        response = _market_data_response(request.contract, request.market_data_type, snapshot)
+        await observe_snapshot(response)
+        return response
 
     @app.get(
         "/v1/options/chain-snapshot",
@@ -610,120 +740,51 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
                 ),
             )
 
-        quote_slots = asyncio.Semaphore(request.max_concurrency)
-
-        async def snapshot_contract(
-            contract_spec: ContractSpec,
-        ) -> tuple[MarketDataSnapshotResponse | None, TwsErrorDetailResponse | None]:
-            snapshot_request = MarketDataSnapshotRequest(
-                contract=contract_spec,
-                market_data_type=request.market_data_type,
-            )
-            try:
-                async with quote_slots:
-                    snapshot = await active_gateway.market_data_snapshot(snapshot_request)
-            except (GatewayRequestError, GatewayTimeout) as exc:
-                return None, _market_data_error(exc)
-            return (
-                _market_data_response(
-                    contract_spec,
-                    request.market_data_type,
-                    snapshot,
-                ),
-                None,
-            )
-
-        collection_started_at = datetime.now(UTC)
         underlying_spec = _contract_spec(underlying)
-        specs = [underlying_spec, *(_contract_spec(contract) for contract in contracts)]
+        specs = [*(_contract_spec(contract) for contract in contracts), underlying_spec]
+        underlying_index = len(contracts)
         collection_timeout = request.timeout_seconds or min(
             settings.tws.request_timeout_seconds,
             10,
         )
-        deadline = time.monotonic() + collection_timeout
-        results: dict[
-            int,
-            tuple[MarketDataSnapshotResponse | None, TwsErrorDetailResponse | None],
-        ] = {}
-        attempts = [0] * len(specs)
-
-        async def collect_wave(indices: list[int], timeout: float) -> set[int]:
-            if not indices:
-                return set()
-            tasks = {
-                asyncio.create_task(snapshot_contract(specs[index])): index for index in indices
-            }
-            for index in indices:
-                attempts[index] += 1
-            try:
-                done, pending = await asyncio.wait(tasks, timeout=max(0, timeout))
-            except BaseException:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                results[tasks[task]] = task.result()
-            return {tasks[task] for task in done}
-
-        all_indices = list(range(len(specs)))
-        preflight_attempted = request.market_data_type is MarketDataType.AUTO
-        preflight_market_data_type = None
-        preflight_seconds = 0.0
-        preflight_index = 1 + len(contracts) // 2
-        if preflight_attempted:
-            preflight_started_at = time.monotonic()
-            preflight_budget = min(
-                2.0,
-                max(0, deadline - preflight_started_at) * 0.2,
-            )
-            completed = await collect_wave([preflight_index], preflight_budget)
-            preflight_seconds = time.monotonic() - preflight_started_at
-            if preflight_index in completed:
-                preflight_snapshot = results[preflight_index][0]
-                if preflight_snapshot is not None:
-                    preflight_market_data_type = preflight_snapshot.market_data_type
-
-        first_wave_indices = [
-            index for index in all_indices if not preflight_attempted or index != preflight_index
-        ]
-        remaining = max(0, deadline - time.monotonic())
-        await collect_wave(
-            first_wave_indices,
-            min(5.0, remaining * 0.6),
+        collection = await collect_market_data_batch(
+            active_gateway,
+            specs,
+            market_data_type=request.market_data_type,
+            max_concurrency=request.max_concurrency,
+            timeout_seconds=collection_timeout,
+            request_timeout_seconds=settings.tws.request_timeout_seconds,
+            preflight_index=len(contracts) // 2,
         )
-        retry_indices = [
-            index
-            for index in all_indices
-            if index not in results
-            or (
-                results[index][0] is None
-                and results[index][1] is not None
-                and results[index][1].code is None
-            )
-        ]
-        retried_indices: list[int] = []
-        if retry_indices and time.monotonic() < deadline:
-            retried_indices = retry_indices
-            await collect_wave(retry_indices, deadline - time.monotonic())
 
-        deadline_error = TwsErrorDetailResponse(
-            code=None,
-            message="batch market data collection deadline reached",
-        )
-        underlying_snapshot, underlying_error = results.get(0, (None, deadline_error))
-        quotes = [
-            OptionChainQuoteResponse(
-                contract=_contract_response(contract),
-                snapshot=results.get(index, (None, deadline_error))[0],
-                error=results.get(index, (None, deadline_error))[1],
-                attempts=attempts[index],
+        responses: dict[int, MarketDataSnapshotResponse] = {}
+        errors: dict[int, TwsErrorDetailResponse] = {}
+        for index, result in collection.results.items():
+            if result.snapshot is not None:
+                response = _market_data_response(
+                    specs[index],
+                    request.market_data_type,
+                    result.snapshot,
+                )
+                responses[index] = response
+                await observe_snapshot(response)
+            else:
+                observe_batch_error(result)
+                assert result.error is not None
+                errors[index] = _market_data_error(result.error)
+
+        underlying_snapshot = responses.get(underlying_index)
+        underlying_error = errors.get(underlying_index)
+        quotes = []
+        for index, contract in enumerate(contracts):
+            quotes.append(
+                OptionChainQuoteResponse(
+                    contract=_contract_response(contract),
+                    snapshot=responses.get(index),
+                    error=errors.get(index),
+                    attempts=collection.attempts[index],
+                )
             )
-            for index, contract in enumerate(contracts, start=1)
-        ]
         market_quote_complete = (
             underlying_snapshot is not None
             and underlying_snapshot.market_quote_complete
@@ -775,13 +836,13 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             complete=market_quote_complete and model_complete and enrichment_complete,
             collection_timeout_seconds=collection_timeout,
             max_concurrency=request.max_concurrency,
-            preflight_attempted=preflight_attempted,
-            preflight_market_data_type=preflight_market_data_type,
-            preflight_seconds=preflight_seconds,
-            retried_contracts=len(retried_indices),
-            collection_started_at=collection_started_at,
-            collected_at=datetime.now(UTC),
-            underlying_attempts=attempts[0],
+            preflight_attempted=collection.preflight_attempted,
+            preflight_market_data_type=collection.preflight_market_data_type,
+            preflight_seconds=collection.preflight_seconds,
+            retried_contracts=collection.retried_contracts,
+            collection_started_at=collection.collection_started_at,
+            collected_at=collection.collected_at,
+            underlying_attempts=collection.attempts[underlying_index],
             reference_underlying_price=reference_underlying_price,
             reference_underlying_price_source=(
                 "option_model_median" if reference_underlying_price is not None else None
@@ -790,6 +851,89 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             reference_underlying_price_samples=(
                 len(reference_prices) if reference_underlying_price is not None else 0
             ),
+            quotes=quotes,
+        )
+
+    @app.get(
+        "/v1/options/portfolio-snapshot",
+        response_model=PortfolioOptionSnapshotResponse,
+        responses=TWS_ERROR_RESPONSES,
+    )
+    async def portfolio_option_snapshot(
+        request: Annotated[PortfolioOptionSnapshotRequest, Query()],
+    ) -> PortfolioOptionSnapshotResponse:
+        policy.require_feature("positions")
+        policy.require_feature("market-data")
+        positions = [
+            position
+            for position in policy.filter_positions(await active_gateway.positions())
+            if position.contract.sec_type == "OPT" and position.position != 0
+        ]
+        unique_specs: list[ContractSpec] = []
+        spec_indices: dict[str, int] = {}
+        position_indices: list[int] = []
+        for position in positions:
+            spec = _contract_spec(position.contract)
+            key = f"conid:{spec.con_id}" if spec.con_id is not None else spec.model_dump_json()
+            index = spec_indices.get(key)
+            if index is None:
+                index = len(unique_specs)
+                spec_indices[key] = index
+                unique_specs.append(spec)
+            position_indices.append(index)
+
+        collection_timeout = request.timeout_seconds or min(
+            settings.tws.request_timeout_seconds,
+            10,
+        )
+        collection = await collect_market_data_batch(
+            active_gateway,
+            unique_specs,
+            market_data_type=request.market_data_type,
+            max_concurrency=request.max_concurrency,
+            timeout_seconds=collection_timeout,
+            request_timeout_seconds=settings.tws.request_timeout_seconds,
+            preflight_index=(len(unique_specs) // 2 if unique_specs else None),
+        )
+        responses: dict[int, MarketDataSnapshotResponse] = {}
+        errors: dict[int, TwsErrorDetailResponse] = {}
+        for index, result in collection.results.items():
+            if result.snapshot is not None:
+                response = _market_data_response(
+                    unique_specs[index],
+                    request.market_data_type,
+                    result.snapshot,
+                )
+                responses[index] = response
+                await observe_snapshot(response)
+            else:
+                observe_batch_error(result)
+                assert result.error is not None
+                errors[index] = _market_data_error(result.error)
+
+        quotes = [
+            PortfolioOptionQuoteResponse(
+                account=position.account,
+                position=position.position,
+                average_cost=position.average_cost,
+                contract=_contract_response(position.contract),
+                snapshot=responses.get(index),
+                error=errors.get(index),
+                attempts=collection.attempts[index],
+            )
+            for position, index in zip(positions, position_indices, strict=True)
+        ]
+        returned_count = sum(quote.snapshot is not None for quote in quotes)
+        return PortfolioOptionSnapshotResponse(
+            requested_market_data_type=request.market_data_type,
+            position_count=len(quotes),
+            returned_count=returned_count,
+            coverage_percentage=(returned_count / len(quotes) * 100 if quotes else 100),
+            collection_timeout_seconds=collection_timeout,
+            max_concurrency=request.max_concurrency,
+            retried_contracts=collection.retried_contracts,
+            collection_started_at=collection.collection_started_at,
+            collected_at=collection.collected_at,
             quotes=quotes,
         )
 
@@ -808,37 +952,68 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
     async def volatility_history(request: VolatilityHistoryRequest) -> VolatilityHistoryResponse:
         policy.require_feature("historical-data")
         policy.check_contract(request.contract)
-        common = {
-            "contract": request.contract,
-            "end": request.end,
-            "duration": request.duration,
-            "bar_size": request.bar_size,
-            "regular_trading_hours_only": request.regular_trading_hours_only,
-        }
-        implied_values, historical_values = await asyncio.gather(
-            active_gateway.historical_bars(
-                HistoricalBarsRequest(**common, data_type="OPTION_IMPLIED_VOLATILITY")
-            ),
-            active_gateway.historical_bars(
-                HistoricalBarsRequest(**common, data_type="HISTORICAL_VOLATILITY")
-            ),
-        )
-        return VolatilityHistoryResponse(
-            contract=request.contract,
+        response, _, _ = await load_volatility_history(request)
+        return response
+
+    @app.post(
+        "/v1/options/volatility-comparison",
+        response_model=OptionVolatilityComparisonResponse,
+        responses=TWS_ERROR_RESPONSES,
+    )
+    async def option_volatility_comparison(
+        request: OptionVolatilityComparisonRequest,
+    ) -> OptionVolatilityComparisonResponse:
+        policy.require_feature("market-data")
+        policy.require_feature("historical-data")
+        policy.check_contract(request.option_contract)
+        policy.check_contract(request.underlying_contract)
+        history_request = VolatilityHistoryRequest(
+            contract=request.underlying_contract,
             end=request.end,
             duration=request.duration,
             bar_size=request.bar_size,
             regular_trading_hours_only=request.regular_trading_hours_only,
-            implied_volatility=VolatilitySeriesResponse(
-                data_type="OPTION_IMPLIED_VOLATILITY",
-                name="ib_30_day_at_market_implied_volatility",
-                bars=[_historical_bar_response(value) for value in implied_values],
+        )
+        raw_snapshot, history_values = await asyncio.gather(
+            active_gateway.market_data_snapshot(
+                MarketDataSnapshotRequest(
+                    contract=request.option_contract,
+                    market_data_type=request.market_data_type,
+                )
             ),
-            historical_volatility=VolatilitySeriesResponse(
-                data_type="HISTORICAL_VOLATILITY",
-                name="ib_30_day_historical_volatility",
-                bars=[_historical_bar_response(value) for value in historical_values],
+            load_volatility_history(history_request),
+        )
+        snapshot = _market_data_response(
+            request.option_contract,
+            request.market_data_type,
+            raw_snapshot,
+        )
+        await observe_snapshot(snapshot)
+        history, implied_values, historical_values = history_values
+        return OptionVolatilityComparisonResponse(
+            option_snapshot=snapshot,
+            underlying_history=history,
+            metrics=_volatility_comparison_metrics(
+                snapshot,
+                implied_values,
+                historical_values,
             ),
         )
+
+    @app.post(
+        "/v1/options/observed-history",
+        response_model=ObservedOptionHistoryResponse,
+    )
+    async def observed_option_history(
+        request: ObservedOptionHistoryRequest,
+    ) -> ObservedOptionHistoryResponse:
+        policy.require_feature("market-data")
+        policy.check_contract(request.contract)
+        if not journal.enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="request-driven option history is disabled; configure history.path",
+            )
+        return await journal.query(request)
 
     return app

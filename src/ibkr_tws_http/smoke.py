@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 EXPECTED_API_OPERATIONS = {
     "/healthz": "get",
     "/v1/status": "get",
+    "/v1/capabilities": "get",
     "/v1/accounts": "get",
     "/v1/account-summary": "get",
     "/v1/positions": "get",
@@ -20,6 +21,9 @@ EXPECTED_API_OPERATIONS = {
     "/v1/contracts/details": "post",
     "/v1/options/chains": "get",
     "/v1/options/chain-snapshot": "get",
+    "/v1/options/portfolio-snapshot": "get",
+    "/v1/options/volatility-comparison": "post",
+    "/v1/options/observed-history": "post",
     "/v1/market-data/snapshot": "post",
     "/v1/historical-bars": "post",
     "/v1/volatility/history": "post",

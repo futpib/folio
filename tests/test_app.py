@@ -211,6 +211,17 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "connection_time": "20260814 12:00:00 UTC",
             "read_only": True,
         }
+        assert client.get("/v1/capabilities").json() == {
+            "tws_connected": True,
+            "live_market_quotes": {"status": "unknown", "evidence_codes": []},
+            "delayed_option_model": {"status": "unknown", "evidence_codes": []},
+            "exact_option_historical_data": {"status": "unknown", "evidence_codes": []},
+            "opportunistic_option_history_enabled": False,
+            "opportunistic_option_history_samples": 0,
+            "adaptive_batch_scheduler": True,
+            "continuous_uptime_required": False,
+            "additional_market_data_subscriptions_required": False,
+        }
         assert client.get("/v1/accounts").json() == [{"account": "paper"}]
         assert client.get("/v1/account-summary").json() == [
             {
@@ -370,11 +381,19 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "HISTORICAL_VOLATILITY",
         }
 
+        disabled_history = client.post(
+            "/v1/options/observed-history",
+            json={"contract": {"con_id": 123, "symbol": "AAPL", "sec_type": "OPT"}},
+        )
+        assert disabled_history.status_code == 409
+        assert "configure history.path" in disabled_history.json()["detail"]
+
         openapi = client.get("/openapi.json").json()
-        assert openapi["info"]["version"] == "0.9.0"
+        assert openapi["info"]["version"] == "0.10.0"
         assert set(openapi["paths"]) == {
             "/healthz",
             "/v1/status",
+            "/v1/capabilities",
             "/v1/accounts",
             "/v1/account-summary",
             "/v1/positions",
@@ -382,6 +401,9 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "/v1/contracts/search",
             "/v1/options/chains",
             "/v1/options/chain-snapshot",
+            "/v1/options/portfolio-snapshot",
+            "/v1/options/volatility-comparison",
+            "/v1/options/observed-history",
             "/v1/market-data/snapshot",
             "/v1/historical-bars",
             "/v1/volatility/history",
@@ -769,10 +791,10 @@ def test_batch_snapshot_uses_one_concurrent_collection_deadline() -> None:
     assert payload["underlying_attempts"] == 2
     assert payload["underlying_error"] == {
         "code": None,
-        "message": "batch market data collection deadline reached",
+        "message": "TWS market data request timed out",
     }
     assert {(quote["error"]["code"], quote["error"]["message"]) for quote in payload["quotes"]} == {
-        (None, "batch market data collection deadline reached")
+        (None, "TWS market data request timed out")
     }
     assert {quote["attempts"] for quote in payload["quotes"]} == {2}
     assert gateway.max_active_quotes == 3

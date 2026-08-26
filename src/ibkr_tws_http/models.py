@@ -528,8 +528,12 @@ class ObservedOptionHistoryResponse(StrictModel):
     contract: ContractSpec
     continuous_coverage: Literal[False] = False
     coverage_note: Literal[
-        "Request-driven observations only; gaps mean the API was not asked for this contract."
-    ] = "Request-driven observations only; gaps mean the API was not asked for this contract."
+        "Transient process-local observations only; gaps mean the API was not asked, and all "
+        "samples are cleared on restart."
+    ] = (
+        "Transient process-local observations only; gaps mean the API was not asked, and all "
+        "samples are cleared on restart."
+    )
     first_observation_at: datetime | None = None
     last_observation_at: datetime | None = None
     samples: list[ObservedOptionSnapshotResponse]
@@ -545,8 +549,10 @@ class CapabilitiesResponse(StrictModel):
     live_market_quotes: CapabilityStatusResponse
     delayed_option_model: CapabilityStatusResponse
     exact_option_historical_data: CapabilityStatusResponse
-    opportunistic_option_history_enabled: bool
-    opportunistic_option_history_samples: int = Field(ge=0)
+    transient_option_history_enabled: Literal[True] = True
+    transient_option_history_samples: int = Field(ge=0)
     adaptive_batch_scheduler: Literal[True] = True
     continuous_uptime_required: Literal[False] = False
     additional_market_data_subscriptions_required: Literal[False] = False
+    persistent_storage: Literal[False] = False
+    all_state_transient: Literal[True] = True

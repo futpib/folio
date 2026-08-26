@@ -10,11 +10,6 @@ connect_timeout_seconds = 3
 request_timeout_seconds = 15
 reconnect_delay_seconds = 5
 
-# Optional request-driven option snapshot journal. The service writes only when
-# an API request obtains an option IV; it does not run a background recorder.
-[history]
-path = "~/.local/state/ibkr-tws-http/option-snapshots.sqlite3"
-
 [exposure]
 features = [
   "status",

@@ -97,8 +97,7 @@ entitlements and provides no delayed historical-data fallback.
 Run a local test service without TWS, subscriptions, or market hours:
 
 ```console
-uv run ibkr-tws-http-mock --port 18080 \
-  --history-path /tmp/ibkr-tws-http-mock.sqlite3
+uv run ibkr-tws-http-mock --port 18080
 ```
 
 The mock operates at the official `EClient`/`EWrapper` callback boundary, so it
@@ -109,7 +108,14 @@ transient streams with no ticks, a missing underlying stream, and exact-option
 historical-data errors 162/2188. Put streams return data on their second attempt,
 which makes batch fairness and retry behavior deterministic.
 
-## In-memory cache
+## Transient-state invariant
+
+All runtime state in this repository must remain transient. Implementations must
+not add databases, journals, snapshot files, or any other filesystem persistence.
+Restarting the process intentionally clears every cache and observation. This is
+a repository-level design constraint, not merely the current default.
+
+## In-memory cache and observations
 
 The service keeps bounded process-local LRU caches and never writes cache entries
 to disk. Contract details, contract searches, option-chain definitions, and
@@ -123,10 +129,11 @@ required by the batch deadline and retry behavior. Errors, accounts, account
 summary, positions, and historical bars are not cached. Every cache is cleared
 when the process stops or the observed TWS connection identity changes.
 
-An optional SQLite observation journal is separate from these caches. Set
-`history.path` to record quality-gated option IV only when an API request obtains
-it. There is no polling loop or background recorder, and the history response
-explicitly labels its coverage as sparse and request-driven.
+The service also retains at most 10,000 quality-gated option-IV observations in
+process memory. Samples are added only when an API request obtains an option IV;
+there is no polling loop or background recorder. The history response explicitly
+labels coverage as sparse and process-local. All samples are discarded on stop
+or restart.
 
 ## API
 
@@ -297,9 +304,10 @@ error codes; the service does not manufacture live data from delayed ticks.
 `GET /v1/capabilities` summarizes evidence observed by this process. It reports
 whether live quotes, delayed option models, and exact-option historical data are
 available, including the TWS codes supporting an unavailable result. It also
-reports whether request-driven history is enabled and how many observations are
-stored. An initial `unknown` means the process has not yet exercised that path;
-it is not a claim that an entitlement exists.
+reports how many transient request-driven observations are currently held and
+asserts `persistent_storage: false` and `all_state_transient: true`. An initial
+`unknown` means the process has not yet exercised that path; it is not a claim
+that an entitlement exists.
 
 The default policy redacts account IDs as `account`. Configure an alias to make
 multiple accounts distinguishable without returning their real IDs. Empty

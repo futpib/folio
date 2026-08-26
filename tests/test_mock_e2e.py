@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from ibkr_tws_http.app import create_app
-from ibkr_tws_http.config import HistoryConfig, ServerConfig, Settings, TwsConfig
+from ibkr_tws_http.config import ServerConfig, Settings, TwsConfig
 from ibkr_tws_http.mock_tws import OPTIONS, UNDERLYING, MockTwsClient, create_mock_gateway
 
 
@@ -24,7 +24,11 @@ def _option_spec(index: int) -> dict[str, object]:
     }
 
 
-def test_no_subscription_workflow_against_mock_tws_callbacks(tmp_path: Path) -> None:
+def test_no_subscription_workflow_against_mock_tws_callbacks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
     MockTwsClient.instances.clear()
     tws = TwsConfig(
         connect_timeout_seconds=0.25,
@@ -34,7 +38,6 @@ def test_no_subscription_workflow_against_mock_tws_callbacks(tmp_path: Path) -> 
     settings = Settings(
         server=ServerConfig(),
         tws=tws,
-        history=HistoryConfig(path=tmp_path / "observations.sqlite3"),
     )
     app = create_app(settings, gateway=create_mock_gateway(tws))
 
@@ -145,10 +148,20 @@ def test_no_subscription_workflow_against_mock_tws_callbacks(tmp_path: Path) -> 
             "status": "unavailable",
             "evidence_codes": [162, 2188],
         }
-        assert capability_payload["opportunistic_option_history_enabled"] is True
-        assert capability_payload["opportunistic_option_history_samples"] >= 8
+        assert capability_payload["transient_option_history_enabled"] is True
+        assert capability_payload["transient_option_history_samples"] >= 8
         assert capability_payload["adaptive_batch_scheduler"] is True
         assert capability_payload["continuous_uptime_required"] is False
         assert capability_payload["additional_market_data_subscriptions_required"] is False
+        assert capability_payload["persistent_storage"] is False
+        assert capability_payload["all_state_transient"] is True
 
-    assert (tmp_path / "observations.sqlite3").exists()
+    assert list(tmp_path.iterdir()) == []
+
+    with TestClient(app) as restarted_client:
+        cleared = restarted_client.post(
+            "/v1/options/observed-history",
+            json={"contract": {"con_id": OPTIONS[0].conId, "sec_type": "OPT"}},
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["samples"] == []

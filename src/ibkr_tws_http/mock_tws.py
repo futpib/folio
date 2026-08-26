@@ -4,14 +4,13 @@ import argparse
 import threading
 from collections import defaultdict
 from collections.abc import Sequence
-from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
 import uvicorn
 
 from .app import create_app
-from .config import HistoryConfig, ServerConfig, Settings, TwsConfig
+from .config import ServerConfig, Settings, TwsConfig
 from .official import IbApiBindings, OfficialGateway
 
 
@@ -322,12 +321,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18080)
-    parser.add_argument("--history-path", type=Path)
     args = parser.parse_args(argv)
     settings = Settings(
         server=ServerConfig(host=args.host, port=args.port),
         tws=TwsConfig(request_timeout_seconds=0.25),
-        history=HistoryConfig(path=args.history_path),
     )
     uvicorn.run(
         create_app(settings, gateway=create_mock_gateway(settings.tws)),

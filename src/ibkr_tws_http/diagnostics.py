@@ -39,8 +39,7 @@ class CapabilityTracker:
         self,
         *,
         tws_connected: bool,
-        journal_enabled: bool,
-        journal_samples: int,
+        observation_samples: int,
     ) -> CapabilitiesResponse:
         if self._live_available:
             live_status = "available"
@@ -61,6 +60,5 @@ class CapabilityTracker:
                 status=("unavailable" if self._option_history_unavailable_codes else "unknown"),
                 evidence_codes=sorted(self._option_history_unavailable_codes),
             ),
-            opportunistic_option_history_enabled=journal_enabled,
-            opportunistic_option_history_samples=journal_samples,
+            transient_option_history_samples=observation_samples,
         )

@@ -17,9 +17,6 @@ def test_config_loads_policy_and_cli_overrides_bind(tmp_path: Path) -> None:
 host = "127.0.0.2"
 port = 8000
 
-[history]
-path = "~/ibkr-observations.sqlite3"
-
 [exposure]
 features = ["status", "positions"]
 allowed_accounts = ["DU123"]
@@ -33,7 +30,6 @@ allowed_symbols = ["aapl"]
     assert settings.server.host == "0.0.0.0"
     assert settings.server.port == 9000
     assert settings.tws.port == 4001
-    assert settings.history.path == Path("~/ibkr-observations.sqlite3").expanduser()
     assert settings.exposure.features == frozenset({"status", "positions"})
     assert settings.exposure.account_aliases == {"DU123": "paper"}
     assert settings.exposure.allowed_security_types == frozenset({"STK"})

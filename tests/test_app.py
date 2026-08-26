@@ -216,11 +216,13 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "live_market_quotes": {"status": "unknown", "evidence_codes": []},
             "delayed_option_model": {"status": "unknown", "evidence_codes": []},
             "exact_option_historical_data": {"status": "unknown", "evidence_codes": []},
-            "opportunistic_option_history_enabled": False,
-            "opportunistic_option_history_samples": 0,
+            "transient_option_history_enabled": True,
+            "transient_option_history_samples": 0,
             "adaptive_batch_scheduler": True,
             "continuous_uptime_required": False,
             "additional_market_data_subscriptions_required": False,
+            "persistent_storage": False,
+            "all_state_transient": True,
         }
         assert client.get("/v1/accounts").json() == [{"account": "paper"}]
         assert client.get("/v1/account-summary").json() == [
@@ -381,15 +383,15 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "HISTORICAL_VOLATILITY",
         }
 
-        disabled_history = client.post(
+        transient_history = client.post(
             "/v1/options/observed-history",
             json={"contract": {"con_id": 123, "symbol": "AAPL", "sec_type": "OPT"}},
         )
-        assert disabled_history.status_code == 409
-        assert "configure history.path" in disabled_history.json()["detail"]
+        assert transient_history.status_code == 200
+        assert transient_history.json()["samples"] == []
 
         openapi = client.get("/openapi.json").json()
-        assert openapi["info"]["version"] == "0.10.0"
+        assert openapi["info"]["version"] == "0.10.1"
         assert set(openapi["paths"]) == {
             "/healthz",
             "/v1/status",

@@ -27,7 +27,6 @@ from .gateway import (
     MarketDataSnapshot,
     OptionComputation,
 )
-from .history import OptionSnapshotJournal
 from .models import (
     AccountResponse,
     AccountValueResponse,
@@ -65,6 +64,7 @@ from .models import (
     VolatilityHistoryResponse,
     VolatilitySeriesResponse,
 )
+from .observations import TransientOptionObservationStore
 from .official import OfficialGateway
 from .policy import ExposurePolicy, PolicyDenied
 
@@ -452,12 +452,12 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
     settings.validate()
     active_gateway = CachingGateway(gateway or OfficialGateway(settings.tws))
     policy = ExposurePolicy(settings.exposure)
-    journal = OptionSnapshotJournal(settings.history.path)
+    observations = TransientOptionObservationStore()
     capabilities = CapabilityTracker()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        await journal.start()
+        await observations.start()
         try:
             await active_gateway.start()
             try:
@@ -465,7 +465,7 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
             finally:
                 await active_gateway.stop()
         finally:
-            await journal.stop()
+            await observations.stop()
 
     app = FastAPI(
         title="IBKR TWS HTTP",
@@ -475,12 +475,12 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
     )
     app.state.gateway = active_gateway
     app.state.settings = settings
-    app.state.journal = journal
+    app.state.observations = observations
     app.state.capabilities = capabilities
 
     async def observe_snapshot(snapshot: MarketDataSnapshotResponse) -> None:
         capabilities.observe_snapshot(snapshot)
-        await journal.record(snapshot)
+        await observations.record(snapshot)
 
     def observe_batch_error(result: BatchItemResult) -> None:
         if isinstance(result.error, GatewayRequestError):
@@ -553,8 +553,7 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
         current = active_gateway.status()
         return capabilities.response(
             tws_connected=current.connected,
-            journal_enabled=journal.enabled,
-            journal_samples=await journal.count(),
+            observation_samples=await observations.count(),
         )
 
     @app.get("/v1/accounts", response_model=list[AccountResponse])
@@ -1009,11 +1008,6 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
     ) -> ObservedOptionHistoryResponse:
         policy.require_feature("market-data")
         policy.check_contract(request.contract)
-        if not journal.enabled:
-            raise HTTPException(
-                status_code=409,
-                detail="request-driven option history is disabled; configure history.path",
-            )
-        return await journal.query(request)
+        return await observations.query(request)
 
     return app

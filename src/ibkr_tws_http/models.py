@@ -134,6 +134,27 @@ class HistoricalBarsRequest(StrictModel):
         return value
 
 
+class VolatilityHistoryRequest(StrictModel):
+    contract: ContractSpec
+    end: datetime | None = None
+    duration: str = Field(default="1 M", min_length=3, max_length=32)
+    bar_size: str = Field(default="1 day", min_length=3, max_length=32)
+    regular_trading_hours_only: bool = True
+
+    @field_validator("end")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("end must include a UTC offset")
+        return value
+
+    @model_validator(mode="after")
+    def require_supported_underlying(self) -> VolatilityHistoryRequest:
+        if self.contract.sec_type not in {"STK", "IND"}:
+            raise ValueError("volatility history supports only stock, ETF, and index underlyings")
+        return self
+
+
 class StatusResponse(StrictModel):
     service: Literal["ok"] = "ok"
     tws_connected: bool
@@ -209,6 +230,45 @@ class OptionComputationsResponse(StrictModel):
     model: OptionComputationResponse | None = None
 
 
+class ImpliedVolatilityResponse(StrictModel):
+    value: float | None = Field(
+        description="Quality-gated IV as a decimal, or null when neither source is usable",
+    )
+    source: Literal["market_mid", "model"] | None = Field(
+        description="market_mid for a qualifying two-sided quote; model for IB model fallback",
+    )
+    bid_implied_volatility: float | None = Field(
+        description="IB IV calculated from the actual option bid, as a decimal",
+    )
+    ask_implied_volatility: float | None = Field(
+        description="IB IV calculated from the actual option ask, as a decimal",
+    )
+    quote_observed_at: datetime | None = Field(
+        description="Oldest server observation time among the bid, ask, and their IVs",
+    )
+    quote_age_seconds: float | None = Field(
+        description="Age of quote_observed_at when collection completed",
+    )
+    spread_percentage: float | None = Field(
+        description="Option ask minus bid divided by their midpoint, in percent",
+    )
+    market_mid_eligible: bool
+    market_mid_rejection_reason: (
+        Literal[
+            "missing_bid_or_ask",
+            "crossed_quote",
+            "missing_bid_or_ask_iv",
+            "inverted_iv_bounds",
+            "missing_quote_timestamp",
+            "stale_quote",
+        ]
+        | None
+    ) = None
+    max_quote_age_seconds: float = Field(
+        description="Maximum server-observed quote age accepted for market_mid",
+    )
+
+
 class TwsErrorDetailResponse(StrictModel):
     code: int | None = None
     message: str
@@ -244,6 +304,10 @@ class MarketDataSnapshotResponse(StrictModel):
     volume: float | int | None = None
     open_interest: float | int | None = None
     option_computations: OptionComputationsResponse | None = None
+    implied_volatility: ImpliedVolatilityResponse | None = Field(
+        default=None,
+        description="Quality-gated market-mid IV with an explicitly labelled model fallback",
+    )
     tws_notices: list[TwsErrorDetailResponse] = Field(default_factory=list)
     fields: dict[str, float | int | str | None]
 
@@ -313,3 +377,24 @@ class HistoricalBarResponse(StrictModel):
     volume: Decimal
     weighted_average_price: Decimal
     trade_count: int
+
+
+class VolatilitySeriesResponse(StrictModel):
+    data_type: Literal["OPTION_IMPLIED_VOLATILITY", "HISTORICAL_VOLATILITY"]
+    name: Literal[
+        "ib_30_day_at_market_implied_volatility",
+        "ib_30_day_historical_volatility",
+    ]
+    window_calendar_days: Literal[30] = 30
+    units: Literal["decimal"] = "decimal"
+    bars: list[HistoricalBarResponse]
+
+
+class VolatilityHistoryResponse(StrictModel):
+    contract: ContractSpec
+    end: datetime | None = None
+    duration: str
+    bar_size: str
+    regular_trading_hours_only: bool
+    implied_volatility: VolatilitySeriesResponse
+    historical_volatility: VolatilitySeriesResponse

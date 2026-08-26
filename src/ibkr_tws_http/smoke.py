@@ -22,6 +22,7 @@ EXPECTED_API_OPERATIONS = {
     "/v1/options/chain-snapshot": "get",
     "/v1/market-data/snapshot": "post",
     "/v1/historical-bars": "post",
+    "/v1/volatility/history": "post",
 }
 
 

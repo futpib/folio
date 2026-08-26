@@ -293,6 +293,7 @@ def test_official_callback_bridge_round_trip() -> None:
         assert snapshot.market_data_type is MarketDataType.LIVE
         assert snapshot.fields["bid"] == 199.5
         assert snapshot.fields["ask_size"] == 120
+        assert snapshot.field_observed_at["bid"] <= snapshot.as_of
 
         option_snapshot = await gateway.market_data_snapshot(
             MarketDataSnapshotRequest(
@@ -307,6 +308,7 @@ def test_official_callback_bridge_round_trip() -> None:
         )
         assert option_snapshot.fields["option_call_open_interest"] == 2500
         assert option_snapshot.option_computations["model"].delta == 0.55
+        assert option_snapshot.option_computation_observed_at["model"] <= option_snapshot.as_of
         assert option_snapshot.market_quote_complete is True
         assert option_snapshot.model_complete is True
         assert option_snapshot.enrichment_complete is True

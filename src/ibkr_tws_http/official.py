@@ -73,6 +73,8 @@ class _Pending:
     enrichment_requested: bool = False
     contract_right: str | None = None
     option_computations: dict[str, OptionComputation] = field(default_factory=dict)
+    field_observed_at: dict[str, datetime] = field(default_factory=dict)
+    option_computation_observed_at: dict[str, datetime] = field(default_factory=dict)
     notices: list[TwsNotice] = field(default_factory=list)
     updated_at: float = field(default_factory=time.monotonic)
 
@@ -781,6 +783,7 @@ class OfficialGateway:
             pending = self._pending.get(request_id)
             if pending is not None:
                 pending.fields[name] = value
+                pending.field_observed_at[name] = datetime.now(UTC)
                 pending.updated_at = time.monotonic()
 
     def _set_market_data_type(self, request_id: int, market_data_type: int) -> None:
@@ -814,6 +817,7 @@ class OfficialGateway:
             pending = self._pending.get(request_id)
             if pending is not None:
                 pending.option_computations[category] = computation
+                pending.option_computation_observed_at[category] = datetime.now(UTC)
                 pending.updated_at = time.monotonic()
 
     def _append_notice(self, request_id: int, notice: TwsNotice) -> None:
@@ -847,6 +851,8 @@ class OfficialGateway:
             ),
             fields=dict(pending.fields),
             option_computations=dict(pending.option_computations),
+            field_observed_at=dict(pending.field_observed_at),
+            option_computation_observed_at=dict(pending.option_computation_observed_at),
             notices=tuple(pending.notices),
         )
 

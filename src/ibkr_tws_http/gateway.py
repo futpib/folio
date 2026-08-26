@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
@@ -149,6 +149,8 @@ class MarketDataSnapshot:
     complete: bool
     fields: dict[str, float | int | str | None]
     option_computations: dict[str, OptionComputation]
+    field_observed_at: dict[str, datetime] = field(default_factory=dict)
+    option_computation_observed_at: dict[str, datetime] = field(default_factory=dict)
     notices: tuple[TwsNotice, ...] = ()
 
 

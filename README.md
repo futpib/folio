@@ -122,6 +122,7 @@ are intentionally explicit:
 - `GET /v1/options/chain-snapshot`
 - `POST /v1/market-data/snapshot`
 - `POST /v1/historical-bars`
+- `POST /v1/volatility/history`
 
 Examples:
 
@@ -145,7 +146,22 @@ curl -X POST http://127.0.0.1:8080/v1/market-data/snapshot \
 curl -X POST http://127.0.0.1:8080/v1/historical-bars \
   -H 'content-type: application/json' \
   -d '{"contract":{"symbol":"AAPL"},"duration":"1 D","bar_size":"5 mins"}'
+
+curl -X POST http://127.0.0.1:8080/v1/volatility/history \
+  -H 'content-type: application/json' \
+  -d '{"contract":{"symbol":"AAPL"},"duration":"1 M","bar_size":"1 day"}'
 ```
+
+The volatility-history wrapper makes IBKR's two useful underlying volatility
+series explicit instead of requiring callers to discover historical-data type
+strings. It returns `OPTION_IMPLIED_VOLATILITY` as
+`ib_30_day_at_market_implied_volatility` and `HISTORICAL_VOLATILITY` as
+`ib_30_day_historical_volatility`, with values expressed as decimals. The IV is
+IBKR's at-market estimate for a maturity 30 calendar days forward using two
+consecutive expirations; it is not the historical IV of a particular option.
+IBKR exposes these historical series for stock, ETF, and index underlyings. The
+endpoint makes two bounded, one-shot historical requests and does not run a
+background recorder.
 
 Use contract search to find the underlying contract ID, query its option chains
 for available exchanges, trading classes, expirations, and strikes, then use
@@ -176,6 +192,17 @@ remain available under `fields`; non-fatal partial-subscription and
 partial-collection messages are returned under `tws_notices` with the same
 redaction. A wholly empty snapshot is an HTTP 504, not a successful response
 containing null fields.
+
+Option responses also expose a quality-gated `implied_volatility` summary. Its
+`source` is `market_mid` only when an actual two-sided option quote and both
+side IV computations were observed within five seconds, the price quote is not
+crossed, and the bid/ask IV bounds are ordered. The response retains the bid IV,
+ask IV, oldest server observation time, age at collection, and quoted-price
+spread percentage. `market_mid` is the arithmetic midpoint of the bid and ask
+IV bounds. If any gate fails, the value falls back to IBKR's model IV with
+`source: model` and a machine-readable rejection reason; model IV is never
+labelled as market IV. Delayed quotes remain identified by
+`market_data_type: delayed`.
 
 Option quotes use short-lived streaming subscriptions because IBKR rejects
 generic option ticks on one-shot snapshots. The adapter collects the initial

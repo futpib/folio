@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi.testclient import TestClient
@@ -66,6 +66,7 @@ class FakeGateway:
         self.last_contract = None
         self.option_chain_requests = []
         self.market_data_requests = []
+        self.historical_requests = []
 
     async def start(self) -> None:
         self.started = True
@@ -167,13 +168,17 @@ class FakeGateway:
 
     async def historical_bars(self, request):
         self.last_contract = request.contract
+        self.historical_requests.append(request)
+        if request.data_type == "OPTION_IMPLIED_VOLATILITY":
+            prices = (0.78, 0.82, 0.77, 0.8)
+        elif request.data_type == "HISTORICAL_VOLATILITY":
+            prices = (0.68, 0.72, 0.67, 0.7)
+        else:
+            prices = (198.0, 200.0, 197.5, 199.5)
         return [
             HistoricalBar(
                 "20260814 12:00:00",
-                198.0,
-                200.0,
-                197.5,
-                199.5,
+                *prices,
                 Decimal("1000"),
                 Decimal("199.2"),
                 75,
@@ -332,8 +337,41 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
         assert response.status_code == 200
         assert response.json()[0]["volume"] == "1000"
 
+        response = client.post(
+            "/v1/volatility/history",
+            json={"contract": {"symbol": "aapl"}, "duration": "2 W"},
+        )
+        assert response.status_code == 200
+        volatility = response.json()
+        assert volatility["contract"]["symbol"] == "AAPL"
+        assert volatility["duration"] == "2 W"
+        assert volatility["bar_size"] == "1 day"
+        assert volatility["implied_volatility"] == {
+            "data_type": "OPTION_IMPLIED_VOLATILITY",
+            "name": "ib_30_day_at_market_implied_volatility",
+            "window_calendar_days": 30,
+            "units": "decimal",
+            "bars": [
+                {
+                    "time": "20260814 12:00:00",
+                    "open": 0.78,
+                    "high": 0.82,
+                    "low": 0.77,
+                    "close": 0.8,
+                    "volume": "1000",
+                    "weighted_average_price": "199.2",
+                    "trade_count": 75,
+                }
+            ],
+        }
+        assert volatility["historical_volatility"]["bars"][0]["close"] == 0.7
+        assert {request.data_type for request in gateway.historical_requests[-2:]} == {
+            "OPTION_IMPLIED_VOLATILITY",
+            "HISTORICAL_VOLATILITY",
+        }
+
         openapi = client.get("/openapi.json").json()
-        assert openapi["info"]["version"] == "0.8.0"
+        assert openapi["info"]["version"] == "0.9.0"
         assert set(openapi["paths"]) == {
             "/healthz",
             "/v1/status",
@@ -346,6 +384,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "/v1/options/chain-snapshot",
             "/v1/market-data/snapshot",
             "/v1/historical-bars",
+            "/v1/volatility/history",
         }
         assert set(openapi["paths"]["/v1/options/chains"]) == {"get"}
         market_data_schema = openapi["components"]["schemas"]["MarketDataSnapshotResponse"]
@@ -356,6 +395,7 @@ def test_read_only_routes_apply_response_and_contract_policy() -> None:
             "enrichment_complete",
             "complete",
             "collected_at",
+            "implied_volatility",
         } <= set(market_data_schema["properties"])
         assert "as_of" not in market_data_schema["properties"]
         assert (
@@ -389,6 +429,12 @@ def test_rejects_out_of_policy_and_naive_historical_time() -> None:
             json={"contract": {"symbol": "AAPL"}, "end": "2026-08-14T12:00:00"},
         )
         assert invalid.status_code == 422
+
+        invalid_volatility = client.post(
+            "/v1/volatility/history",
+            json={"contract": {"symbol": "AAPL", "sec_type": "OPT"}},
+        )
+        assert invalid_volatility.status_code == 422
 
 
 def test_disabled_feature_is_not_exposed() -> None:
@@ -482,7 +528,7 @@ class SideComputationGateway(FakeGateway):
         computation_values = {
             name: OptionComputation(
                 option_price=price,
-                implied_volatility=0.75,
+                implied_volatility=implied_volatility,
                 delta=0.55,
                 gamma=0.08,
                 theta=-0.01,
@@ -490,17 +536,24 @@ class SideComputationGateway(FakeGateway):
                 underlying_price=200.0,
                 present_value_dividend=0.0,
             )
-            for name, price in (("bid", 1.7), ("ask", 1.9), ("last", 1.85), ("model", 1.827))
+            for name, price, implied_volatility in (
+                ("bid", 1.7, 0.7),
+                ("ask", 1.9, 0.8),
+                ("last", 1.85, 0.76),
+                ("model", 1.827, 0.75),
+            )
         }
+        collected_at = datetime(2026, 8, 14, 14, 0, tzinfo=UTC)
         return MarketDataSnapshot(
             market_data_type=MarketDataType.DELAYED,
-            as_of=datetime(2026, 8, 14, 14, 0, tzinfo=UTC),
+            as_of=collected_at,
             market_quote_complete=True,
             model_complete=True,
             enrichment_complete=False,
             complete=False,
             fields={},
             option_computations=computation_values,
+            option_computation_observed_at={name: collected_at for name in computation_values},
         )
 
 
@@ -546,6 +599,104 @@ class EntitlementPreflightGateway(FakeGateway):
             )
             return replace(snapshot, notices=(TwsNotice(2186, "using delayed data"),))
         return await super().market_data_snapshot(request)
+
+
+class CrossedOptionGateway(SideComputationGateway):
+    async def market_data_snapshot(self, request):
+        snapshot = await super().market_data_snapshot(request)
+        if request.contract.sec_type != "OPT":
+            return snapshot
+        computations = dict(snapshot.option_computations)
+        computations["bid"] = replace(computations["bid"], option_price=1.9)
+        computations["ask"] = replace(computations["ask"], option_price=1.7)
+        return replace(snapshot, option_computations=computations)
+
+
+class StaleOptionGateway(SideComputationGateway):
+    async def market_data_snapshot(self, request):
+        snapshot = await super().market_data_snapshot(request)
+        if request.contract.sec_type != "OPT":
+            return snapshot
+        observed_at = snapshot.as_of - timedelta(seconds=6)
+        return replace(
+            snapshot,
+            option_computation_observed_at={
+                name: observed_at for name in snapshot.option_computations
+            },
+        )
+
+
+class IvBoundsWithoutQuotesGateway(SideComputationGateway):
+    async def market_data_snapshot(self, request):
+        snapshot = await super().market_data_snapshot(request)
+        if request.contract.sec_type != "OPT":
+            return snapshot
+        computations = dict(snapshot.option_computations)
+        computations["bid"] = replace(computations["bid"], option_price=None)
+        computations["ask"] = replace(computations["ask"], option_price=None)
+        return replace(
+            snapshot,
+            market_quote_complete=False,
+            option_computations=computations,
+        )
+
+
+def _option_snapshot(gateway: FakeGateway) -> dict:
+    with TestClient(create_app(settings(), gateway)) as client:
+        response = client.post(
+            "/v1/market-data/snapshot",
+            json={
+                "contract": {
+                    "symbol": "AAPL",
+                    "sec_type": "OPT",
+                    "last_trade_date_or_contract_month": "20260918",
+                    "strike": 200,
+                    "right": "C",
+                },
+                "market_data_type": "delayed",
+            },
+        )
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_option_iv_uses_only_a_fresh_non_crossed_market_mid() -> None:
+    payload = _option_snapshot(SideComputationGateway())
+
+    assert payload["implied_volatility"] == {
+        "value": 0.75,
+        "source": "market_mid",
+        "bid_implied_volatility": 0.7,
+        "ask_implied_volatility": 0.8,
+        "quote_observed_at": "2026-08-14T14:00:00Z",
+        "quote_age_seconds": 0.0,
+        "spread_percentage": 11.111111111111109,
+        "market_mid_eligible": True,
+        "market_mid_rejection_reason": None,
+        "max_quote_age_seconds": 5.0,
+    }
+
+
+def test_option_iv_falls_back_to_explicitly_labelled_model_value() -> None:
+    model_only = _option_snapshot(ModelOnlyOptionGateway())["implied_volatility"]
+    crossed = _option_snapshot(CrossedOptionGateway())["implied_volatility"]
+    stale = _option_snapshot(StaleOptionGateway())["implied_volatility"]
+    iv_without_quotes = _option_snapshot(IvBoundsWithoutQuotesGateway())["implied_volatility"]
+
+    assert model_only["source"] == "model"
+    assert model_only["value"] == 0.75
+    assert model_only["market_mid_rejection_reason"] == "missing_bid_or_ask"
+    assert crossed["source"] == "model"
+    assert crossed["market_mid_rejection_reason"] == "crossed_quote"
+    assert crossed["spread_percentage"] < 0
+    assert stale["source"] == "model"
+    assert stale["quote_age_seconds"] == 6.0
+    assert stale["market_mid_rejection_reason"] == "stale_quote"
+    assert iv_without_quotes["source"] == "model"
+    assert iv_without_quotes["bid_implied_volatility"] == 0.7
+    assert iv_without_quotes["ask_implied_volatility"] == 0.8
+    assert iv_without_quotes["spread_percentage"] is None
+    assert iv_without_quotes["market_mid_rejection_reason"] == "missing_bid_or_ask"
 
 
 def test_batch_snapshot_keeps_per_contract_errors_and_redacts_accounts() -> None:

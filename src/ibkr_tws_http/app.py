@@ -22,6 +22,7 @@ from .gateway import (
     GatewayRequestError,
     GatewayTimeout,
     GatewayUnavailable,
+    HistoricalBar,
     MarketDataSnapshot,
     OptionComputation,
 )
@@ -34,6 +35,7 @@ from .models import (
     GatewayTimeoutResponse,
     HistoricalBarResponse,
     HistoricalBarsRequest,
+    ImpliedVolatilityResponse,
     MarketDataSnapshotRequest,
     MarketDataSnapshotResponse,
     MarketDataType,
@@ -48,6 +50,9 @@ from .models import (
     StatusResponse,
     TwsErrorDetailResponse,
     TwsErrorResponse,
+    VolatilityHistoryRequest,
+    VolatilityHistoryResponse,
+    VolatilitySeriesResponse,
 )
 from .official import OfficialGateway
 from .policy import ExposurePolicy, PolicyDenied
@@ -168,6 +173,100 @@ def _option_side_price(
     return option_price
 
 
+_MAX_MARKET_MID_QUOTE_AGE_SECONDS = 5.0
+
+
+def _option_side_observed_at(
+    snapshot: MarketDataSnapshot,
+    names: Iterable[str],
+    computation_name: str,
+) -> datetime | None:
+    for name in names:
+        if _available_number(snapshot.fields, (name,)) is not None:
+            return snapshot.field_observed_at.get(name)
+    computation = snapshot.option_computations.get(computation_name)
+    if computation is not None and _option_side_price({}, (), computation) is not None:
+        return snapshot.option_computation_observed_at.get(computation_name)
+    return None
+
+
+def _valid_implied_volatility(value: float | None) -> float | None:
+    if value is None or not math.isfinite(value) or value <= 0 or value >= 1e100:
+        return None
+    return value
+
+
+def _implied_volatility_response(
+    snapshot: MarketDataSnapshot,
+    bid: float | int | None,
+    ask: float | int | None,
+) -> ImpliedVolatilityResponse:
+    bid_computation = snapshot.option_computations.get("bid")
+    ask_computation = snapshot.option_computations.get("ask")
+    model_computation = snapshot.option_computations.get("model")
+    bid_iv = _valid_implied_volatility(
+        bid_computation.implied_volatility if bid_computation is not None else None
+    )
+    ask_iv = _valid_implied_volatility(
+        ask_computation.implied_volatility if ask_computation is not None else None
+    )
+    model_iv = _valid_implied_volatility(
+        model_computation.implied_volatility if model_computation is not None else None
+    )
+
+    spread_percentage = None
+    if bid is not None and ask is not None and bid >= 0 and ask >= 0 and bid + ask > 0:
+        spread_percentage = (ask - bid) / ((bid + ask) / 2) * 100
+
+    observed_values = (
+        _option_side_observed_at(snapshot, ("bid", "delayed_bid"), "bid"),
+        _option_side_observed_at(snapshot, ("ask", "delayed_ask"), "ask"),
+        snapshot.option_computation_observed_at.get("bid"),
+        snapshot.option_computation_observed_at.get("ask"),
+    )
+    quote_observed_at = min(observed_values) if all(observed_values) else None
+    quote_age_seconds = (
+        max(0.0, (snapshot.as_of - quote_observed_at).total_seconds())
+        if quote_observed_at is not None
+        else None
+    )
+
+    reason = None
+    if bid is None or ask is None or bid < 0 or ask < 0:
+        reason = "missing_bid_or_ask"
+    elif ask < bid:
+        reason = "crossed_quote"
+    elif bid_iv is None or ask_iv is None:
+        reason = "missing_bid_or_ask_iv"
+    elif ask_iv < bid_iv:
+        reason = "inverted_iv_bounds"
+    elif quote_observed_at is None:
+        reason = "missing_quote_timestamp"
+    elif quote_age_seconds is None or quote_age_seconds > _MAX_MARKET_MID_QUOTE_AGE_SECONDS:
+        reason = "stale_quote"
+
+    market_mid_eligible = reason is None
+    if market_mid_eligible:
+        value = (bid_iv + ask_iv) / 2
+        source = "market_mid"
+    else:
+        value = model_iv
+        source = "model" if model_iv is not None else None
+
+    return ImpliedVolatilityResponse(
+        value=value,
+        source=source,
+        bid_implied_volatility=bid_iv,
+        ask_implied_volatility=ask_iv,
+        quote_observed_at=quote_observed_at,
+        quote_age_seconds=quote_age_seconds,
+        spread_percentage=spread_percentage,
+        market_mid_eligible=market_mid_eligible,
+        market_mid_rejection_reason=reason,
+        max_quote_age_seconds=_MAX_MARKET_MID_QUOTE_AGE_SECONDS,
+    )
+
+
 def _market_data_response(
     contract: ContractSpec,
     requested_type: MarketDataType,
@@ -191,6 +290,16 @@ def _market_data_response(
     )
     if not any((computations.bid, computations.ask, computations.last, computations.model)):
         computations = None
+    bid = _option_side_price(
+        fields,
+        ("bid", "delayed_bid"),
+        snapshot.option_computations.get("bid"),
+    )
+    ask = _option_side_price(
+        fields,
+        ("ask", "delayed_ask"),
+        snapshot.option_computations.get("ask"),
+    )
     return MarketDataSnapshotResponse(
         contract=contract,
         requested_market_data_type=requested_type,
@@ -202,16 +311,8 @@ def _market_data_response(
         complete=snapshot.complete,
         collected_at=snapshot.as_of,
         last_trade_time=_last_trade_time(fields),
-        bid=_option_side_price(
-            fields,
-            ("bid", "delayed_bid"),
-            snapshot.option_computations.get("bid"),
-        ),
-        ask=_option_side_price(
-            fields,
-            ("ask", "delayed_ask"),
-            snapshot.option_computations.get("ask"),
-        ),
+        bid=bid,
+        ask=ask,
         last=_option_side_price(
             fields,
             ("last", "delayed_last"),
@@ -227,6 +328,9 @@ def _market_data_response(
         volume=_available_number(fields, volume_names, nonnegative=True),
         open_interest=_available_number(fields, open_interest_names, nonnegative=True),
         option_computations=computations,
+        implied_volatility=(
+            _implied_volatility_response(snapshot, bid, ask) if contract.sec_type == "OPT" else None
+        ),
         tws_notices=[
             TwsErrorDetailResponse(code=notice.code, message=notice.message)
             for notice in snapshot.notices
@@ -245,6 +349,19 @@ def _market_data_error(
     if isinstance(error, GatewayRequestError):
         return _tws_error(error)
     return TwsErrorDetailResponse(code=None, message="TWS market data request timed out")
+
+
+def _historical_bar_response(value: HistoricalBar) -> HistoricalBarResponse:
+    return HistoricalBarResponse(
+        time=value.time,
+        open=value.open,
+        high=value.high,
+        low=value.low,
+        close=value.close,
+        volume=value.volume,
+        weighted_average_price=value.weighted_average_price,
+        trade_count=value.trade_count,
+    )
 
 
 TWS_ERROR_RESPONSES = {
@@ -681,18 +798,47 @@ def create_app(settings: Settings, gateway: Gateway | None = None) -> FastAPI:
         policy.require_feature("historical-data")
         policy.check_contract(request.contract)
         values = await active_gateway.historical_bars(request)
-        return [
-            HistoricalBarResponse(
-                time=value.time,
-                open=value.open,
-                high=value.high,
-                low=value.low,
-                close=value.close,
-                volume=value.volume,
-                weighted_average_price=value.weighted_average_price,
-                trade_count=value.trade_count,
-            )
-            for value in values
-        ]
+        return [_historical_bar_response(value) for value in values]
+
+    @app.post(
+        "/v1/volatility/history",
+        response_model=VolatilityHistoryResponse,
+        responses=TWS_ERROR_RESPONSES,
+    )
+    async def volatility_history(request: VolatilityHistoryRequest) -> VolatilityHistoryResponse:
+        policy.require_feature("historical-data")
+        policy.check_contract(request.contract)
+        common = {
+            "contract": request.contract,
+            "end": request.end,
+            "duration": request.duration,
+            "bar_size": request.bar_size,
+            "regular_trading_hours_only": request.regular_trading_hours_only,
+        }
+        implied_values, historical_values = await asyncio.gather(
+            active_gateway.historical_bars(
+                HistoricalBarsRequest(**common, data_type="OPTION_IMPLIED_VOLATILITY")
+            ),
+            active_gateway.historical_bars(
+                HistoricalBarsRequest(**common, data_type="HISTORICAL_VOLATILITY")
+            ),
+        )
+        return VolatilityHistoryResponse(
+            contract=request.contract,
+            end=request.end,
+            duration=request.duration,
+            bar_size=request.bar_size,
+            regular_trading_hours_only=request.regular_trading_hours_only,
+            implied_volatility=VolatilitySeriesResponse(
+                data_type="OPTION_IMPLIED_VOLATILITY",
+                name="ib_30_day_at_market_implied_volatility",
+                bars=[_historical_bar_response(value) for value in implied_values],
+            ),
+            historical_volatility=VolatilitySeriesResponse(
+                data_type="HISTORICAL_VOLATILITY",
+                name="ib_30_day_historical_volatility",
+                bars=[_historical_bar_response(value) for value in historical_values],
+            ),
+        )
 
     return app

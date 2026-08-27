@@ -304,10 +304,9 @@ error codes; the service does not manufacture live data from delayed ticks.
 `GET /v1/capabilities` summarizes evidence observed by this process. It reports
 whether live quotes, delayed option models, and exact-option historical data are
 available, including the TWS codes supporting an unavailable result. It also
-reports how many transient request-driven observations are currently held and
-asserts `persistent_storage: false` and `all_state_transient: true`. An initial
-`unknown` means the process has not yet exercised that path; it is not a claim
-that an entitlement exists.
+reports how many transient request-driven observations are currently held. An
+initial `unknown` means the process has not yet exercised that path; it is not a
+claim that an entitlement exists.
 
 The default policy redacts account IDs as `account`. Configure an alias to make
 multiple accounts distinguishable without returning their real IDs. Empty

@@ -549,10 +549,4 @@ class CapabilitiesResponse(StrictModel):
     live_market_quotes: CapabilityStatusResponse
     delayed_option_model: CapabilityStatusResponse
     exact_option_historical_data: CapabilityStatusResponse
-    transient_option_history_enabled: Literal[True] = True
     transient_option_history_samples: int = Field(ge=0)
-    adaptive_batch_scheduler: Literal[True] = True
-    continuous_uptime_required: Literal[False] = False
-    additional_market_data_subscriptions_required: Literal[False] = False
-    persistent_storage: Literal[False] = False
-    all_state_transient: Literal[True] = True

@@ -43,7 +43,7 @@ class FakeClient:
             return {"tws_connected": self.connected, "server_version": 204}
         if path == "/openapi.json":
             return {
-                "info": {"version": "0.10.1"},
+                "info": {"version": "0.10.2"},
                 "paths": {
                     endpoint: {method: {}} for endpoint, method in EXPECTED_API_OPERATIONS.items()
                 },
@@ -171,7 +171,7 @@ def test_smoke_exercises_live_read_only_flow_without_exposing_account_ids() -> N
 
     result = run_smoke(client, "aapl", messages.append)
 
-    assert result.api_version == "0.10.1"
+    assert result.api_version == "0.10.2"
     assert result.server_version == 204
     assert result.account_count == 1
     assert result.account_summary_count == 1

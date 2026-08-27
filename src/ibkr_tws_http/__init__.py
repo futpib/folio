@@ -1,3 +1,3 @@
 """Read-only HTTP facade for the Interactive Brokers TWS API."""
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"

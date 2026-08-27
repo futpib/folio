@@ -148,13 +148,7 @@ def test_no_subscription_workflow_against_mock_tws_callbacks(
             "status": "unavailable",
             "evidence_codes": [162, 2188],
         }
-        assert capability_payload["transient_option_history_enabled"] is True
         assert capability_payload["transient_option_history_samples"] >= 8
-        assert capability_payload["adaptive_batch_scheduler"] is True
-        assert capability_payload["continuous_uptime_required"] is False
-        assert capability_payload["additional_market_data_subscriptions_required"] is False
-        assert capability_payload["persistent_storage"] is False
-        assert capability_payload["all_state_transient"] is True
 
     assert list(tmp_path.iterdir()) == []
 

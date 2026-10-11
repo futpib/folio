@@ -200,10 +200,10 @@ needed.
 
 ## Gateway sign-in through zond
 
-Zond's optional IB Gateway credential adapter can run Gateway on a private Xvfb
-display and collect login credentials through its Android app, without VNC.
-The adapter and its setup instructions live in
-[`zondd/adapters/ibgateway`](https://github.com/futpib/zondd/tree/master/adapters/ibgateway).
+This repository's optional [IB Gateway adapter](adapters/ibgateway/readme.md)
+can run Gateway on a private Xvfb display and collect login credentials through
+zond's Android app, without VNC. The adapter runs as a separate process from
+the HTTP server and is built separately from the Python package.
 It uses the generic zond application-input protocol, with a configured recipient,
 private credential delivery, and an audit trail that excludes answers.
 

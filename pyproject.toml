@@ -25,6 +25,7 @@ dev = [
 ]
 
 [project.scripts]
+ibkr-tws = "ibkr_tws_http.cli:main"
 ibkr-tws-http = "ibkr_tws_http.main:main"
 ibkr-tws-http-smoke = "ibkr_tws_http.smoke:main"
 ibkr-tws-http-mock = "ibkr_tws_http.mock_tws:main"

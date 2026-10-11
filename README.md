@@ -9,6 +9,10 @@ This service has no authentication or TLS. It binds to `127.0.0.1:8080` by
 default. If you bind it to another interface, every host that can reach it can
 read every resource permitted by the exposure policy.
 
+The companion `ibkr-tws` CLI queries that local service and prints JSON. It can
+run on the same VM as TWS and be invoked through zond over SSH or Iroh, without
+exposing the HTTP listener to the network.
+
 ## Install
 
 Python 3.11 or newer is required. One command installs the service and every
@@ -17,6 +21,10 @@ dependency:
 ```console
 uv sync --extra dev
 ```
+
+This also installs `ibkr-tws` in `.venv/bin`. Use `uv run ibkr-tws` from the
+checkout, or add the checkout's `.venv/bin` to your PATH. The CLI calls the
+running HTTP service; it does not create another TWS API session.
 
 The current official client is not available from IBKR as a package index or
 Git dependency. The lockfile therefore pins the exact commit of an automated
@@ -61,6 +69,134 @@ uv run ibkr-tws-http --config example-config.toml --check
 
 `--host`, `--port`, and `--tws-port` override their TOML values. The TWS socket
 itself is always restricted to a loopback host.
+
+## Query from the CLI
+
+Run the HTTP service first, then use the companion CLI on the same machine:
+
+```sh
+ibkr-tws status
+ibkr-tws positions
+ibkr-tws account-summary
+ibkr-tws contract-search AAPL
+ibkr-tws contract-details --symbol AAPL
+ibkr-tws snapshot --symbol AAPL --market-data-type auto
+ibkr-tws option-chains AAPL 265598
+ibkr-tws chain-snapshot XXI 20280121 --strike-min 2.5 --strike-max 10
+ibkr-tws portfolio-snapshot --timeout-seconds 30
+ibkr-tws historical-bars --symbol AAPL --duration '1 D' --bar-size '5 mins'
+ibkr-tws volatility-history --symbol AAPL
+ibkr-tws observed-history --con-id 829400001 --sec-type OPT
+ibkr-tws volatility-comparison \
+  --option-contract '{"con_id":829400001,"sec_type":"OPT"}' \
+  --underlying-contract '{"symbol":"XXI"}'
+```
+
+`ibkr-tws --help` lists commands for all 16 read-only endpoints, including
+`health`, `accounts`, and `capabilities`. Each command has `--help` for its
+query options. Contract commands accept `--symbol`, `--con-id`, or
+`--local-symbol`, plus fields such as `--sec-type OPT`, `--strike`, `--right C`,
+and `--last-trade-date-or-contract-month YYYYMMDD`.
+
+`--host` (loopback only), `--port`, and `--timeout` work before or after the
+command. They select the HTTP service, not the upstream TWS socket. The default
+HTTP socket timeout is 180 seconds (maximum 86400); `--timeout-seconds` separately sets a batch
+query's server collection window. Proxy environment variables are ignored and
+HTTP redirects are not followed.
+
+Successful requests emit the original JSON response on stdout, preserving
+numeric precision and all data-quality, delay, and partial-result fields.
+HTTP success can still contain incomplete quotes or per-contract errors; inspect
+those fields. Exit status is `0` for HTTP success, `1` for HTTP/connection/response
+errors, `2` for invalid arguments, and `130` for interruption. Errors go to stderr
+with an empty stdout, including TWS error codes when available. `status` reports
+`tws_connected` in JSON; use that field to check TWS readiness. The CLI has no
+prompts, stdin input, runtime files, or persistence. Responses are limited to
+16 MiB.
+
+## Run through zond on a VM
+
+The data path is:
+
+```text
+caller -> zondctl -> SSH (optionally over Iroh) -> zondd on VM
+       -> ibkr-tws on VM -> loopback HTTP -> TWS / IB Gateway
+```
+
+Install this project on the VM, keep `ibkr-tws-http` listening on loopback,
+and configure zond for the Unix account that will execute the CLI. Start the
+HTTP service separately so its TWS session, caches, and observations persist
+between queries. The Android zond app can manage approvals and policy; these
+queries are issued by `zondctl`.
+
+After adding the installation's `.venv/bin` to PATH, run this **on the VM**:
+
+```sh
+command -v ibkr-tws
+ibkr-tws health
+ibkr-tws status
+```
+
+Use the reported absolute executable path in zond's policy. Zond's execution
+policy matches absolute programs; the installed CLI launcher directly selects
+its Python environment and works without shell activation. For example, if
+the path is `/opt/ibkr-tws-http/.venv/bin/ibkr-tws`, these entries provide fixed
+read operations:
+
+```toml
+[principals.ibkr]
+cwd = "/"
+allow_exec = false
+operations = ["ibkr-read"]
+
+[operations.ibkr-read]
+description = "Read the VM's local IBKR API"
+program = "/opt/ibkr-tws-http/.venv/bin/ibkr-tws"
+fixed_args = ["--host", "127.0.0.1", "--port", "8080"]
+arguments = [{ name = "query", choices = ["health", "status", "capabilities", "accounts", "account-summary", "positions", "portfolio-snapshot"] }]
+decision = "allow"
+```
+
+Merge these entries into `~/.config/zondd/config.toml`, preserving other
+principals and operations; validate with `zondd check` and apply to a running
+daemon with `zondctl reload`. Enroll the caller's public key on the VM using
+`zondctl authorize-key /path/to/caller.pub --principal ibkr` and review its
+confirmation. From the caller:
+
+```sh
+zondctl --host user@vm --identity ~/.ssh/ibkr invoke ibkr-read positions
+zondctl --host user@vm --identity ~/.ssh/ibkr invoke ibkr-read portfolio-snapshot
+zondctl --iroh --host user@ENDPOINT_ID --identity ~/.ssh/ibkr invoke ibkr-read status
+```
+
+For arbitrary contract queries, set this principal's `allow_exec = true` and
+`default = "deny"`, and add a rule requiring approval for the CLI's exact path:
+
+```toml
+[[principals.ibkr.rules]]
+program = "/opt/ibkr-tws-http/.venv/bin/ibkr-tws"
+decision = "ask"
+```
+
+Then a caller can submit, for example:
+
+```sh
+zondctl --host user@vm --identity ~/.ssh/ibkr exec \
+  /opt/ibkr-tws-http/.venv/bin/ibkr-tws chain-snapshot XXI 20280121
+```
+
+Review that request in the zond app or with `zondctl review` on the VM. Fixed
+named reads remain allowed. The service's exposure policy still controls
+accounts, symbols, and features. Zond records command arguments and retains
+bounded job output, so queries and returned account data are also subject to
+the daemon's history and local access controls.
+
+If a query exceeds zond's `command_timeout_secs`, zond backgrounds it and prints
+a request ID. Use `zondctl ... follow REQUEST_ID` to obtain the result; do not
+resubmit the query. Set zond's output limit large enough for the intended batch
+responses. Zond does not pass stdin or allocate a terminal, which is why all
+CLI query inputs are arguments. No shell wrapper or forwarded HTTP port is
+needed.
 
 ## Live smoke test
 

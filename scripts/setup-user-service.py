@@ -322,8 +322,8 @@ def install(args: argparse.Namespace) -> None:
     if args.gateway:
         print("Gateway sign-in: open zond's Approvals screen, then complete IBKR Mobile approval.")
         print(
-            f"Gateway's configured API port must be {api_port}; "
-            "setup does not change its API settings."
+            f"After login, Gateway's API will be configured on port {api_port} "
+            "with Read-Only API enabled."
         )
 
 

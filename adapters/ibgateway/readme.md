@@ -12,7 +12,8 @@ belong to the same window. No coordinates, screenshots, or VNC are needed.
 
 IBKR Mobile approval still happens in IBKR Mobile. The adapter waits up to five
 minutes for the authenticated TWS API handshake. It reports ready only after the
-login form is gone and the configured API socket responds to that handshake.
+login form is gone, API settings have been saved and verified, and the configured
+API socket responds to that handshake.
 A port merely accepting TCP is insufficient. Socket outages alone do not trigger
 a password prompt. Reappearing login controls do.
 
@@ -53,9 +54,15 @@ cwd = "/home/me"
 ```
 
 For live trading choose `--mode live`, the live instance's settings and API
-port, and a matching configured label. The port is a readiness probe, not a
-change to Gateway's API configuration. Configure the HTTP bridge to use this
-same loopback port. The launcher does not read `/etc/ib-gw.conf` or the user's
+port, and a matching configured label. After each login, the adapter opens
+Configure → Settings → API → Settings, sets the socket port, enables
+**Read-Only API**, and enables localhost-only connections when that control is
+available. It saves, reopens, and verifies those settings before reporting ready.
+These managed values also replace conflicting values in existing settings;
+unrelated settings are preserved. Gateway handles its own account-specific
+settings files, including encrypted files. No manual settings step is needed.
+Configure the HTTP bridge to use this same loopback port. The launcher does not
+read `/etc/ib-gw.conf` or the user's
 shell wrapper settings; use its explicit options. It invokes the same
 `ibgateway.GWClient` entrypoint supplied by `ib-tws`.
 
@@ -73,8 +80,9 @@ the adapter. After reauthentication is required, a new form is generated.
 
 The adapter recognizes the English Gateway login UI (the launcher selects
 English), including the current `IBKR Gateway` window. Unknown UI layouts are
-left untouched. It does not accept account takeover dialogs, enable trading,
-change API permissions, or automatically dismiss arbitrary dialogs. It reports
+left untouched. Missing or ambiguous API settings controls prevent readiness.
+It does not accept account takeover dialogs, enable trading,
+or automatically dismiss arbitrary dialogs. It reports
 an unavailable/failed state when it cannot finish. Additional authentication
 methods can be implemented as further forms over the same generic protocol.
 
@@ -99,7 +107,8 @@ python3 adapters/ibgateway/test/run.py --zondd "$HOME/code/zondd/target/debug/zo
 ```
 
 The first test runs an actual Swing UI under Xvfb with the production Java
-agent and daemon. It verifies private delivery into controls, API readiness,
+agent and daemon. It verifies private delivery into controls, automatic API port
+and read-only configuration, saved-setting verification, API readiness,
 reauthentication, rejection/retry, withdrawal when the window disappears, and
 secret-free audit storage. Its API endpoint is a local fixture and never calls
 IBKR. The second starts the installed Gateway with temporary settings, observes
@@ -122,6 +131,8 @@ The test starts the unmodified installed Gateway with a **test-only second Java
 agent** that replaces its login action. Android fills the original Swing controls
 through the production adapter over SSH and Iroh. Dummy credentials are checked
 inside that action, and a test signal simulates accepting mobile authentication.
+Post-login API settings use a Swing fixture, since the test does not authenticate
+with IBKR and therefore cannot open Gateway's authenticated settings window.
 Both Gateway and the real HTTP server run in a private network namespace with
 only loopback, so they cannot contact IBKR. A small local TWS protocol peer supplies
 the handshake and account callbacks to the HTTP server's real official API client.

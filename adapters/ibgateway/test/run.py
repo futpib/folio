@@ -36,11 +36,26 @@ def main():
             "-d",
             str(ADAPTER / "build/test"),
             str(ADAPTER / "test/GatewayFixture.java"),
+            str(ADAPTER / "test/GatewaySettingsFixture.java"),
+            str(ADAPTER / "test/ApiConfigurationTest.java"),
         ],
         check=True,
     )
     with tempfile.TemporaryDirectory(prefix="zond-gateway-e2e-") as temp:
         base = Path(temp)
+        subprocess.run(
+            [
+                "xvfb-run",
+                "-a",
+                "java",
+                "-cp",
+                f"{ADAPTER}/build/test:{ADAPTER}/build/zond-ibgateway.jar",
+                "ApiConfigurationTest",
+                str(base),
+            ],
+            check=True,
+            timeout=30,
+        )
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
@@ -104,6 +119,7 @@ cwd = {json.dumps(str(base))}
                 first = challenge()
                 assert first["recipient"]["label"] == "Configured test Gateway"
                 assert first["context"]["mode"] == "paper"
+                assert first["context"]["read_only_api"] is True
                 assert [f["id"] for f in first["fields"]] == ["username", "password"]
                 request(
                     {
@@ -145,18 +161,22 @@ cwd = {json.dumps(str(base))}
                     assert response["type"] == "credential_answered"
                     wait_for(pending, lambda q: q["adapters"][0]["state"] == "ready")
                     assert (base / "submitted").read_text() == "yes"
+                    assert (base / "api-settings").read_text() == f"{port} true true"
                     (base / "reauth").touch()
                 challenge()
                 (base / "hide").touch()
                 wait_for(pending, lambda q: not q["interactions"])
-                audit = json.dumps(request({"method": "actions", "limit": 100}))
+                audit = json.dumps(
+                    request({"method": "actions", "limit": 100, "query": "interaction"})
+                )
                 assert "withdrawn" in audit and "succeeded" in audit and "rejected" in audit
                 assert "test-gateway-password" not in audit and "test-user" not in audit
                 for path in base.glob("config.history.sqlite3*"):
                     assert b"test-gateway-password" not in path.read_bytes()
                 assert "test-gateway-password" not in (base / "daemon.log").read_text()
                 print(
-                    "PASS: Swing login, private delivery, API handshake, reauthentication, "
+                    "PASS: Swing login, private delivery, saved read-only API settings, "
+                    "API handshake, reauthentication, "
                     "decline/retry, withdrawal, audit"
                 )
             finally:

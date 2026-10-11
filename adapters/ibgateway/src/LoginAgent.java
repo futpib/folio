@@ -20,6 +20,8 @@ public final class LoginAgent {
     private static PrintStream protocol;
     private static String mode;
     private static int apiPort;
+    private static ApiConfiguration apiConfiguration;
+    private static volatile boolean apiConfigured;
     private static volatile boolean busy;
     private static volatile Window suppressed;
     private static volatile Login login;
@@ -32,6 +34,8 @@ public final class LoginAgent {
         String[] parts = options.split(":");
         if (parts.length != 2 || !Set.of("paper", "live").contains(parts[0])) throw new IllegalArgumentException("expected mode:port");
         mode = parts[0]; apiPort = Integer.parseInt(parts[1]);
+        if (apiPort < 1 || apiPort > 65535) throw new IllegalArgumentException("invalid API port");
+        apiConfiguration = new ApiConfiguration(apiPort);
         InputStream incoming = System.in;
         protocol = System.out;
         System.setIn(InputStream.nullInputStream());
@@ -97,6 +101,12 @@ public final class LoginAgent {
 
     private static void scan() {
         login = findLogin();
+        if (login != null) {
+            apiConfiguration.reset(); apiConfigured = false;
+        } else {
+            try { apiConfigured = apiConfiguration.tick(); }
+            catch (RuntimeException ignored) { apiConfigured = false; }
+        }
         if (busy) return;
         Login found = login;
         if (found != null && found.window() != suppressed) {
@@ -148,7 +158,8 @@ public final class LoginAgent {
             request.putArray("fields")
                 .add(JSON.createObjectNode().put("id", "username").put("label", "IBKR username").put("kind", "text"))
                 .add(JSON.createObjectNode().put("id", "password").put("label", "IBKR password").put("kind", "secret"));
-            request.putObject("context").put("application", "IB Gateway").put("mode", mode).put("api_port", apiPort);
+            request.putObject("context").put("application", "IB Gateway").put("mode", mode)
+                .put("api_port", apiPort).put("read_only_api", true);
             send(request);
             id = receive("opened").path("challenge_id").asText();
             JsonNode answer;
@@ -199,6 +210,7 @@ public final class LoginAgent {
     }
 
     private static boolean apiReady() {
+        if (!apiConfigured) return false;
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), apiPort), 500);
             socket.setSoTimeout(500);

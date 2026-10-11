@@ -7,6 +7,7 @@ import javax.swing.*;
 public final class AuthenticationPatch {
     private static Path directory;
     private static Window login;
+    private static GatewaySettingsFixture settings;
     private static final Set<AbstractButton> patched = Collections.newSetFromMap(new IdentityHashMap<>());
 
     public static void premain(String options) {
@@ -33,11 +34,14 @@ public final class AuthenticationPatch {
             if (Files.deleteIfExists(directory.resolve("reauth")) && login != null) {
                 Files.deleteIfExists(directory.resolve("authenticated"));
                 Files.deleteIfExists(directory.resolve("submitted"));
+                if (settings != null) settings.frame.setVisible(false);
                 login.setVisible(true);
             }
             if (Files.deleteIfExists(directory.resolve("accept-mfa"))) {
                 if (!Files.exists(directory.resolve("submitted"))) throw new IllegalStateException("no login submitted");
                 mark("authenticated");
+                if (settings == null) settings = new GatewaySettingsFixture(directory);
+                settings.frame.setVisible(true);
             }
             for (Window window : Window.getWindows()) {
                 if (!window.isShowing()) continue;

@@ -29,6 +29,7 @@ def main():
             "-d",
             str(classes),
             str(ADAPTER / "test/AuthenticationPatch.java"),
+            str(ADAPTER / "test/GatewaySettingsFixture.java"),
         ],
         check=True,
     )

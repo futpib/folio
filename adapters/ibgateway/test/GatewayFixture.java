@@ -12,6 +12,7 @@ public class GatewayFixture {
         int port = Integer.parseInt(args[0]);
         Path signals = Path.of(args[1]);
         SwingUtilities.invokeAndWait(() -> {
+            GatewaySettingsFixture settings = new GatewaySettingsFixture(signals);
             JFrame frame = new JFrame("IBKR Gateway");
             JPanel panel = new JPanel();
             JRadioButton fix = new JRadioButton("FIX CTCI", true), api = new JRadioButton("IB API");
@@ -32,6 +33,7 @@ public class GatewayFixture {
             login.addActionListener(e -> {
                 if (!api.isSelected() || !paper.isSelected() || !username.getText().equals("test-user") || !Arrays.equals(password.getPassword(), "test-gateway-password".toCharArray())) throw new AssertionError("incorrect login controls");
                 frame.setVisible(false);
+                settings.frame.setVisible(true);
                 try {
                     Files.writeString(signals.resolve("submitted"), "yes");
                     server = new ServerSocket(port, 10, InetAddress.getLoopbackAddress());
@@ -56,6 +58,7 @@ public class GatewayFixture {
                 try {
                     if (Files.deleteIfExists(signals.resolve("reauth"))) {
                         if (server != null) server.close();
+                        settings.frame.setVisible(false);
                         password.setText(""); frame.setVisible(true);
                     }
                     if (Files.deleteIfExists(signals.resolve("hide"))) frame.setVisible(false);

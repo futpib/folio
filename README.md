@@ -135,10 +135,12 @@ for manual review. A failed application restores the previous configuration file
 
 The default settings directory is `~/.ib-gateway-paper` or `~/.ib-gateway-live`.
 Only one launcher may own that directory; stop another Gateway launcher before
-using this option. The configured API port must match Gateway's API settings;
-setup does not change those settings. Keep Read-Only API enabled. Credentials
-are entered in the Android zond **Approvals** screen, followed by any IBKR Mobile
-approval. See the [adapter guide](adapters/ibgateway/readme.md) for login/retry,
+using this option. After login, the adapter configures Gateway's API socket port
+to match the HTTP bridge, enables **Read-Only API**, and restricts connections to
+localhost when Gateway exposes that setting. It saves and reopens the settings
+to verify them before reporting ready. No manual API configuration is needed.
+Credentials are entered in the Android zond **Approvals** screen, followed by any
+IBKR Mobile approval. See the [adapter guide](adapters/ibgateway/readme.md) for login/retry,
 Gateway settings, and reauthentication details. The HTTP service receives no
 Gateway credentials and may run while login is pending.
 

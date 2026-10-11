@@ -198,6 +198,40 @@ responses. Zond does not pass stdin or allocate a terminal, which is why all
 CLI query inputs are arguments. No shell wrapper or forwarded HTTP port is
 needed.
 
+## Gateway sign-in through zond
+
+Zond's optional IB Gateway credential adapter can run Gateway on a private Xvfb
+display and collect login credentials through its Android app, without VNC.
+The adapter and its setup instructions live in
+[`zondd/adapters/ibgateway`](https://github.com/futpib/zondd/tree/master/adapters/ibgateway).
+It uses the generic zond application-input protocol, with a configured recipient,
+private credential delivery, and an audit trail that excludes answers.
+
+Keep this HTTP service running independently. It never receives a Gateway
+password. Configure its TWS endpoint to match the adapter's Gateway instance:
+
+```toml
+[tws]
+host = "127.0.0.1"
+port = 4002  # Match the Gateway instance's configured API port.
+client_id = 37
+reconnect_delay_seconds = 5
+```
+
+When Gateway's login screen appears, the adapter submits one form for that
+Gateway session. Enter credentials in zond and complete any IBKR Mobile
+approval in IBKR Mobile. Once Gateway's API becomes ready, this service's
+existing supervisor reconnects automatically. During login, `ibkr-tws status`
+reports `tws_connected: false` and reads can return HTTP 503; retry those reads
+after reconnection. A socket outage alone does not request a password, and
+HTTP callers do not create individual login flows.
+
+Only one launcher should own the Gateway instance. When using the zond adapter,
+it launches Gateway itself; do not also run another user service against the
+same settings directory. Gateway's own Auto Restart settings govern reuse of
+its authentication session. Restarting a launcher is not a promise of preserved
+authentication.
+
 ## Live smoke test
 
 With the service running and connected to a real TWS or IB Gateway session, run:

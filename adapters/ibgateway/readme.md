@@ -18,6 +18,18 @@ a password prompt. Reappearing login controls do.
 
 ## Install
 
+The repository's [user-service setup](../../README.md#persistent-user-service)
+installs the HTTP bridge, builds this adapter, and registers it with zond:
+
+```sh
+./scripts/setup-user-service.py --gateway paper
+```
+
+Use `--gateway live` for a live login, `--settings-dir` for existing Gateway
+settings, and `--tws-port` for a nondefault API port. Setup preserves existing
+configuration and validates changes before applying them. The manual steps below
+are available for custom deployments.
+
 Requirements: the Arch `ib-tws` layout (default `/usr/share/ib-tws`), a JDK 17+
 for compilation, Python 3, `xvfb-run`, and `xauth`. The installed Gateway provides
 its JRE and Jackson libraries. Compilation needs no downloads:

@@ -1,0 +1,13 @@
+# Managed by scripts/setup-user-service.py. Use systemctl --user edit for overrides.
+[Unit]
+Description=IBKR read-only HTTP bridge
+
+[Service]
+Type=simple
+WorkingDirectory=@CHECKOUT@
+ExecStart=@EXECUTABLE@ --config @CONFIG@
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

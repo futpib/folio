@@ -15,11 +15,14 @@ exposing the HTTP listener to the network.
 
 ## Install
 
+For a persistent Linux installation, use the [user-service setup](#persistent-user-service)
+below; it also installs Python dependencies, so no separate `uv sync` is needed.
+
 Python 3.11 or newer is required. One command installs the service and every
 dependency:
 
 ```console
-uv sync --extra dev
+uv sync --locked
 ```
 
 This also installs `ibkr-tws` in `.venv/bin`. Use `uv run ibkr-tws` from the
@@ -69,6 +72,109 @@ uv run ibkr-tws-http --config example-config.toml --check
 
 `--host`, `--port`, and `--tws-port` override their TOML values. The TWS socket
 itself is always restricted to a loopback host.
+
+## Persistent user service
+
+On a Linux host with systemd, run setup **as your login user**, from the cloned
+repository. On Arch/Manjaro, install the prerequisites once:
+
+```sh
+sudo pacman -S --needed python uv
+```
+
+For an already running Gateway or TWS, one command installs and starts the bridge:
+
+```sh
+./scripts/setup-user-service.py --tws-port 4002
+```
+
+Match the port configured in Gateway/TWS. The usual defaults are Gateway paper
+`4002`, Gateway live `4001`, TWS paper `7497`, and TWS live `7496`. Use `--http-port`
+if the default HTTP port `8080` is occupied. HTTP remains bound to loopback.
+
+Setup installs locked dependencies in this checkout's `.venv`, creates
+`~/.config/ibkr-tws-http/config.toml`, validates configuration, and enables
+`ibkr-tws-http.service`. It enables user lingering for startup at boot and
+continued operation after logout. If the system requires administrator permission
+for lingering, setup prints the `sudo loginctl enable-linger` command to run before
+retrying. `--no-linger` explicitly skips this step for a login-session service.
+
+The service invokes `.venv/bin/ibkr-tws-http` directly, restarts after a crash,
+and reconnects automatically when Gateway becomes available. Keep the checkout
+in place. Existing configuration, including account/feature restrictions, is
+preserved on reruns; conflicting explicit port options fail with an explanation.
+Edit the generated configuration to restrict `allowed_accounts` (empty permits
+all accounts available to this login). `XDG_CONFIG_HOME` is respected when set;
+it must match your systemd user manager's configuration directory.
+
+### Include headless Gateway sign-in through zond
+
+Install Gateway, the Java build tools, Xvfb, and a current zond release supporting
+credential adapters. On Arch/Manjaro:
+
+```sh
+sudo pacman -S --needed jdk17-openjdk xorg-server-xvfb xorg-xauth
+paru -S --needed ib-tws zondd-git
+./scripts/setup-user-service.py --gateway paper
+```
+
+Use `--gateway live` for a live login. On a fresh installation these select API
+port `4002` or `4001`; an existing HTTP configuration retains its port. Override
+with `--tws-port` when necessary. To reuse previously configured Gateway settings:
+
+```sh
+./scripts/setup-user-service.py --gateway paper --settings-dir ~/.ib-gateway-paper
+```
+
+Setup builds the bundled Java agent and adds `credential_adapters.ibkr` to
+`~/.config/zondd/config.toml`, preserving existing text and keeping a private
+backup. It validates the complete file before applying it, starts/enables
+`zondd.service`, or reloads an already running daemon, and confirms the adapter
+appears in its queue. A conflicting existing `ibkr` adapter is left unchanged
+for manual review. A failed application restores the previous configuration file.
+
+The default settings directory is `~/.ib-gateway-paper` or `~/.ib-gateway-live`.
+Only one launcher may own that directory; stop another Gateway launcher before
+using this option. The configured API port must match Gateway's API settings;
+setup does not change those settings. Keep Read-Only API enabled. Credentials
+are entered in the Android zond **Approvals** screen, followed by any IBKR Mobile
+approval. See the [adapter guide](adapters/ibgateway/readme.md) for login/retry,
+Gateway settings, and reauthentication details. The HTTP service receives no
+Gateway credentials and may run while login is pending.
+
+### Inspect, update, or remove
+
+```sh
+systemctl --user status ibkr-tws-http.service
+./.venv/bin/ibkr-tws status
+journalctl --user -u ibkr-tws-http.service -f
+```
+
+Setup checks HTTP health. `ibkr-tws status` must additionally show
+`"tws_connected": true` before account reads work. For a custom HTTP port, pass
+`--port PORT` to the CLI. Gateway logs are in `journalctl --user -u zondd.service`.
+
+After pulling an update, rerun the same setup command. It refreshes dependencies
+and restarts the HTTP service while retaining its configuration. With `--gateway`,
+it also rebuilds the Java agent; an already running Gateway keeps its current
+agent until the next restart of `zondd.service`. Restart zond when ready to
+interrupt its managed jobs and Gateway session.
+
+Use `systemctl --user edit ibkr-tws-http.service` for unit overrides. Setup owns
+the generated unit; it refuses to replace a manually installed unit. Back up
+and remove an earlier hand-written unit before using setup.
+
+To remove the HTTP service while keeping the checkout and configuration:
+
+```sh
+systemctl --user disable --now ibkr-tws-http.service
+rm "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ibkr-tws-http.service"
+systemctl --user daemon-reload
+```
+
+To stop managing Gateway too, remove `[credential_adapters.ibkr]` from zond's
+configuration, validate with `zondd check`, and run `zondctl reload`. Other zond
+services and user lingering remain available for your other user services.
 
 ## Query from the CLI
 

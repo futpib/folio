@@ -1,0 +1,15 @@
+[server]
+host = "127.0.0.1"
+port = @HTTP_PORT@
+
+[tws]
+host = "127.0.0.1"
+port = @TWS_PORT@
+client_id = 37
+reconnect_delay_seconds = 5
+
+[exposure]
+# Empty permits every account available to this Gateway/TWS login.
+# Set an explicit allowlist if needed, for example ["DU1234567"].
+allowed_accounts = []
+expose_account_ids = false

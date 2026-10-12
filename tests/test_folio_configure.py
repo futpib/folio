@@ -7,6 +7,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import tomlkit
+from cryptography.hazmat.primitives import serialization
 
 from folio import configure
 from folio.config import Settings
@@ -15,7 +17,17 @@ from folio.credentials import read_credentials
 
 def cli(path, *args, success=True):
     result = subprocess.run(
-        [str(Path(sys.executable).parent / "folio"), "--config", str(path), *args],
+        [
+            sys.executable,
+            "-c",
+            "import sys; from pathlib import Path; from folio import credentials; "
+            "credentials.DEFAULT_ENV_FILE = Path(sys.argv.pop(1)); "
+            "from folio.cli import main; main()",
+            str(path.parent / ".env.local"),
+            "--config",
+            str(path),
+            *args,
+        ],
         capture_output=True,
         text=True,
         cwd="/",
@@ -82,6 +94,100 @@ def test_fresh_binance_setup_and_generic_config_editor(tmp_path, monkeypatch):
     assert config.read_bytes() == previous
     cli(config, "config", "unset", "connections.binance.binance.spot_symbols")
     assert not Settings.load(config).connection("binance").binance.spot_symbols
+
+
+@pytest.mark.parametrize("key_type", ["auto", "ed25519", "rsa"])
+def test_setup_creates_and_reuses_matching_public_key_without_exposing_secrets(
+    tmp_path, monkeypatch, key_type
+):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    path = tmp_path / ".env.local"
+    path.write_text("# preserve\nWOLT_PASSWORD='fixture secret'\n")
+    config = tmp_path / "folio.toml"
+    args = ("setup", "binance", "--yes", "--configure-only", "--key-type", key_type)
+    result = cli(config, *args)
+    kind = "ed25519" if key_type == "auto" else key_type
+    target = tmp_path / f".secrets/binance-{kind}.pem"
+    original = target.read_bytes()
+    private = serialization.load_pem_private_key(original, None)
+    public = (
+        private.public_key()
+        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        .decode()
+    )
+    assert public in result.stdout
+    assert "Self-generated" in result.stdout and "Zond" in result.stdout
+    assert "fixture secret" not in result.stdout + result.stderr
+    assert "PRIVATE KEY" not in result.stdout + result.stderr
+    assert target.stat().st_mode & 0o777 == path.stat().st_mode & 0o777 == 0o600
+    assert target.parent.stat().st_mode & 0o777 == 0o700
+    path.write_text(path.read_text() + "BINANCE_API_KEY=FixtureApiKey123456\n")
+    credentials = path.read_bytes()
+    repeated = cli(config, *args)
+    assert public in repeated.stdout and "FixtureApiKey123456" not in repeated.stdout
+    assert target.read_bytes() == original and path.read_bytes() == credentials
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        "BINANCE_API_KEY=FixtureApiKey123456\n",
+        "BINANCE_API_SECRET=FixtureSecret123456\n",
+        "BINANCE_PRIVATE_KEY_FILE=missing.pem\n",
+    ],
+)
+def test_setup_preserves_existing_credentials_and_zond_fallback(tmp_path, monkeypatch, values):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    path = tmp_path / ".env.local"
+    path.write_text(values)
+    result = cli(tmp_path / "folio.toml", "setup", "binance", "--yes", "--configure-only")
+    assert path.read_text() == values and not (tmp_path / ".secrets").exists()
+    assert "missing values will be requested through Zond" in result.stdout
+    assert "PUBLIC KEY" not in result.stdout
+
+
+def test_explicit_hmac_setup_does_not_generate_a_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    cli(
+        tmp_path / "folio.toml",
+        "setup",
+        "binance",
+        "--yes",
+        "--configure-only",
+        "--key-type",
+        "hmac",
+    )
+    assert not (tmp_path / ".env.local").exists()
+    assert not (tmp_path / ".secrets").exists()
+
+
+def test_existing_zond_only_connection_is_not_silently_given_new_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    config = tmp_path / "folio.toml"
+    config.write_text('[connections.binance]\nprovider="binance"\ncredential_adapter=true\n')
+    cli(config, "setup", "binance", "--yes", "--configure-only")
+    assert not (tmp_path / ".env.local").exists()
+    cli(config, "setup", "binance", "--yes", "--configure-only", "--key-type", "ed25519")
+    assert (tmp_path / ".secrets/binance-ed25519.pem").is_file()
+
+
+def test_setup_keeps_encrypted_key_and_defers_missing_passphrase_to_zond(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    config = tmp_path / "folio.toml"
+    cli(config, "setup", "binance", "--yes", "--configure-only")
+    target = tmp_path / ".secrets/binance-ed25519.pem"
+    key = serialization.load_pem_private_key(target.read_bytes(), None)
+    encrypted = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.BestAvailableEncryption(b"FixturePassphrase1234"),
+    )
+    target.write_bytes(encrypted)
+    before = (tmp_path / ".env.local").read_bytes()
+    result = cli(config, "setup", "binance", "--yes", "--configure-only")
+    assert "Zond will ask for its missing passphrase" in result.stdout
+    assert target.read_bytes() == encrypted and (tmp_path / ".env.local").read_bytes() == before
+    assert "PRIVATE KEY" not in result.stdout
 
 
 def test_interactive_setup_prompts_for_provider_and_history(tmp_path, monkeypatch):
@@ -163,9 +269,16 @@ def test_adapter_reconciliation_preserves_policy_and_retires_only_owned_workers(
         "--config",
         str(config),
         "--watch-config",
+        "--worker-revision",
+        parsed["credential_adapters"]["folio-binance"]["args"][4],
         "api-adapter",
         "binance",
     ]
+    old = tomllib.loads(source)
+    del old["credential_adapters"]["folio-binance"]["args"][3:5]
+    assert (
+        tomllib.loads(configure.adapter_config(tomlkit.dumps(old), config, connections)) == parsed
+    )
     assert configure.adapter_config(source, config, connections) == source
     reduced = configure.adapter_config(
         source, config, {"bank": {"provider": "bog", "credential_adapter": False}}

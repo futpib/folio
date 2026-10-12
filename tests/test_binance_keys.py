@@ -13,7 +13,13 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 from test_binance import Broker, connection
 
 from folio.binance import BinanceConnector
-from folio.binance_keys import Credentials, generate_key, load_private_key, read_binance_credentials
+from folio.binance_keys import (
+    Credentials,
+    generate_key,
+    load_private_key,
+    read_binance_credentials,
+    setup_public_key,
+)
 from folio.credentials import CredentialFileError, read_credentials
 from folio.models import LoginRequired
 
@@ -75,6 +81,39 @@ def test_keygen_never_overwrites_registered_or_broken_keys(tmp_path):
         generate_key(env_file=path)
     assert target.read_bytes() == b"fixture-broken-key"
     assert not path.exists()
+
+
+def test_registered_missing_generated_key_is_never_recreated(tmp_path):
+    path = tmp_path / ".env.local"
+    path.write_text("BINANCE_PRIVATE_KEY_FILE=.secrets/binance-ed25519.pem\n")
+    with pytest.raises(CredentialFileError, match="missing; restore"):
+        generate_key(env_file=path)
+    assert not (tmp_path / ".secrets/binance-ed25519.pem").exists()
+
+
+@pytest.mark.parametrize("source", ["file", "inline", "legacy"])
+def test_setup_displays_imported_keys_without_modifying_them(tmp_path, source):
+    private = ed25519.Ed25519PrivateKey.generate()
+    material = pem(private, "fixture-passphrase")
+    target = tmp_path / "imported.pem"
+    target.write_text(material)
+    setting = {
+        "file": f"BINANCE_PRIVATE_KEY_FILE={target}\n",
+        "inline": "BINANCE_PRIVATE_KEY=" + material.replace("\n", "\\n") + "\n",
+        "legacy": "BINANCE_API_SECRET=" + material.replace("\n", "\\n") + "\n",
+    }[source]
+    path = tmp_path / ".env.local"
+    path.write_text(setting + "BINANCE_PRIVATE_KEY_PASSPHRASE=fixture-passphrase\n")
+    before = path.read_bytes()
+    public = setup_public_key(env_file=path)
+    assert serialization.load_pem_public_key(public.encode()).public_bytes_raw() == (
+        private.public_key().public_bytes_raw()
+    )
+    assert path.read_bytes() == before and target.read_text() == material
+    assert not (tmp_path / ".secrets").exists()
+    if source != "legacy":
+        with pytest.raises(LoginRequired, match="does not match"):
+            setup_public_key("rsa", env_file=path)
 
 
 @pytest.fixture(params=["ed25519", "rsa", "rsa4096"])

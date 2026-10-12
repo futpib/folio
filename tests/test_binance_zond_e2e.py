@@ -152,6 +152,10 @@ cwd = {json.dumps(str(tmp_path))}
                 }
             )
             wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "unavailable")
+            failed = call("connections")[0]
+            assert failed["error_code"] == "login_required"
+            assert "spot account (/api/v3/account, HTTP 401, code -2015)" in failed["error"]
+            assert KEY not in failed["error"] and SECRET not in failed["error"]
             assert call("read", "binance", "positions")["snapshot"] is None
             request({"method": "retry_adapter", "adapter": "binance"})
             third = wait(lambda: request({"method": "pending"})["interactions"])[0]

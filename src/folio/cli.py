@@ -21,6 +21,7 @@ from .store import Store
 def common(parser):
     parser.add_argument("--config", type=Path, default=default_config())
     parser.add_argument("--watch-config", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-revision", help=argparse.SUPPRESS)
 
 
 def daemon():

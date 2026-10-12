@@ -125,12 +125,20 @@ def generate_key(key_type="ed25519", *, env_file=None) -> str:
     directory = env_file.parent / ".secrets"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = directory / f"binance-{key_type}.pem"
-    with exclusive(directory / "binance-keygen.lock"):
+    with (
+        exclusive(directory / "binance-keygen.lock"),
+        exclusive(env_file.with_name(env_file.name + ".lock")),
+    ):
         existing = read_credentials("binance", env_file)
         registered = existing.get("private_key_file")
         if existing.get("private_key") or (registered and registered != f".secrets/{target.name}"):
             raise CredentialFileError(
                 "A different Binance private key is already configured; it was not replaced."
+            )
+        if registered and not target.exists():
+            raise CredentialFileError(
+                "The registered Binance private key is missing; restore it. "
+                "It was not replaced with a different key."
             )
         existing.clear()
         if target.exists():
@@ -181,10 +189,39 @@ def generate_key(key_type="ed25519", *, env_file=None) -> str:
             os.replace(temporary, env_file)
         finally:
             Path(temporary).unlink(missing_ok=True)
-        return (
-            private.public_key()
-            .public_bytes(
-                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-            .decode("ascii")
-        )
+        return public_pem(private)
+
+
+def public_pem(private) -> str:
+    return (
+        private.public_key()
+        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        .decode("ascii")
+    )
+
+
+def setup_public_key(key_type="auto", *, env_file=None, create=True) -> str | None:
+    """Generate for a fresh setup, or derive the public key from existing credentials."""
+    values = read_binance_credentials(env_file, key_type=key_type)
+    if key_type == "hmac":
+        return None
+    pem = values.get("private_key")
+    if (
+        not pem
+        and key_type == "auto"
+        and values.get("api_secret", "").lstrip().startswith("-----BEGIN")
+    ):
+        pem = values["api_secret"]
+    if pem:
+        private = load_private_key(pem, values.get("private_key_passphrase"))
+        actual = "ed25519" if isinstance(private, ed25519.Ed25519PrivateKey) else "rsa"
+        if key_type not in ("auto", actual):
+            raise LoginRequired("Binance private key does not match binance.key_type.")
+        return public_pem(private)
+    if not create or any(
+        values.get(field) for field in ("api_key", "api_secret", "private_key_file")
+    ):
+        # Missing signing material may live in Zond; never pair an existing API key
+        # with a newly generated private key or silently switch an HMAC account.
+        return None
+    return generate_key("ed25519" if key_type == "auto" else key_type, env_file=env_file)

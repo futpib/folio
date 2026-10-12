@@ -109,6 +109,7 @@ def test_income_pages_keep_one_range_and_detect_a_repeated_page(monkeypatch):
     "status,code,expected",
     [
         (401, -2015, LoginRequired),
+        (401, -2014, LoginRequired),
         (400, -1022, LoginRequired),
         (400, -1021, ConnectorError),
         (403, -1000, ConnectorError),
@@ -123,8 +124,40 @@ def test_errors_are_safe_and_auth_rejection_discards_credentials(status, code, e
     with pytest.raises(expected) as error:
         asyncio.run(worker.sync(None))
     assert KEY not in str(error.value) and SECRET not in str(error.value)
+    assert f"HTTP {status}, code {code}" in str(error.value)
+    assert "spot account (/api/v3/account" in str(error.value)
     if expected is LoginRequired:
         assert worker.credentials is None
+
+
+@pytest.mark.parametrize("code", [-2014, -2015, -1022])
+def test_futures_auth_error_identifies_failing_market_and_remedy(code):
+    api = Api()
+    api.failure = lambda request: (
+        httpx.Response(401, json={"code": code, "msg": KEY + SECRET})
+        if request.url.path.startswith("/fapi/")
+        else None
+    )
+    with pytest.raises(LoginRequired) as error:
+        asyncio.run(connector(api).sync(None))
+    message = str(error.value)
+    assert f"usdm account (/fapi/v3/account, HTTP 401, code {code})" in message
+    assert {
+        -2014: "BAD_API_KEY_FMT",
+        -2015: "IP allowlist",
+        -1022: "matches the public key",
+    }[code] in message
+    assert KEY not in message and SECRET not in message
+
+
+@pytest.mark.parametrize("code", [[-2015], {"secret": KEY}, KEY, True, 10**30, None])
+def test_untrusted_error_code_is_not_echoed_or_used_as_a_mapping_key(code):
+    api = Api()
+    api.failure = lambda _: httpx.Response(401, json={"code": code, "msg": KEY + SECRET})
+    with pytest.raises(LoginRequired) as error:
+        asyncio.run(connector(api).sync(None))
+    assert "HTTP 401): Unauthorized request" in str(error.value)
+    assert KEY not in str(error.value) and SECRET not in str(error.value)
 
 
 def test_rate_limit_honors_long_bans_and_redirects_never_forward_keys():
@@ -256,7 +289,7 @@ def test_config_and_api_expose_only_fixed_reads(tmp_path):
         valid + '[connections.binance.binance]\nurl="https://attacker.test"',
         valid + '[connections.binance.binance]\nmarkets=["wrong"]',
         valid + '[connections.binance.binance]\nkey_type="ecdsa"',
-        valid + '[connections.binance.binance]\nkey_type={}',
+        valid + "[connections.binance.binance]\nkey_type={}",
         valid + "[connections.binance.binance]\nmarkets=[{}]",
         valid + "[connections.binance.binance]\nhistory_days=91",
         valid + '[connections.binance.binance]\nspot_symbols=["BTCUSDT", "BTCUSDT"]',

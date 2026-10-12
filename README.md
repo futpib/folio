@@ -27,16 +27,13 @@ Use `folio config show`, `folio config set KEY VALUE`, and `folio credentials PR
 to inspect settings, change individual values, or enter credentials privately.
 See the [configuration CLI guide](docs/folio.md#configuration-cli) for examples.
 
-To create a Binance self-generated API key, run this from the checkout on the
-machine running Folio:
-
-```sh
-python3 scripts/binance-keygen.py
-```
-
-Paste the printed public key into Binance. The script saves the private key in
-the ignored `.secrets/` directory and registers it in `.env.local`, preserving
-other credentials. Rerunning prints the same public key.
+Binance setup creates an Ed25519 signing key for a fresh installation and prints
+the public key to paste into Binance's **Self-generated** API key form. It saves
+the private key in the ignored `.secrets/` directory and registers it in
+`.env.local`. Reruns reuse existing keys, including imported RSA/Ed25519 keys;
+existing HMAC credentials remain supported. Missing API credentials are requested
+through Zond when you sync. `folio binance-keygen` and `scripts/binance-keygen.py`
+remain available for standalone key generation.
 
 ## Existing IBKR interface
 

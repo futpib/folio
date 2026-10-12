@@ -70,18 +70,25 @@ uv run folio setup --yes --port 9080
 ```
 
 Binance defaults to Spot and USD-M, a seven-day lookback and automatic signing-key
-detection. Trade symbols start empty: balances, positions and Futures income work,
-but per-symbol trades require your actual symbols. Pass `--spot-symbols ''` (or the
+detection. A fresh setup generates an Ed25519 private key locally, registers its
+path in `.env.local`, and displays the public key for Binance's **Self-generated**
+API key form. Reruns reuse existing signing credentials; `--key-type rsa` selects
+RSA for a fresh setup and `--key-type hmac` skips generation. Missing API credentials
+still go through Zond on sync. Trade symbols start empty: balances, positions and
+Futures income work, but per-symbol trades require your actual symbols. Pass `--spot-symbols ''` (or the
 corresponding Futures option) to clear a list. Disabling a market removes its
 configured trade-symbol list. Other provider and connection settings remain unchanged.
 
-`--configure-only` validates and saves without changing services. `--no-linger`
-skips boot/logout persistence setup. `folio --config PATH setup ...` supports a
+`--configure-only` validates and saves, including local Binance key setup, without
+changing services. `--no-linger` skips boot/logout persistence setup.
+`folio --config PATH setup ...` supports a
 custom configuration file. Existing comments are preserved, changes get private
 backups, and invalid settings leave the previous file intact. A managed legacy
 IBKR service is migrated automatically; custom units and adapter bindings are not
 silently replaced. A failed service installation restores the previous config,
 Zond configuration and Folio unit, and restarts services that were running.
+Generated private keys are retained if service setup fails, so a retry uses the
+same public key.
 
 Inspect or edit any supported Folio setting while the daemon is stopped:
 
@@ -99,7 +106,8 @@ uv run folio setup --yes
 configuration is valid. Use a new connection name when changing providers.
 Run `setup --yes` after individual edits to apply service and adapter changes.
 Managed Folio workers reload changed configurations without restarting Gateway
-or unrelated Zond adapters. Removed managed workers are retired during setup.
+or unrelated Zond adapters. Setup also refreshes these workers after Folio code or
+locked dependency changes. Removed managed workers are retired during setup.
 
 Enter credentials with masked prompts instead of placing secrets in commands:
 
@@ -113,7 +121,7 @@ uv run folio credentials ibkr
 These commands preserve other entries in the checkout's ignored `.env.local`
 and save with owner-only permissions. Enter keeps a value; `-` removes it.
 They never display existing secrets. A missing field still falls back to Zond.
-For a Binance signing key use `folio binance-keygen`; `credentials binance`
+Binance setup handles signing keys; `credentials binance`
 can also set a path to an existing private key. Inline PEMs remain supported in
 `.env.local`. Already cached credentials take effect after worker restart or
 authentication rejection, as described below.
@@ -242,7 +250,7 @@ For automatic setup:
 
 ```sh
 uv run folio setup binance --yes
-uv run folio credentials binance
+# Register the displayed public key in Binance, then:
 uv run folio sync binance
 ```
 
@@ -288,8 +296,18 @@ adapter mechanism and restart Folio after adding the connection.
 
 For a new key, choose **Self-generated** on Binance and use **Ed25519**.
 Binance [recommends Ed25519 and marks HMAC deprecated](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/api_key_types.md).
-Run the key-generation script from the checkout **on the machine running Folio**,
-even before configuring a connection or starting the service:
+`folio setup binance` handles generation and displays the public key on the
+machine where you run it. Run it **on the machine running Folio**. It also
+displays the public key for an existing imported key, provided its passphrase
+is available locally if encrypted. Existing HMAC credentials and missing signing
+material for an already configured API key are retained for Zond fallback; setup
+never silently associates an existing API key with a new private key.
+An existing connection using only Zond credentials also keeps that behavior.
+To explicitly add local key generation to it, run
+`folio setup binance --key-type ed25519 --yes`.
+
+For standalone key generation without connection or service setup, the older
+entry point remains supported:
 
 ```sh
 python3 scripts/binance-keygen.py
@@ -308,10 +326,13 @@ key; it does not rotate or overwrite the private key. Other credentials and
 comments in `.env.local` are preserved. A different configured private key is
 never replaced. `--type rsa` generates a 2048-bit RSA key instead, and
 `--env-file PATH` selects another credential file and adjacent `.secrets` directory.
+A registered private key that has gone missing is never regenerated: restore it
+from your private backup or supply it through Zond.
 
 When Binance supplies the API key, set `BINANCE_API_KEY` in `.env.local`, or
-leave it empty to enter it through Zond. The generated private key is unencrypted;
-access is controlled by owner-only file and directory permissions. Keep it with
+use `folio credentials binance`, or leave it empty to enter it through Zond.
+The generated private key is unencrypted; access is controlled by owner-only
+file and directory permissions. Keep it with
 your private backups: the public key cannot recreate it.
 
 Existing Ed25519 or RSA keys can be supplied through `BINANCE_PRIVATE_KEY_FILE`
@@ -322,6 +343,16 @@ or let Zond request it. Zond requests only missing values; if an encrypted key
 is entered interactively, its passphrase is a subsequent masked step. A missing
 referenced key file falls back to Zond; an unreadable or malformed one fails
 without printing its contents. Only signatures and the API key go to Binance.
+
+When Binance returns a JSON API rejection, the error includes the market,
+endpoint, HTTP status and Binance numeric code. Authentication errors distinguish `-2014` (key format), `-2015`
+(key/IP/permissions) and `-1022` (signature), as defined in the
+[official error reference](https://github.com/binance/binance-spot-api-docs/blob/master/errors.md).
+For example, `usdm account (/fapi/v3/account, HTTP 401, code -2015)` identifies
+Futures account access as the failed request. Raw provider messages and signed
+URLs are not copied into jobs or logs because they can contain secrets. After
+updating Folio, run `folio setup binance --yes`, then `folio sync binance` to
+produce a new diagnostic; existing failed jobs retain their old error text.
 
 `key_type = "auto"` detects the supplied key. A configured private key takes
 precedence over a legacy HMAC secret. With no private-key configuration, Zond's

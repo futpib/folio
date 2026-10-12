@@ -282,19 +282,47 @@ class BinanceConnector:
                 except ValueError:
                     raise ConnectorError("Binance returned an unreadable response.") from None
                 code = payload.get("code") if isinstance(payload, dict) else None
+                if type(code) is not int or not -999999 <= code <= 999999:
+                    code = None
+                context = (
+                    f"Binance {market} {operation} ({ENDPOINTS[market][operation]}, "
+                    f"HTTP {response.status_code}"
+                    + (f", code {code}" if code is not None else "")
+                    + "): "
+                )
                 if response.status_code == 401 or code in {-2014, -2015, -1022}:
                     self.credentials = None
+                    reason = {
+                        -2014: (
+                            "BAD_API_KEY_FMT: API-key format invalid. "
+                            "Check BINANCE_API_KEY in .env.local."
+                        ),
+                        -2015: (
+                            "REJECTED_MBX_KEY: Invalid API-key, IP, or permissions for action. "
+                            "Check that the API key is active on Binance.com, its IP allowlist "
+                            "includes this machine's outbound IP, and it can read this market."
+                        ),
+                        -1022: (
+                            "INVALID_SIGNATURE: Signature for this request is not valid. "
+                            "Check that the configured private key matches the public key "
+                            "registered for this API key (or the matching secret for HMAC)."
+                        ),
+                    }.get(code, "Unauthorized request. Check API key access on Binance.")
                     raise LoginRequired(
-                        "Binance rejected the API key, signature or permissions. "
-                        "Correct any values in .env.local, then retry in Zond."
+                        context
+                        + reason
+                        + " After correcting it, retry 'folio sync "
+                        + self.connection.id
+                        + "'. Local credentials are reread; "
+                        "Zond asks only for missing values."
                     )
                 if code == -1021:
                     raise ConnectorError(
-                        "Binance rejected the request timestamp. Retry sync to refresh server time."
+                        context + "INVALID_TIMESTAMP: Retry sync to refresh Binance server time."
                     )
                 if not response.is_success or (isinstance(code, int) and code < 0):
                     raise ConnectorError(
-                        "Binance API request failed; check account access and configured symbols."
+                        context + "API request failed; check account access and configured symbols."
                     )
                 return payload
         except httpx.HTTPError:

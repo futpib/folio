@@ -14,6 +14,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import tomlkit
 
 from folio import cli, configure
 
@@ -24,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_setup_starts_services_reloads_worker_and_rolls_back_failed_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr("folio.credentials.DEFAULT_ENV_FILE", tmp_path / ".env.local")
     zondd = Path(os.environ["FOLIO_TEST_ZONDD"])
     zondctl = zondd.with_name("zondctl")
     token = uuid.uuid4().hex[:10]
@@ -120,6 +122,38 @@ def test_setup_starts_services_reloads_worker_and_rolls_back_failed_restart(tmp_
             time.sleep(0.1)
         else:
             raise AssertionError("updated configuration did not restart the managed worker")
+        doc = tomlkit.parse(zond_config.read_text())
+        command = doc["credential_adapters"]["folio-binance"]["args"]
+        revision_index = list(command).index("--worker-revision") + 1
+        revision = command[revision_index]
+        command[revision_index] = "0" * 64
+        zond_config.write_text(tomlkit.dumps(doc))
+        subprocess.run([str(zondctl), "--runtime-dir", str(run_dir), "reload"], check=True)
+        for _ in range(100):
+            current = sessions()[0]
+            if (
+                current["state"] == "ready"
+                and current["recipient"]["command"]["args"][revision_index] == "0" * 64
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("could not simulate a worker from an older checkout")
+        older_session = current["recipient"]["session_id"]
+        unchanged_config = config.read_bytes()
+        call([*arguments, "--history-days", "30"])
+        for _ in range(100):
+            current = sessions()[0]
+            if (
+                current["state"] == "ready"
+                and current["recipient"]["session_id"] != older_session
+                and current["recipient"]["command"]["args"][revision_index] == revision
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("setup did not refresh the worker after a code update")
+        assert config.read_bytes() == unchanged_config
         original = config.read_bytes()
         previous_unit = (config_home / "systemd/user" / folio_unit).read_bytes()
         with socket.socket() as occupied:

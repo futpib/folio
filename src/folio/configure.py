@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import getpass
+import hashlib
 import importlib.util
 import os
 import re
@@ -16,6 +17,7 @@ import tomlkit
 
 from .config import RESOURCES, Settings
 from .credentials import FIELDS, credential_path, read_credentials
+from .models import LoginRequired
 from .store import exclusive
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -304,6 +306,10 @@ def adapter_config(source, config, connections):
     doc = tomlkit.parse(source)
     adapters = table(doc, "credential_adapters")
     desired = {}
+    revision = hashlib.sha256()
+    for path in [*sorted((ROOT / "src/folio").glob("*.py")), ROOT / "uv.lock"]:
+        revision.update(path.name.encode())
+        revision.update(path.read_bytes())
     for ident, connection in connections.items():
         if connection.get("credential_adapter"):
             desired["folio-" + ident] = {
@@ -313,6 +319,8 @@ def adapter_config(source, config, connections):
                     "--config",
                     str(config),
                     "--watch-config",
+                    "--worker-revision",
+                    revision.hexdigest(),
                     "api-adapter" if connection["provider"] == "binance" else "browser-adapter",
                     ident,
                 ],
@@ -323,6 +331,13 @@ def adapter_config(source, config, connections):
             continue
         ident = name.removeprefix("folio-")
         command = list(item.get("args", []))
+        if (
+            len(command) == 7
+            and command[3] == "--worker-revision"
+            and isinstance(command[4], str)
+            and re.fullmatch(r"[a-f0-9]{64}", command[4])
+        ):
+            del command[3:5]
         if len(command) == 5 and command[2] == "--watch-config":
             del command[2]
         owned = (
@@ -358,7 +373,7 @@ def credentials(args):
         lines = (original or "").splitlines()
         print("Enter keeps the current value; '-' removes it so Zond can ask when needed.")
         if args.provider == "binance":
-            print("For a generated Binance signing key, use 'folio binance-keygen'.")
+            print("Signing key setup is included in 'folio setup binance'.")
         for field in FIELDS[args.provider]:
             if field == "private_key":
                 continue
@@ -379,6 +394,34 @@ def credentials(args):
             raise ValueError("Credential file changed during editing; it was not overwritten.")
         private_write(path, "\n".join(lines) + "\n")
     print(f"Credentials saved privately in {path}. Missing values still use Zond.")
+
+
+def binance_setup(connection, *, create):
+    from .binance_keys import PassphraseRequired, setup_public_key
+
+    try:
+        public = setup_public_key(connection.binance.key_type, create=create)
+    except PassphraseRequired:
+        public = None
+        print("Existing encrypted signing key retained; Zond will ask for its missing passphrase.")
+    except LoginRequired as error:
+        raise ValueError(str(error)) from None
+    if public:
+        print("Binance public key for this machine (existing private keys are reused):")
+        print(public, end="")
+        print(
+            "For a new Binance API key, choose Self-generated and paste the entire public "
+            "key block above. For an existing API key, check that it uses this public key."
+        )
+    else:
+        print(
+            "Binance signing credentials retained; missing values will be requested through Zond."
+        )
+    print(
+        "API credentials are read from .env.local first. On sync, enter only missing values "
+        "in Zond. To save the API key locally, use 'folio credentials binance'.",
+        flush=True,
+    )
 
 
 def run(args):
@@ -427,6 +470,14 @@ def run(args):
         print(f"Configuring Folio on {os.uname().nodename}: {path}", flush=True)
         for connection in settings.connections:
             print(f"  {connection.id}: {connection.provider}", flush=True)
+        selected = [settings.connection(name)] if name else settings.connections
+        existing = tomllib.loads(original or "").get("connections", {})
+        for connection in selected:
+            if connection.provider == "binance":
+                binance_setup(
+                    connection,
+                    create=connection.id not in existing or args.key_type in {"ed25519", "rsa"},
+                )
         if args.configure_only:
             save(path, source, original)
             print("Configuration saved; services were not changed.")

@@ -54,7 +54,7 @@ other launcher for that same instance before enabling it.
 ```toml
 [credential_adapters.ibkr]
 label = "IBKR Gateway — paper account"
-program = "/home/me/code/ibkr-tws-http/adapters/ibgateway/launch.py"
+program = "/home/me/code/folio/adapters/ibgateway/launch.py"
 args = ["--settings-dir", "/home/me/.ib-gateway-paper", "--mode", "paper", "--api-port", "4002"]
 cwd = "/home/me"
 ```

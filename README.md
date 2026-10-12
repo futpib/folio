@@ -263,7 +263,7 @@ ibkr-tws status
 Use the reported absolute executable path in zond's policy. Zond's execution
 policy matches absolute programs; the installed CLI launcher directly selects
 its Python environment and works without shell activation. For example, if
-the path is `/opt/ibkr-tws-http/.venv/bin/ibkr-tws`, these entries provide fixed
+the path is `/opt/folio/.venv/bin/ibkr-tws`, these entries provide fixed
 read operations:
 
 ```toml
@@ -274,7 +274,7 @@ operations = ["ibkr-read"]
 
 [operations.ibkr-read]
 description = "Read the VM's local IBKR API"
-program = "/opt/ibkr-tws-http/.venv/bin/ibkr-tws"
+program = "/opt/folio/.venv/bin/ibkr-tws"
 fixed_args = ["--host", "127.0.0.1", "--port", "8080"]
 arguments = [{ name = "query", choices = ["health", "status", "capabilities", "accounts", "account-summary", "positions", "portfolio-snapshot"] }]
 decision = "allow"
@@ -297,7 +297,7 @@ For arbitrary contract queries, set this principal's `allow_exec = true` and
 
 ```toml
 [[principals.ibkr.rules]]
-program = "/opt/ibkr-tws-http/.venv/bin/ibkr-tws"
+program = "/opt/folio/.venv/bin/ibkr-tws"
 decision = "ask"
 ```
 
@@ -305,7 +305,7 @@ Then a caller can submit, for example:
 
 ```sh
 zondctl --host user@vm --identity ~/.ssh/ibkr exec \
-  /opt/ibkr-tws-http/.venv/bin/ibkr-tws chain-snapshot XXI 20280121
+  /opt/folio/.venv/bin/ibkr-tws chain-snapshot XXI 20280121
 ```
 
 Review that request in the zond app or with `zondctl review` on the VM. Fixed

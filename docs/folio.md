@@ -5,8 +5,9 @@ It runs on the computer holding the account sessions. Callers can read records,
 request a sync, and follow its progress; they cannot supply browser URLs,
 JavaScript, credentials, or arbitrary HTTP requests.
 
-The repository and Python distribution retain the `ibkr-tws-http` name for
-compatibility. The new commands are `folio` and `foliod`. Existing `ibkr-tws`,
+The repository is named `folio`. The Python distribution retains the
+`ibkr-tws-http` name for compatibility. The new commands are `folio` and `foliod`.
+Existing `ibkr-tws`,
 `ibkr-tws-http`, configuration files, exposure policies, and Gateway adapter
 remain supported.
 

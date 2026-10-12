@@ -196,11 +196,16 @@ adapter mechanism and restart Folio after adding the connection.
 
 For a new key, choose **Self-generated** on Binance and use **Ed25519**.
 Binance [recommends Ed25519 and marks HMAC deprecated](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/api_key_types.md).
-Generate the key locally, even before configuring a connection or starting Folio:
+Run the key-generation script from the checkout **on the machine running Folio**,
+even before configuring a connection or starting the service:
 
 ```sh
-uv run folio binance-keygen
+python3 scripts/binance-keygen.py
 ```
+
+The script uses `uv` to install the checkout's locked dependencies and runs
+`folio binance-keygen`. It needs neither a running daemon nor a Binance API key.
+It always selects its own checkout, even when invoked from another directory.
 
 This prints only the public PEM key. Paste the complete output, including the
 `BEGIN PUBLIC KEY` and `END PUBLIC KEY` lines, into Binance. Folio saves the

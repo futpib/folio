@@ -9,6 +9,17 @@ Start with the [Folio setup and usage guide](docs/folio.md). BoG and Wolt browse
 connectors are experimental and still need verification with authenticated real
 accounts. Existing IBKR interfaces and exposure policies remain supported.
 
+To create a Binance self-generated API key, run this from the checkout on the
+machine running Folio:
+
+```sh
+python3 scripts/binance-keygen.py
+```
+
+Paste the printed public key into Binance. The script saves the private key in
+the ignored `.secrets/` directory and registers it in `.env.local`, preserving
+other credentials. Rerunning prints the same public key.
+
 ## Existing IBKR interface
 
 `ibkr-tws-http` exposes a deliberately small, read-only HTTP API backed by a

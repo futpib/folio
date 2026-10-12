@@ -19,12 +19,16 @@ from folio.models import LoginRequired
 
 
 @pytest.mark.parametrize("kind", ["ed25519", "rsa"])
-def test_cli_generates_private_key_once_and_only_prints_public_key(tmp_path, kind):
+@pytest.mark.parametrize("entrypoint", ["cli", "script"])
+def test_cli_generates_private_key_once_and_only_prints_public_key(tmp_path, kind, entrypoint):
     env_file = tmp_path / ".env.local"
     env_file.write_text("# preserve\nBOG_PASSWORD='fixture $password'\nBINANCE_API_KEY=fixture\n")
     cli = Path(sys.executable).parent / "folio"
+    script = Path(__file__).resolve().parents[1] / "scripts/binance-keygen.py"
+    command = [str(cli), "binance-keygen"] if entrypoint == "cli" else [sys.executable, str(script)]
+    command += ["--type", kind, "--env-file", str(env_file)]
     result = subprocess.run(
-        [str(cli), "binance-keygen", "--type", kind, "--env-file", str(env_file)],
+        command,
         cwd="/",
         capture_output=True,
         check=True,
@@ -41,7 +45,7 @@ def test_cli_generates_private_key_once_and_only_prints_public_key(tmp_path, kin
     ) == private.public_key().public_bytes(
         serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
     )
-    assert result.stderr == b"" and b"PRIVATE" not in result.stdout
+    assert b"PRIVATE" not in result.stdout + result.stderr
     assert private_file.stat().st_mode & 0o777 == env_file.stat().st_mode & 0o777 == 0o600
     assert private_file.parent.stat().st_mode & 0o777 == 0o700
     assert (
@@ -52,6 +56,8 @@ def test_cli_generates_private_key_once_and_only_prints_public_key(tmp_path, kin
         read_credentials("binance", env_file)["private_key_file"] == f".secrets/{private_file.name}"
     )
     assert generate_key(kind, env_file=env_file).encode() == result.stdout
+    repeated = subprocess.run(command, cwd="/", capture_output=True, check=True)
+    assert repeated.stdout == result.stdout
     assert private_file.read_bytes() == pem
     assert "PRIVATE KEY" not in env_file.read_text()
 

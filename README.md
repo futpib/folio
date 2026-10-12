@@ -156,11 +156,16 @@ Setup checks HTTP health. `ibkr-tws status` must additionally show
 `"tws_connected": true` before account reads work. For a custom HTTP port, pass
 `--port PORT` to the CLI. Gateway logs are in `journalctl --user -u zondd.service`.
 
-After pulling an update, rerun the same setup command. It refreshes dependencies
-and restarts the HTTP service while retaining its configuration. With `--gateway`,
-it also rebuilds the Java agent; an already running Gateway keeps its current
-agent until the next restart of `zondd.service`. Restart zond when ready to
-interrupt its managed jobs and Gateway session.
+After pulling an update, rerun the same setup command to refresh dependencies
+and restart the HTTP service while retaining its configuration. For Gateway
+adapter changes, restart `zondd.service`: Gateway startup automatically rebuilds
+the Java agent from the checkout before loading it. Keep the JDK installed;
+compilation is offline, and a failed build stops startup. Restart zond when ready
+to interrupt its managed jobs and Gateway session:
+
+```sh
+systemctl --user restart zondd.service
+```
 
 Use `systemctl --user edit ibkr-tws-http.service` for unit overrides. Setup owns
 the generated unit; it refuses to replace a manually installed unit. Back up

@@ -3,7 +3,11 @@
 
 import argparse
 import os
+import subprocess
+import sys
 from pathlib import Path
+
+ADAPTER = Path(__file__).resolve().parent
 
 
 def main():
@@ -15,16 +19,31 @@ def main():
     parser.add_argument(
         "--agent-jar",
         type=Path,
-        default=Path(__file__).resolve().parent / "build/zond-ibgateway.jar",
+        help="use a prebuilt agent instead of building this checkout's adapter at startup",
     )
     args = parser.parse_args()
     if os.environ.get("ZOND_ADAPTER_PROTOCOL") != "1":
         parser.error("configure this executable as a zondd credential adapter")
     if not 1 <= args.api_port <= 65535 or not args.settings_dir.is_absolute():
         parser.error("an absolute settings directory and valid API port are required")
+    args.gateway_home = args.gateway_home.expanduser().resolve()
     java = args.gateway_home / "jre/bin/java"
-    if not java.is_file() or not args.agent_jar.is_file():
-        parser.error("install IB Gateway and run build.sh first")
+    if not java.is_file():
+        parser.error("install IB Gateway first")
+    if args.agent_jar is None:
+        try:
+            # Stdout and stdin belong to the private zond protocol, not build tools.
+            subprocess.run(
+                [str(ADAPTER / "build.sh"), str(args.gateway_home)],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=sys.stderr,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            parser.error(f"could not build the Gateway adapter: {error}")
+        args.agent_jar = ADAPTER / "build/zond-ibgateway.jar"
+    if not args.agent_jar.is_file():
+        parser.error(f"Gateway adapter JAR does not exist: {args.agent_jar}")
     args.settings_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     command = [
         "/usr/bin/xvfb-run",

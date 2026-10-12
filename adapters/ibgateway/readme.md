@@ -33,12 +33,18 @@ are available for custom deployments.
 
 Requirements: the Arch `ib-tws` layout (default `/usr/share/ib-tws`), a JDK 17+
 for compilation, Python 3, `xvfb-run`, and `xauth`. The installed Gateway provides
-its JRE and Jackson libraries. Compilation needs no downloads:
+its JRE and Jackson libraries. The launcher rebuilds the bundled adapter at each
+Gateway start, so pulling changes and restarting `zondd.service` loads the latest
+source. Keep the JDK installed. Compilation needs no downloads; to build manually:
 
 ```sh
 cd ~/code/ibkr-tws-http
 adapters/ibgateway/build.sh
 ```
+
+A failed build stops startup without launching a stale adapter. Builds replace
+the JAR only after successful compilation and packaging. `--agent-jar PATH`
+explicitly selects a prebuilt adapter and skips the startup build.
 
 Merge this into `~/.config/zondd/config.toml`, adjusting absolute paths and the
 Gateway API port. Existing Gateway settings can be used; run only one instance

@@ -9,6 +9,24 @@ Start with the [Folio setup and usage guide](docs/folio.md). BoG and Wolt browse
 connectors are experimental and still need verification with authenticated real
 accounts. Existing IBKR interfaces and exposure policies remain supported.
 
+Run the setup wizard on the machine where Folio should run:
+
+```sh
+uv run folio setup
+```
+
+It configures any supported provider, preserves existing connections, registers
+Zond workers where needed, and starts the user service. For Binance with defaults:
+
+```sh
+uv run folio setup binance --yes
+uv run folio sync binance
+```
+
+Use `folio config show`, `folio config set KEY VALUE`, and `folio credentials PROVIDER`
+to inspect settings, change individual values, or enter credentials privately.
+See the [configuration CLI guide](docs/folio.md#configuration-cli) for examples.
+
 To create a Binance self-generated API key, run this from the checkout on the
 machine running Folio:
 

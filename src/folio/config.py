@@ -105,6 +105,11 @@ class Settings:
         path = path.expanduser().resolve()
         with path.open("rb") as stream:
             data = tomllib.load(stream)
+        return cls.from_data(data, path)
+
+    @classmethod
+    def from_data(cls, data: dict, path: Path) -> Settings:
+        path = path.expanduser().resolve()
         unknown = data.keys() - {"server", "storage", "browser", "connections"}
         if unknown:
             raise ConfigError(f"unknown Folio configuration sections: {', '.join(sorted(unknown))}")

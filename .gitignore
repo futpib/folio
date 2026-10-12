@@ -10,4 +10,5 @@ build/
 htmlcov/
 config.toml
 .env.local
+.env.local.lock
 /.secrets/

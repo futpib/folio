@@ -18,6 +18,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT = "folio.service"
+ZOND_UNIT = "zondd.service"
+LEGACY_UNIT = "ibkr-tws-http.service"
 MARKER = "# Managed by scripts/setup-folio.py."
 spec = importlib.util.spec_from_file_location("ibkr_setup", ROOT / "scripts/setup-user-service.py")
 legacy = importlib.util.module_from_spec(spec)
@@ -32,7 +34,9 @@ def config_source(config_home: Path, *, zond: bool, chromium: str, port: int | N
             if old.exists()
             else 8080
         )
-    source = f"[server]\nport = {port}\n\n[browser]\nexecutable = {json.dumps(chromium)}\n"
+    source = f"[server]\nport = {port}\n"
+    if chromium:
+        source += f"\n[browser]\nexecutable = {json.dumps(chromium)}\n"
     if old.exists():
         source += f'\n[connections.ibkr]\nprovider = "ibkr"\nibkr_config = {json.dumps(str(old))}\n'
     for name in ("bog", "wolt"):
@@ -78,7 +82,7 @@ def adapter_config(source: str, config: Path, connections: dict) -> str:
     return source
 
 
-def main():
+def main(argv=None, *, source=None, expected_original=..., adapter_builder=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--replace-ibkr-service",
@@ -90,21 +94,36 @@ def main():
     )
     parser.add_argument("--no-linger", action="store_true")
     parser.add_argument("--port", type=legacy.port)
-    args = parser.parse_args()
+    parser.add_argument("--config", type=Path, help="Folio configuration file")
+    parser.add_argument(
+        "--auto-migrate",
+        action="store_true",
+        help="migrate a managed legacy service when installed",
+    )
+    args = parser.parse_args(argv)
     if os.getuid() == 0 or sys.platform != "linux":
         parser.error("run setup as the ordinary Linux user, without sudo")
     os.umask(0o077)
     home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     if not home.is_absolute():
         parser.error("XDG_CONFIG_HOME must be absolute")
-    config = home / "folio/config.toml"
+    config = (args.config or home / "folio/config.toml").expanduser().resolve()
     unit = home / "systemd/user" / UNIT
     zond = home / "zondd/config.toml"
     required = ["uv", "systemctl", "systemd-analyze"]
-    current = tomllib.loads(config.read_text()) if config.exists() else None
-    if current is None or any(
-        c.get("provider") in {"bog", "wolt"} for c in current.get("connections", {}).values()
-    ):
+    original = config.read_text() if config.exists() else None
+    if expected_original is not ... and original != expected_original:
+        parser.error("configuration changed during setup; rerun")
+    source = (
+        source
+        if source is not None
+        else original
+        or config_source(home, zond=args.zond, chromium=shutil.which("chromium"), port=args.port)
+    )
+    data = tomllib.loads(source)
+    if any(
+        c.get("provider") in {"bog", "wolt"} for c in data.get("connections", {}).values()
+    ) and not data.get("browser", {}).get("executable"):
         required.append("chromium")
     if args.zond:
         required += ["zondd", "zondctl"]
@@ -116,19 +135,29 @@ def main():
     legacy.run("systemctl", "--user", "show-environment", stdout=subprocess.DEVNULL)
     if unit.exists() and not unit.read_text().startswith(MARKER):
         parser.error(f"{unit} is not managed by this installer")
-    old_unit = home / "systemd/user/ibkr-tws-http.service"
+    previous_unit = unit.read_text() if unit.exists() else None
+    old_unit = home / "systemd/user" / LEGACY_UNIT
     old_active = (
         subprocess.run(
-            ["systemctl", "--user", "is-active", "--quiet", "ibkr-tws-http.service"], check=False
+            ["systemctl", "--user", "is-active", "--quiet", LEGACY_UNIT], check=False
         ).returncode
         == 0
     )
     old_enabled = (
         subprocess.run(
-            ["systemctl", "--user", "is-enabled", "--quiet", "ibkr-tws-http.service"], check=False
+            ["systemctl", "--user", "is-enabled", "--quiet", LEGACY_UNIT], check=False
         ).returncode
         == 0
     )
+    if args.auto_migrate and (old_active or old_enabled):
+        if not old_unit.exists():
+            parser.error("legacy unit is not managed in this config directory; migrate it manually")
+        if not any(c.get("provider") == "ibkr" for c in data.get("connections", {}).values()):
+            parser.error(
+                "legacy IBKR is running but absent from Folio; first run "
+                "'folio setup ibkr --yes' to retain its account access"
+            )
+        args.replace_ibkr_service = True
     if (old_active or old_enabled) and not args.replace_ibkr_service:
         parser.error("legacy service is installed; rerun with --replace-ibkr-service to migrate it")
     if (
@@ -137,11 +166,6 @@ def main():
         and not old_unit.read_text().startswith(legacy.MARKER)
     ):
         parser.error("legacy unit is custom; migrate it manually")
-    original = config.read_text() if config.exists() else None
-    source = original or config_source(
-        home, zond=args.zond, chromium=shutil.which("chromium"), port=args.port
-    )
-    data = tomllib.loads(source)
     if (
         any(c.get("provider") == "binance" for c in data.get("connections", {}).values())
         and not args.zond
@@ -151,40 +175,33 @@ def main():
         parser.error(
             "existing config is preserved; edit server.port before requesting another port"
         )
-    if (
-        original
-        and args.zond
-        and any(
-            not c.get("credential_adapter")
-            for c in data["connections"].values()
-            if c["provider"] != "ibkr"
-        )
-    ):
-        parser.error(
-            "existing config is preserved; set credential_adapter=true before --zond setup"
-        )
     previous_zond = zond.read_text() if zond.exists() else ""
     if args.zond and not previous_zond:
         parser.error("configure zond first; its existing configuration is required")
-    candidate = adapter_config(previous_zond, config, data["connections"]) if args.zond else None
+    candidate = (
+        (adapter_builder or adapter_config)(previous_zond, config, data["connections"])
+        if args.zond
+        else None
+    )
     legacy.run(
         "uv",
         "sync",
         "--locked",
         "--no-dev",
+        "--inexact",
         cwd=ROOT,
         env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(ROOT / ".venv")},
     )
     unit_source = render_unit(config)
     with tempfile.TemporaryDirectory(prefix="folio-setup-") as directory:
         staged = Path(directory)
-        (staged / "config.toml").write_text(source)
-        legacy.run(
-            ROOT / ".venv/bin/foliod",
-            "--config",
-            (config if original else staged / "config.toml"),
-            "--check",
-        )
+        config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=config.parent, prefix=".folio-check-", suffix=".toml"
+        ) as check:
+            check.write(source)
+            check.flush()
+            legacy.run(ROOT / ".venv/bin/foliod", "--config", check.name, "--check")
         (staged / UNIT).write_text(unit_source)
         legacy.run("systemd-analyze", "--user", "verify", staged / UNIT)
         if candidate is not None:
@@ -196,47 +213,121 @@ def main():
         raise ValueError("Folio configuration changed during setup; rerun")
     if candidate is not None and zond.read_text() != previous_zond:
         raise ValueError("zond configuration changed during setup; rerun")
-    if original is None:
-        legacy.write_private(config, source)
-    legacy.write_private(unit, unit_source)
-    legacy.run("systemctl", "--user", "daemon-reload")
+    if (unit.read_text() if unit.exists() else None) != previous_unit:
+        raise ValueError("Folio service unit changed during setup; rerun")
+    prior = {
+        name: {
+            state: subprocess.run(
+                ["systemctl", "--user", "is-" + state, "--quiet", name], check=False
+            ).returncode
+            == 0
+            for state in ("active", "enabled")
+        }
+        for name in (UNIT, ZOND_UNIT)
+    }
+    ctl = ["zondctl"]
+    if candidate is not None and (runtime := tomllib.loads(candidate).get("runtime_dir")):
+        ctl += ["--runtime-dir", runtime]
+    if original is not None and source != original:
+        with tempfile.NamedTemporaryFile(
+            mode="w", prefix="config.toml.backup-", dir=config.parent, delete=False
+        ) as backup:
+            backup.write(original)
+        print(f"Previous configuration: {backup.name}", flush=True)
     try:
-        if args.replace_ibkr_service:
-            legacy.run("systemctl", "--user", "disable", "--now", "ibkr-tws-http.service")
+        if source != original:
+            legacy.write_private(config, source)
+        legacy.write_private(unit, unit_source)
+        legacy.run("systemctl", "--user", "daemon-reload")
+        if args.replace_ibkr_service and (old_active or old_enabled):
+            legacy.run("systemctl", "--user", "disable", "--now", LEGACY_UNIT)
         if candidate is not None:
-            legacy.write_private(zond, candidate)
-            ctl = ["zondctl"]
-            if runtime := tomllib.loads(candidate).get("runtime_dir"):
-                ctl += ["--runtime-dir", runtime]
-            legacy.run("systemctl", "--user", "enable", "--now", "zondd.service")
-            legacy.run(*ctl, "reload")
-        legacy.run("systemctl", "--user", "enable", UNIT)
+            if candidate != previous_zond:
+                legacy.write_private(zond, candidate)
+            legacy.run("systemctl", "--user", "enable", "--now", ZOND_UNIT)
+            if prior[ZOND_UNIT]["active"]:
+                legacy.run(*ctl, "reload")
+            expected = {
+                name: value
+                for name, value in tomllib.loads(candidate).get("credential_adapters", {}).items()
+                if name.startswith("folio-")
+                and value.get("program") == str(ROOT / ".venv/bin/folio")
+            }
+            deadline = time.monotonic() + 15
+            while expected:
+                response = subprocess.run(
+                    [*ctl, "--json", "pending"], capture_output=True, check=False, timeout=5
+                )
+                queue = json.loads(response.stdout) if response.returncode == 0 else {}
+                running = {item["recipient"]["adapter"]: item for item in queue.get("adapters", [])}
+                if all(
+                    name in running
+                    and running[name]["state"] in {"ready", "working", "waiting", "unavailable"}
+                    and running[name]["recipient"]["command"]
+                    == {"program": value["program"], "args": value["args"]}
+                    for name, value in expected.items()
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    raise ValueError(
+                        "Zond did not start the configured Folio workers; "
+                        "inspect journalctl --user -u zondd"
+                    )
+                time.sleep(0.25)
+        legacy.run("systemctl", "--user", "enable", unit)
         legacy.run("systemctl", "--user", "restart", UNIT)
-        endpoint = f"http://127.0.0.1:{data.get('server', {}).get('port', 8080)}/healthz"
+        endpoint = f"http://127.0.0.1:{data.get('server', {}).get('port', 8080)}"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        for _ in range(30):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
             try:
-                with opener.open(endpoint, timeout=1) as response:
-                    if json.load(response).get("version"):
-                        break
+                with opener.open(endpoint + "/v1/connections", timeout=1) as response:
+                    actual = {item["id"] for item in json.load(response)}
+                active = subprocess.run(
+                    ["systemctl", "--user", "is-active", "--quiet", UNIT], check=False
+                )
+                if active.returncode == 0 and actual == set(data["connections"]):
+                    break
             except OSError:
                 pass
             time.sleep(0.5)
         else:
             raise ValueError("Folio did not become healthy; inspect journalctl --user -u folio")
-    except Exception:
-        subprocess.run(["systemctl", "--user", "disable", "--now", UNIT], check=False)
+    except BaseException:
+        subprocess.run(["systemctl", "--user", "stop", UNIT], check=False)
+        if not prior[UNIT]["enabled"]:
+            subprocess.run(["systemctl", "--user", "disable", UNIT], check=False)
+        for target, applied, previous in (
+            (config, source, original),
+            (unit, unit_source, previous_unit),
+            (zond, candidate, previous_zond),
+        ):
+            if applied is None or (target.read_text() if target.exists() else None) != applied:
+                continue
+            if previous is None:
+                target.unlink(missing_ok=True)
+            else:
+                legacy.write_private(target, previous)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
         if candidate is not None:
-            legacy.write_private(zond, previous_zond)
-            subprocess.run([*ctl, "reload"], check=False)
+            if prior[ZOND_UNIT]["active"]:
+                subprocess.run([*ctl, "reload"], check=False)
+            else:
+                subprocess.run(["systemctl", "--user", "stop", ZOND_UNIT], check=False)
+            if not prior[ZOND_UNIT]["enabled"]:
+                subprocess.run(["systemctl", "--user", "disable", ZOND_UNIT], check=False)
+        if prior[UNIT]["enabled"]:
+            subprocess.run(["systemctl", "--user", "enable", UNIT], check=False)
+        if prior[UNIT]["active"]:
+            subprocess.run(["systemctl", "--user", "start", UNIT], check=False)
         if old_enabled:
-            subprocess.run(["systemctl", "--user", "enable", "ibkr-tws-http.service"], check=False)
+            subprocess.run(["systemctl", "--user", "enable", LEGACY_UNIT], check=False)
         if old_active:
-            subprocess.run(["systemctl", "--user", "start", "ibkr-tws-http.service"], check=False)
+            subprocess.run(["systemctl", "--user", "start", LEGACY_UNIT], check=False)
         raise
     print(f"Folio is enabled and healthy. Configuration: {config}")
     print(f"CLI: {ROOT}/.venv/bin/folio connections")
-    print("Sign in with 'folio login bog' and 'folio login wolt', then run 'folio sync NAME'.")
+    print("Use 'folio connections' to inspect connections and 'folio sync NAME' to fetch data.")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ dependencies = [
   "ibapi @ git+https://github.com/deepentropy/ibapi.git@e27eff9c8cd9da7d91ffabaa4db86fec683956e7",
   "playwright>=1.56,<2",
   "protobuf==5.29.5",
+  "tomlkit>=0.13,<1",
   "uvicorn[standard]>=0.34,<1",
 ]
 

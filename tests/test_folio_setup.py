@@ -47,3 +47,40 @@ def test_setup_selects_api_adapter_for_binance(tmp_path):
     )
     item = tomllib.loads(result)["credential_adapters"]["folio-binance"]
     assert item["args"][-2:] == ["api-adapter", "binance"]
+
+
+def test_missing_chromium_keeps_default_toml_valid(tmp_path):
+    source = setup.config_source(tmp_path, zond=True, chromium=None, port=None)
+    assert "browser" not in tomllib.loads(source)
+
+
+def test_setup_preserves_a_concurrent_service_unit_edit(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    import sys
+
+    config = tmp_path / "folio/config.toml"
+    config.parent.mkdir()
+    original = (
+        f'[browser]\nexecutable={json.dumps(sys.executable)}\n[connections.wolt]\nprovider="wolt"\n'
+    )
+    config.write_text(original)
+    unit = tmp_path / "systemd/user/folio.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text(setup.MARKER + "\n[Service]\nExecStart=/usr/bin/true\n")
+    changed = "# edited by user during setup\n[Service]\nExecStart=/usr/bin/false\n"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(setup.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(setup.os, "getuid", lambda: 1000)
+    monkeypatch.setattr(setup.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1))
+
+    def run(*command, **kwargs):
+        if command[0] == "uv":
+            unit.write_text(changed)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(setup.legacy, "run", run)
+    with pytest.raises(ValueError, match="unit changed"):
+        setup.main(["--no-linger"])
+    assert unit.read_text() == changed
+    assert config.read_text() == original

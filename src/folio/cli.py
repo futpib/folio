@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,7 @@ from .store import Store
 
 def common(parser):
     parser.add_argument("--config", type=Path, default=default_config())
+    parser.add_argument("--watch-config", action="store_true", help=argparse.SUPPRESS)
 
 
 def daemon():
@@ -39,7 +41,7 @@ def daemon():
         parser.exit(1, f"foliod: {error}\n")
 
 
-async def adapter(settings, connection):
+async def adapter(settings, connection, *, watch_config=None):
     from .binance import BinanceConnector
     from .broker import Broker
     from .service import worker
@@ -54,7 +56,29 @@ async def adapter(settings, connection):
     try:
         store = Store(settings.state_dir)
         store.register(connection)
-        await worker(store, connection, connector, broker)
+        if watch_config is None:
+            await worker(store, connection, connector, broker)
+        else:
+            original = watch_config.read_bytes()
+
+            async def changed():
+                while True:
+                    await asyncio.sleep(0.5)
+                    if watch_config.read_bytes() != original:
+                        return
+
+            tasks = [
+                asyncio.create_task(worker(store, connection, connector, broker)),
+                asyncio.create_task(changed()),
+            ]
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         if isinstance(connector, BinanceConnector):
             connector.credentials = None
@@ -62,9 +86,12 @@ async def adapter(settings, connection):
 
 
 def main():
+    from .configure import add_commands
+
     parser = argparse.ArgumentParser(description="Read personal account data through Folio")
     common(parser)
     sub = parser.add_subparsers(dest="command", required=True)
+    add_commands(sub)
     sub.add_parser("connections", help="list connections, capabilities and freshness")
     read = sub.add_parser("read", help="read collected data without contacting the provider")
     read.add_argument("connection")
@@ -94,6 +121,11 @@ def main():
     args = parser.parse_args()
     try:
         os.umask(0o077)
+        if args.command in {"setup", "config", "credentials"}:
+            from .configure import run
+
+            run(args)
+            return
         if args.command == "binance-keygen":
             from .binance_keys import generate_key
 
@@ -118,7 +150,15 @@ def main():
                     parser.error("credential adapters must be launched by zond")
                 if not connection.credential_adapter:
                     parser.error("set credential_adapter = true for this connection first")
-                asyncio.run(adapter(settings, connection))
+                asyncio.run(
+                    adapter(
+                        settings,
+                        connection,
+                        watch_config=args.config.expanduser().resolve()
+                        if args.watch_config
+                        else None,
+                    )
+                )
             return
         with httpx.Client(
             base_url=f"http://127.0.0.1:{settings.port}",
@@ -171,7 +211,20 @@ def main():
             if isinstance(result, dict) and result.get("state") == "failed":
                 raise SystemExit(1)
     except KeyboardInterrupt:
+        if args.command in {"setup", "config", "credentials", "binance-keygen"}:
+            parser.exit(130, "Cancelled.\n")
         parser.exit(130, "Detached. Use 'folio job ID --follow' to resume following.\n")
-    except (OSError, ValueError, httpx.HTTPError, CredentialFileError) as error:
+    except httpx.ConnectError:
+        parser.exit(
+            1, "Cannot reach Folio. Run 'folio setup' to configure and start its service.\n"
+        )
+    except (
+        OSError,
+        ValueError,
+        EOFError,
+        subprocess.SubprocessError,
+        httpx.HTTPError,
+        CredentialFileError,
+    ) as error:
         # No provider response bodies, credentials or browser exceptions in CLI diagnostics.
         parser.exit(1, f"folio: {error}\n")

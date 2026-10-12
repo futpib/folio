@@ -39,7 +39,91 @@ receipts/statements, and matching a Wolt order to a bank transaction are not yet
 implemented. No payments, trades, order placement, or account-setting operations
 are exposed.
 
+## Configuration CLI
+
+Run these commands **on the machine that will run Folio**, from its checkout.
+Setup works without a running daemon or an existing Folio configuration:
+
+```sh
+uv run folio setup
+```
+
+The wizard adds or edits a named connection for Binance, BoG, Wolt or IBKR. It asks
+for provider settings, sync limits, the local HTTP port and data directory, then
+validates the result and installs/starts the user service. IBKR connections reuse
+an existing Gateway/TWS configuration and its exposure policy. Gateway installation
+and its first login remain covered by the [IBKR setup guide](../README.md#include-headless-gateway-sign-in-through-zond).
+Browser connections need Chromium. Zond-backed connections need an installed,
+configured Zond service; setup preserves its existing SSH policy and other adapters.
+
+Give a name to edit one connection. Add `--yes` to use existing values or defaults
+without prompts; flags change only the selected settings:
+
+```sh
+uv run folio setup binance --yes
+uv run folio setup binance --yes --markets spot,usdm \
+  --spot-symbols BTCUSDT,ETHUSDT --usdm-symbols BTCUSDT --history-days 30
+uv run folio setup bank --provider bog --yes --chromium /usr/bin/chromium
+uv run folio setup wolt --yes
+uv run folio setup ibkr --yes --ibkr-config ~/.config/ibkr-tws-http/config.toml
+uv run folio setup --yes --port 9080
+```
+
+Binance defaults to Spot and USD-M, a seven-day lookback and automatic signing-key
+detection. Trade symbols start empty: balances, positions and Futures income work,
+but per-symbol trades require your actual symbols. Pass `--spot-symbols ''` (or the
+corresponding Futures option) to clear a list. Disabling a market removes its
+configured trade-symbol list. Other provider and connection settings remain unchanged.
+
+`--configure-only` validates and saves without changing services. `--no-linger`
+skips boot/logout persistence setup. `folio --config PATH setup ...` supports a
+custom configuration file. Existing comments are preserved, changes get private
+backups, and invalid settings leave the previous file intact. A managed legacy
+IBKR service is migrated automatically; custom units and adapter bindings are not
+silently replaced. A failed service installation restores the previous config,
+Zond configuration and Folio unit, and restarts services that were running.
+
+Inspect or edit any supported Folio setting while the daemon is stopped:
+
+```sh
+uv run folio config show
+uv run folio config set server.port 9080
+uv run folio config set connections.binance.binance.markets '["spot", "usdm", "coinm"]'
+uv run folio config set connections.binance.binance.coinm_symbols '["BTCUSD_PERP"]'
+uv run folio config unset connections.binance.binance.coinm_symbols
+uv run folio setup --yes
+```
+
+`config set` accepts a TOML value; quote strings and arrays as in the examples.
+`config unset` can remove optional fields or a connection, provided the remaining
+configuration is valid. Use a new connection name when changing providers.
+Run `setup --yes` after individual edits to apply service and adapter changes.
+Managed Folio workers reload changed configurations without restarting Gateway
+or unrelated Zond adapters. Removed managed workers are retired during setup.
+
+Enter credentials with masked prompts instead of placing secrets in commands:
+
+```sh
+uv run folio credentials binance
+uv run folio credentials bog
+uv run folio credentials wolt
+uv run folio credentials ibkr
+```
+
+These commands preserve other entries in the checkout's ignored `.env.local`
+and save with owner-only permissions. Enter keeps a value; `-` removes it.
+They never display existing secrets. A missing field still falls back to Zond.
+For a Binance signing key use `folio binance-keygen`; `credentials binance`
+can also set a path to an existing private key. Inline PEMs remain supported in
+`.env.local`. Already cached credentials take effect after worker restart or
+authentication rejection, as described below.
+
+After setup, check the connection with `folio sync NAME`, then `folio read NAME RESOURCE`.
+
 ## Persistent installation
+
+`folio setup` is the guided interface to the installer below. Existing scripted
+installations can continue using these commands.
 
 On Arch/Manjaro install `uv` and `chromium`, then run from the checkout:
 
@@ -154,7 +238,15 @@ separate accounts need separate installations/credential files.
 
 ## Binance Spot and Futures
 
-Add a named connection to `~/.config/folio/config.toml`:
+For automatic setup:
+
+```sh
+uv run folio setup binance --yes
+uv run folio credentials binance
+uv run folio sync binance
+```
+
+Or add a named connection manually to `~/.config/folio/config.toml`:
 
 ```toml
 [connections.binance]

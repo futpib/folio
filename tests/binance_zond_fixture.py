@@ -1,7 +1,8 @@
-"""Run the actual API adapter CLI against an isolated loopback Binance fixture."""
+"""Run standalone Folio against an isolated loopback Binance fixture."""
 
 from __future__ import annotations
 
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,22 +34,42 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if (Path.cwd() / "forbid-zond").exists():
+        from folio.broker import ServiceBroker
+
+        async def unexpected_challenge(*args, **kwargs):
+            raise AssertionError("Complete local credentials must not contact Zond")
+
+        ServiceBroker.challenge = unexpected_challenge
     public = Path.cwd() / "fixture-public.pem"
     if public.exists():
         api.public_key = load_pem_public_key(public.read_bytes())
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    for market in binance.ORIGINS:
-        binance.ORIGINS[market] = f"http://127.0.0.1:{server.server_port}"
+
+    class Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            url = request.url.copy_with(scheme="http", host="127.0.0.1", port=server.server_port)
+            async with httpx.AsyncClient(trust_env=False) as client:
+                return await client.get(url, headers=request.headers)
+
     # Preserve the production constructor and CLI; only eliminate fixture pacing.
     original = binance.BinanceConnector.__init__
 
     def initialize(self, *args, **kwargs):
-        original(self, *args, **kwargs, pace=0, env_file=Path.cwd() / ".env.local")
+        original(
+            self, *args, **kwargs, pace=0, transport=Transport(), env_file=Path.cwd() / ".env.local"
+        )
 
     binance.BinanceConnector.__init__ = initialize
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        main()
+        if "--daemon" in sys.argv:
+            sys.argv.remove("--daemon")
+            from folio.cli import daemon
+
+            daemon()
+        else:
+            main()
     finally:
         server.shutdown()
         server.server_close()

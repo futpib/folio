@@ -16,6 +16,7 @@ from .binance_keys import PassphraseRequired, private_pem, read_binance_credenti
 from .config import BinanceSettings, Connection
 from .credentials import CredentialFileError
 from .models import ConnectorError, LoginRequired, RateLimited, Record, SchemaChanged, Snapshot
+from .observability import RequestLog
 
 DAY = 86_400_000
 PAGE_SIZE = 1000
@@ -260,8 +261,11 @@ class BinanceConnector:
             url += f"?{query}&{urlencode({'signature': signature})}"
             headers["X-MBX-APIKEY"] = self.credentials.key
         self.last_request = time.monotonic()
+        log = RequestLog("GET", ORIGINS[market] + ENDPOINTS[market][operation])
+        status, api_code, failure = None, None, None
         try:
             async with client.stream("GET", url, headers=headers) as response:
+                status = response.status_code
                 if response.status_code in {418, 429}:
                     try:
                         delay = int(response.headers.get("Retry-After", "300"))
@@ -284,6 +288,7 @@ class BinanceConnector:
                 code = payload.get("code") if isinstance(payload, dict) else None
                 if type(code) is not int or not -999999 <= code <= 999999:
                     code = None
+                api_code = code
                 context = (
                     f"Binance {market} {operation} ({ENDPOINTS[market][operation]}, "
                     f"HTTP {response.status_code}"
@@ -326,10 +331,16 @@ class BinanceConnector:
                     )
                 return payload
         except httpx.HTTPError:
+            failure = "network"
             # HTTP exceptions and Binance error bodies can contain signed URLs or secrets.
             raise ConnectorError(
                 "Could not reach the Binance API securely; stored data is unchanged."
             ) from None
+        except asyncio.CancelledError:
+            failure = "cancelled"
+            raise
+        finally:
+            log.finish(status=status, code=api_code, error_code=failure)
 
     async def time(self, client, market):
         payload = await self.request(client, market, "time")
@@ -477,7 +488,8 @@ class BinanceConnector:
                         if missing:
                             if self.broker is None:
                                 raise LoginRequired(
-                                    "Start the Binance API credential adapter through zond."
+                                    "Binance credentials are missing from .env.local. "
+                                    "Use 'folio credentials binance' or enable Zond authentication."
                                 )
                             if challenge:
                                 # Zond requires a result before opening the next credential step.
@@ -503,7 +515,7 @@ class BinanceConnector:
                                 resolved = True
                                 raise LoginRequired(
                                     "Binance API credentials were declined or expired; "
-                                    "retry in zond."
+                                    f"retry 'folio sync {self.connection.id}'."
                                 )
                             try:
                                 if any(

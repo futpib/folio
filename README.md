@@ -3,7 +3,9 @@
 Folio provides local, read-only access to IBKR, Binance Spot and Futures, Bank of
 Georgia personal banking, and Wolt customer order history. It adds named
 connections, durable sync jobs, a SQLite data store, local credentials with Zond fallback,
-and private Chromium sessions for browser providers.
+and private Chromium sessions for browser providers. `folio.service` runs all
+provider workers independently. It contacts Zond only for credentials missing
+from `.env.local`; complete local credentials work with Zond stopped or absent.
 
 Start with the [Folio setup and usage guide](docs/folio.md). BoG and Wolt browser
 connectors are experimental and still need verification with authenticated real
@@ -16,11 +18,12 @@ uv run folio setup
 ```
 
 It configures any supported provider, preserves existing connections, registers
-Zond workers where needed, and starts the user service. For Binance with defaults:
+credential relays when Zond is configured, and starts the standalone user service.
+For Binance with defaults:
 
 ```sh
 uv run folio setup binance --yes
-uv run folio sync binance
+uv run folio sync binance --verbose
 ```
 
 Use `folio config show`, `folio config set KEY VALUE`, and `folio credentials PROVIDER`
@@ -34,6 +37,12 @@ the private key in the ignored `.secrets/` directory and registers it in
 existing HMAC credentials remain supported. Missing API credentials are requested
 through Zond when you sync. `folio binance-keygen` and `scripts/binance-keygen.py`
 remain available for standalone key generation.
+
+`folio sync NAME --verbose` shows individual provider requests as the job runs.
+Use `folio logs NAME --follow` to watch retained logs, or
+`folio job ID --follow --verbose` to resume a job's progress. Logs include fixed
+endpoints, timing, HTTP status and safe error codes; credentials, query strings,
+headers and response bodies are excluded.
 
 ## Existing IBKR interface
 

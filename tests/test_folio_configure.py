@@ -271,11 +271,13 @@ def test_adapter_reconciliation_preserves_policy_and_retires_only_owned_workers(
         "--watch-config",
         "--worker-revision",
         parsed["credential_adapters"]["folio-binance"]["args"][4],
-        "api-adapter",
+        "credential-relay",
         "binance",
     ]
     old = tomllib.loads(source)
     del old["credential_adapters"]["folio-binance"]["args"][3:5]
+    old["credential_adapters"]["folio-binance"]["args"][3] = "api-adapter"
+    old["credential_adapters"]["folio-bank"]["args"][5] = "browser-adapter"
     assert (
         tomllib.loads(configure.adapter_config(tomlkit.dumps(old), config, connections)) == parsed
     )

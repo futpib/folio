@@ -9,9 +9,6 @@ from pathlib import Path
 
 import httpx
 
-from folio.models import Record, Snapshot
-from folio.store import Store
-
 
 def test_actual_daemon_and_cli_follow_detach_and_cached_read(tmp_path):
     with socket.socket() as sock:
@@ -30,7 +27,14 @@ credential_adapter = true
     command = [str(executable / "folio"), "--config", str(config)]
     with (tmp_path / "daemon.log").open("w") as log:
         daemon = subprocess.Popen(
-            [str(executable / "foliod"), "--config", str(config)], stdout=log, stderr=log
+            [
+                sys.executable,
+                str(Path(__file__).with_name("folio_cli_fixture.py")),
+                "--config",
+                str(config),
+            ],
+            stdout=log,
+            stderr=log,
         )
         follow = None
         try:
@@ -54,21 +58,6 @@ credential_adapter = true
                 [*command, "job", job["id"], "--follow"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-            )
-            # Fixture worker completes the same durable job the real CLI is following.
-            store = Store(tmp_path / "state")
-            store.claim("wolt")
-            store.finish(
-                job,
-                Snapshot(
-                    records=[
-                        Record(id="fixture", resource="orders", data={"merchant": "Test café"})
-                    ],
-                    resources=["orders"],
-                    complete=True,
-                    coverage="fixture",
-                ),
-                300,
             )
             output, error = follow.communicate(timeout=10)
             assert follow.returncode == 0, error.decode()

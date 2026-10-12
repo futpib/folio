@@ -205,6 +205,15 @@ def test_ibkr_compatibility_uses_existing_exposure_policy(tmp_path):
         assert "DU424242" not in json.dumps(data)
         assert len(data["items"]) == 2
         assert client.post("/v1/order", json={}).status_code == 404
+        logs = client.get("/v1/connections/ibkr/logs", params={"job": job["id"]}).json()["items"]
+        requests = [row for row in logs if row["event"] == "request_finished"]
+        assert {row["fields"]["endpoint"] for row in requests} == {
+            "ibkr://gateway/v1/accounts",
+            "ibkr://gateway/v1/account-summary",
+            "ibkr://gateway/v1/positions",
+        }
+        assert all(row["fields"]["status"] == 200 for row in requests)
+        assert "DU424242" not in json.dumps(logs)
 
 
 def test_config_rejects_unsafe_or_ambiguous_connections(tmp_path):

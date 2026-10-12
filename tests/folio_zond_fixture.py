@@ -1,34 +1,25 @@
-"""Real Chromium/zond test adapter. All browser traffic is intercepted locally."""
+"""Standalone Folio with real Chromium and locally intercepted login traffic."""
 
 from __future__ import annotations
 
-import asyncio
 import os
-import shutil
-import sys
 from pathlib import Path
 
-from folio.broker import Broker
-from folio.browser import authenticate, browser
-from folio.config import Connection, Settings
+from folio.browser import BrowserConnector, authenticate, browser
+from folio.cli import daemon
+from folio.models import LoginRequired, Snapshot
 
 
-async def main():
-    root = Path(sys.argv[1])
-    connection = Connection("bog", "bog")
-    settings = Settings(root, (connection,), chromium=shutil.which("chromium"))
-    broker = Broker()
-    env_file = root / ".env.local"
-    await broker.start()
-    try:
-        async with browser(
-            settings, connection, headed=os.getenv("FOLIO_TEST_HEADED") == "1"
-        ) as ctx:
+async def sync(self, since):
+    root = Path.cwd()
+    async with browser(
+        self.settings, self.connection, headed=os.getenv("FOLIO_TEST_HEADED") == "1"
+    ) as ctx:
 
-            async def route(request):
-                await request.fulfill(
-                    content_type="text/html",
-                    body="""
+        async def route(request):
+            await request.fulfill(
+                content_type="text/html",
+                body="""
                     <form id="login" onsubmit="event.preventDefault();
                       if(this.querySelector('[name=username]').value !== 'fixture-user' ||
                          this.querySelector('[type=password]').value !== 'folio-test-secret')
@@ -41,25 +32,19 @@ async def main():
                       <input autocomplete="one-time-code">
                       <button type="submit">Verify</button>
                     </form>""",
-                )
+            )
 
-            await ctx.route("**/*", route)
-            page = await ctx.new_page()
-            await page.goto("https://account.bog.ge/auth/login")
-            if not (root / "full-credentials").exists():
-                assert not await authenticate(page, "bog", broker, env_file=env_file)
-                (root / "declined").touch()
-                await broker.status("unavailable")
-                await broker.retry.wait()
-                broker.retry.clear()
-            assert await authenticate(page, "bog", broker, env_file=env_file)
-            assert await authenticate(page, "bog", broker, env_file=env_file)
-            (root / "authenticated").touch()
-            await broker.status("ready")
-            await asyncio.Event().wait()
-    finally:
-        broker.close()
+        await ctx.route("**/*", route)
+        page = await ctx.new_page()
+        await page.goto("https://account.bog.ge/auth/login")
+        for _ in range(2):
+            if not await authenticate(page, "bog", self.broker, env_file=root / ".env.local"):
+                raise LoginRequired("Fixture login declined")
+        return Snapshot(
+            records=[], resources=list(self.connection.resources), complete=True, coverage="fixture"
+        )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    BrowserConnector.sync = sync
+    daemon()

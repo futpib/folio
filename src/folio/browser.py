@@ -14,6 +14,7 @@ from playwright.async_api import async_playwright
 from .config import Connection, Settings
 from .credentials import CredentialFileError, read_credentials
 from .models import ConnectorError, LoginRequired, RateLimited, SchemaChanged
+from .observability import Recorder, browser_logging, current
 from .providers import (
     LOGIN_ORIGINS,
     PAGES,
@@ -23,7 +24,7 @@ from .providers import (
     resource_for,
     snapshot,
 )
-from .store import exclusive, private_directory
+from .store import Store, exclusive, private_directory
 
 MAX_BODY = 8 * 1024 * 1024
 
@@ -58,9 +59,13 @@ async def browser(settings: Settings, connection: Connection, *, headed=False):
                     locale="en-US",
                     service_workers="block",
                 )
+                close_logs = browser_logging(
+                    context, current.get() or Recorder(Store(settings.state_dir), connection)
+                )
                 try:
                     yield context
                 finally:
+                    close_logs()
                     await context.close()
     except BlockingIOError:
         raise LoginRequired(

@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 ZONDD = os.environ.get("FOLIO_TEST_ZONDD")
@@ -26,15 +27,29 @@ def test_real_zond_chromium_decline_retry_password_and_otp(tmp_path, present):
             "".join(f"BOG_{name.upper()}={expected[name]}\n" for name in present)
         )
     missing = {name: value for name, value in expected.items() if name not in present}
-    if not missing:
-        (tmp_path / "full-credentials").touch()
     fixture = Path(__file__).with_name("folio_zond_fixture.py")
+    with socket.socket() as free:
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+    folio_config = tmp_path / "folio.toml"
+    folio_config.write_text(f"""[server]
+port = {port}
+[storage]
+path = {json.dumps(str(tmp_path / "state"))}
+[browser]
+executable = {json.dumps(shutil.which("chromium"))}
+[connections.bog]
+provider = "bog"
+credential_adapter = true
+min_sync_seconds = 1
+""")
+    cli = [str(Path(sys.executable).parent / "folio"), "--config", str(folio_config)]
     config = tmp_path / "zond.toml"
     config.write_text(f"""runtime_dir = {json.dumps(str(tmp_path / "run"))}
 [credential_adapters.folio]
 label = "Configured Folio fixture"
-program = {json.dumps(sys.executable)}
-args = {json.dumps([str(fixture), str(tmp_path)])}
+program = {json.dumps(cli[0])}
+args = {json.dumps([*cli[1:], "credential-relay", "bog"])}
 cwd = {json.dumps(str(tmp_path))}
 """)
     config.chmod(0o600)
@@ -53,10 +68,30 @@ cwd = {json.dumps(str(tmp_path))}
             time.sleep(0.1)
         raise AssertionError("Folio/zond E2E did not reach expected state")
 
+    def call(*args):
+        result = subprocess.run([*cli, *args], capture_output=True, timeout=10)
+        assert result.returncode in {0, 1} and result.stdout, result.stderr.decode()
+        return json.loads(result.stdout)
+
+    def healthy():
+        try:
+            with httpx.Client(trust_env=False) as client:
+                return client.get(f"http://127.0.0.1:{port}/healthz").is_success
+        except httpx.TransportError:
+            return False
+
     with (tmp_path / "daemon.log").open("w+") as log:
         daemon = subprocess.Popen([ZONDD, "serve", "--config", str(config)], stdout=log, stderr=log)
+        service = subprocess.Popen(
+            [sys.executable, str(fixture), "--config", str(folio_config)],
+            cwd=tmp_path,
+            stdout=log,
+            stderr=log,
+        )
         try:
             wait(lambda: (tmp_path / "run/admin.sock").exists())
+            wait(healthy)
+            job = call("sync", "bog", "--detach")
 
             def challenge():
                 return wait(lambda: request({"method": "pending"})["interactions"])[0]
@@ -73,9 +108,9 @@ cwd = {json.dumps(str(tmp_path))}
                         "values": None,
                     }
                 )
-                wait(lambda: (tmp_path / "declined").exists())
+                wait(lambda: call("job", job["id"])["state"] == "failed")
                 assert not request({"method": "pending"})["interactions"]
-                request({"method": "retry_adapter", "adapter": "folio"})
+                job = call("sync", "bog", "--detach")
                 second = challenge()
                 assert first["challenge_id"] != second["challenge_id"]
                 assert [f["id"] for f in second["fields"]] == list(missing)
@@ -95,11 +130,17 @@ cwd = {json.dumps(str(tmp_path))}
                     "values": {"otp": "527941"},
                 }
             )
-            wait(lambda: (tmp_path / "authenticated").exists())
-            wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "ready")
+            wait(lambda: call("job", job["id"])["state"] == "completed")
             assert not request({"method": "pending"})["interactions"]
+            result = subprocess.run(
+                [*cli, "logs", "bog", "--job", job["id"]], capture_output=True, check=True
+            )
+            assert b"request_finished" in result.stdout
+            assert b"/<redacted-path>" in result.stdout and b"status=200" in result.stdout
+            assert b"folio-test-secret" not in result.stdout and b"527941" not in result.stdout
         finally:
-            daemon.terminate()
-            daemon.wait(timeout=15)
+            for process in (service, daemon):
+                process.terminate()
+                process.wait(timeout=15)
         log.seek(0)
         assert "folio-test-secret" not in log.read()

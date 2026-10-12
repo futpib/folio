@@ -109,7 +109,7 @@ def test_setup_starts_services_reloads_worker_and_rolls_back_failed_restart(tmp_
         call(arguments)
         with httpx.Client(trust_env=False) as client:
             result = client.get(f"http://127.0.0.1:{port}/v1/connections").json()
-            assert result[0]["id"] == "binance" and result[0]["worker"] == "zond"
+            assert result[0]["id"] == "binance" and result[0]["worker"] == "foliod"
         original_session = sessions()[0]["recipient"]["session_id"]
         call([*arguments, "--history-days", "30"])
         for _ in range(100):

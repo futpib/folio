@@ -12,6 +12,7 @@ from folio.browser import BrowserConnector, authenticate, browser
 from folio.config import Connection, Settings
 from folio.models import RateLimited
 from folio.providers import BOG_ACCOUNTS, WOLT_ORDERS
+from folio.store import Store
 
 pytestmark = pytest.mark.skipif(not shutil.which("chromium"), reason="requires installed Chromium")
 
@@ -52,7 +53,11 @@ def test_real_chromium_profile_pagination_and_limits(tmp_path):
         async with browser(settings, connection) as context:
             await context.route("**/*", routes)
             page = await context.new_page()
-            await page.goto("https://wolt.com/en/profile/order-history")
+            async with page.expect_response(
+                lambda response: urlsplit(response.url).path == WOLT_ORDERS
+            ) as response:
+                await page.goto("https://wolt.com/en/profile/order-history")
+            await (await response.value).finished()
             assert (
                 await page.evaluate("localStorage.getItem('session')") == "private-fixture-session"
             )
@@ -61,6 +66,13 @@ def test_real_chromium_profile_pagination_and_limits(tmp_path):
                     pass
         assert all(method == "GET" for method, _ in requests)
         assert not any("order-again" in path for _, path in requests)
+        logs = Store(tmp_path).logs("wolt")["items"]
+        ends = [row for row in logs if row["event"] == "request_finished"]
+        history = [row for row in ends if row["fields"]["endpoint"].endswith(WOLT_ORDERS)]
+        assert len(history) == 3 and all(row["fields"]["status"] == 200 for row in history)
+        assert "page-two" not in json.dumps(logs) and "private-fixture-session" not in json.dumps(
+            logs
+        )
 
     asyncio.run(run())
 

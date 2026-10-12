@@ -275,7 +275,7 @@ def test_config_and_api_expose_only_fixed_reads(tmp_path):
     settings = replace(Settings.load(path), state_dir=tmp_path / "state")
     with TestClient(create_app(settings)) as client:
         info = client.get("/v1/connections").json()[0]
-        assert info["worker"] == "zond" and info["browser_support"] is None
+        assert info["worker"] == "foliod" and info["browser_support"] is None
         assert info["markets"] == ["spot", "usdm"]
         assert info["resources"] == ["accounts", "balances", "positions", "trades", "income"]
         assert (
@@ -284,7 +284,7 @@ def test_config_and_api_expose_only_fixed_reads(tmp_path):
         )
         assert client.post("/v1/connections/binance/orders", json={}).status_code == 404
     for invalid in (
-        valid.replace("true", "false"),
+        valid.replace("true", "42"),
         valid + 'api_key="no"',
         valid + '[connections.binance.binance]\nurl="https://attacker.test"',
         valid + '[connections.binance.binance]\nmarkets=["wrong"]',

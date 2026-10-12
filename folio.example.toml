@@ -22,8 +22,9 @@ provider = "wolt"
 min_sync_seconds = 300
 max_pages = 100
 
-# For browser login through zond, set credential_adapter = true on each browser
-# connection and run scripts/setup-folio.py --zond. Otherwise use folio login.
+# All provider workers run in foliod. For missing credentials through Zond,
+# set credential_adapter = true and run scripts/setup-folio.py --zond.
+# Complete local credentials and saved browser sessions work without Zond.
 
 # Binance uses its REST API, with local keys and Zond for missing values.
 # Run `uv run folio binance-keygen` for an Ed25519 public key to register with Binance.

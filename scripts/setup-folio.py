@@ -57,29 +57,10 @@ def render_unit(config: Path) -> str:
 
 
 def adapter_config(source: str, config: Path, connections: dict) -> str:
-    existing = tomllib.loads(source).get("credential_adapters", {})
-    for name, connection in connections.items():
-        if not connection.get("credential_adapter"):
-            continue
-        ident = "folio-" + name
-        item = {
-            "label": f"Folio {connection['provider']} ({name})",
-            "program": str(ROOT / ".venv/bin/folio"),
-            "args": [
-                "--config",
-                str(config),
-                "api-adapter" if connection["provider"] == "binance" else "browser-adapter",
-                name,
-            ],
-            "cwd": str(ROOT),
-        }
-        if ident in existing:
-            if existing[ident] != item:
-                raise ValueError(f"Existing zond adapter {ident} differs; inspect it before setup.")
-            continue
-        source += f"\n[credential_adapters.{ident}]\n"
-        source += "".join(f"{key} = {json.dumps(value)}\n" for key, value in item.items())
-    return source
+    sys.path.insert(0, str(ROOT / "src"))
+    from folio.configure import adapter_config as reconcile
+
+    return reconcile(source, config, connections)
 
 
 def main(argv=None, *, source=None, expected_original=..., adapter_builder=None):
@@ -166,11 +147,6 @@ def main(argv=None, *, source=None, expected_original=..., adapter_builder=None)
         and not old_unit.read_text().startswith(legacy.MARKER)
     ):
         parser.error("legacy unit is custom; migrate it manually")
-    if (
-        any(c.get("provider") == "binance" for c in data.get("connections", {}).values())
-        and not args.zond
-    ):
-        parser.error("Binance requires --zond to install its API credential adapter")
     if original and args.port is not None and data.get("server", {}).get("port", 8080) != args.port:
         parser.error(
             "existing config is preserved; edit server.port before requesting another port"
@@ -270,7 +246,7 @@ def main(argv=None, *, source=None, expected_original=..., adapter_builder=None)
                     break
                 if time.monotonic() >= deadline:
                     raise ValueError(
-                        "Zond did not start the configured Folio workers; "
+                        "Zond did not start the configured Folio credential relays; "
                         "inspect journalctl --user -u zondd"
                     )
                 time.sleep(0.25)

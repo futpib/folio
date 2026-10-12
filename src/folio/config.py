@@ -173,8 +173,6 @@ class Settings:
             broker = item.get("credential_adapter", False)
             if type(broker) is not bool or (broker and provider == "ibkr"):
                 raise ConfigError("credential_adapter is a boolean for browser or API connections")
-            if provider == "binance" and not broker:
-                raise ConfigError("Binance requires credential_adapter = true for private API keys")
             connections.append(
                 Connection(
                     name,

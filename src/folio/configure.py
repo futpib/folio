@@ -321,7 +321,7 @@ def adapter_config(source, config, connections):
                     "--watch-config",
                     "--worker-revision",
                     revision.hexdigest(),
-                    "api-adapter" if connection["provider"] == "binance" else "browser-adapter",
+                    "credential-relay",
                     ident,
                 ],
                 "cwd": str(ROOT),
@@ -347,7 +347,7 @@ def adapter_config(source, config, connections):
             and item.get("label") in {f"Folio {provider} ({ident})" for provider in RESOURCES}
             and len(command) == 4
             and command[:2] == ["--config", str(config)]
-            and command[2] in {"api-adapter", "browser-adapter"}
+            and command[2] in {"api-adapter", "browser-adapter", "credential-relay"}
             and command[3] == ident
         )
         if name in desired and item != desired[name] and not owned:
@@ -487,8 +487,13 @@ def run(args):
                 Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
                 / "zondd/config.toml"
             )
-            if any(c.credential_adapter for c in settings.connections) or zond_path.exists():
+            if zond_path.exists() and shutil.which("zondd") and shutil.which("zondctl"):
                 command.append("--zond")
+            elif any(c.credential_adapter for c in settings.connections):
+                print(
+                    "Zond is unavailable; local credentials still work. "
+                    "Missing fields need Zond setup."
+                )
             if args.no_linger:
                 command.append("--no-linger")
             module = installer()

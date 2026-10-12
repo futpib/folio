@@ -14,6 +14,10 @@ from binance_fixture import KEY, SECRET
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 
+from folio.broker import socket_path
+from folio.config import Settings
+from folio.store import Store
+
 ZONDD = os.environ.get("FOLIO_TEST_ZONDD")
 
 
@@ -74,16 +78,15 @@ history_days = 1
 """)
     zond_config = tmp_path / "zond.toml"
     adapter_args = [
-        str(Path(__file__).with_name("binance_zond_fixture.py")),
         "--config",
         str(config),
-        "api-adapter",
+        "credential-relay",
         "binance",
     ]
     zond_config.write_text(f"""runtime_dir = {json.dumps(str(tmp_path / "run"))}
 [credential_adapters.binance]
 label = "Configured Binance API fixture"
-program = {json.dumps(sys.executable)}
+program = {json.dumps(str(Path(sys.executable).parent / "folio"))}
 args = {json.dumps(adapter_args)}
 cwd = {json.dumps(str(tmp_path))}
 """)
@@ -112,22 +115,41 @@ cwd = {json.dumps(str(tmp_path))}
 
     with (tmp_path / "daemon.log").open("w+") as log:
         folio = subprocess.Popen(
-            [str(binaries / "foliod"), "--config", str(config)], stdout=log, stderr=log
+            [
+                sys.executable,
+                str(Path(__file__).with_name("binance_zond_fixture.py")),
+                "--daemon",
+                "--config",
+                str(config),
+            ],
+            stdout=log,
+            stderr=log,
+            cwd=tmp_path,
         )
         zond = subprocess.Popen(
             [ZONDD, "serve", "--config", str(zond_config)], stdout=log, stderr=log
         )
         try:
             wait(lambda: (tmp_path / "run/admin.sock").exists())
-            with httpx.Client(trust_env=False) as client:
 
-                def healthy():
-                    try:
+            def healthy():
+                try:
+                    with httpx.Client(trust_env=False) as client:
                         return client.get(f"http://127.0.0.1:{port}/healthz").is_success
-                    except httpx.HTTPError:
-                        return False
+                except httpx.HTTPError:
+                    return False
 
-                wait(healthy)
+            wait(healthy)
+            settings = Settings.load(config)
+            relay_socket = socket_path(settings, settings.connection("binance"))
+            wait(relay_socket.exists)
+            assert relay_socket.stat().st_mode & 0o777 == 0o600
+            assert relay_socket.parent.stat().st_mode & 0o777 == 0o700
+            # An unrelated process with the same UID cannot impersonate foliod.
+            with socket.socket(socket.AF_UNIX) as intruder:
+                intruder.settimeout(5)
+                intruder.connect(str(relay_socket))
+                assert intruder.recv(1024) == b""
             job = call("sync", "binance", "--detach")
             first = wait(lambda: request({"method": "pending"})["interactions"])[0]
             assert first["recipient"]["label"] == "Configured Binance API fixture"
@@ -142,7 +164,7 @@ cwd = {json.dumps(str(tmp_path))}
             wait(lambda: call("job", job["id"])["state"] == "failed")
             assert call("read", "binance", "balances")["snapshot"] is None
             assert not request({"method": "pending"})["interactions"]
-            request({"method": "retry_adapter", "adapter": "binance"})
+            rejected = call("sync", "binance", "--detach")
             second = wait(lambda: request({"method": "pending"})["interactions"])[0]
             request(
                 {
@@ -151,13 +173,13 @@ cwd = {json.dumps(str(tmp_path))}
                     "values": {"api_key": "WrongFixtureApiKey123", signing_field: signing_value},
                 }
             )
-            wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "unavailable")
+            wait(lambda: call("job", rejected["id"])["state"] == "failed")
             failed = call("connections")[0]
             assert failed["error_code"] == "login_required"
             assert "spot account (/api/v3/account, HTTP 401, code -2015)" in failed["error"]
             assert KEY not in failed["error"] and SECRET not in failed["error"]
             assert call("read", "binance", "positions")["snapshot"] is None
-            request({"method": "retry_adapter", "adapter": "binance"})
+            successful = call("sync", "binance", "--detach")
             third = wait(lambda: request({"method": "pending"})["interactions"])[0]
             assert len({c["challenge_id"] for c in (first, second, third)}) == 3
             request(
@@ -178,7 +200,7 @@ cwd = {json.dumps(str(tmp_path))}
                         "values": {"private_key_passphrase": "FixtureKeyPassphrase"},
                     }
                 )
-            wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "ready")
+            wait(lambda: call("job", successful["id"])["state"] == "completed")
             positions = call("read", "binance", "positions")
             assert len(positions["items"]) == 4
             assert positions["snapshot"]["complete"]
@@ -190,11 +212,30 @@ cwd = {json.dumps(str(tmp_path))}
             assert not request({"method": "pending"})["interactions"]
             zond.terminate()
             zond.wait(timeout=10)
+            independent = call("sync", "binance", "--detach")
+            wait(lambda: call("job", independent["id"])["state"] == "completed")
+            positions = call("read", "binance", "positions")
+            # Zond owns authentication only; restarting it does not discard Folio's valid keys.
             zond = subprocess.Popen(
                 [ZONDD, "serve", "--config", str(zond_config)], stdout=log, stderr=log
             )
-            # The prior snapshot remains readable; the restarted adapter must ask for keys again.
-            call("sync", "binance", "--detach")
+            folio.terminate()
+            folio.wait(timeout=15)
+            folio = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("binance_zond_fixture.py")),
+                    "--daemon",
+                    "--config",
+                    str(config),
+                ],
+                stdout=log,
+                stderr=log,
+                cwd=tmp_path,
+            )
+            wait(healthy)
+            # A Folio restart drops its in-memory keys; missing local fields now need Zond again.
+            restarted_job = call("sync", "binance", "--detach")
 
             def restarted_form():
                 try:
@@ -205,17 +246,37 @@ cwd = {json.dumps(str(tmp_path))}
             fourth = wait(restarted_form)[0]
             assert fourth["challenge_id"] != third["challenge_id"]
             assert call("read", "binance", "positions")["items"] == positions["items"]
-            request(
-                {
-                    "method": "answer_interaction",
-                    "challenge_id": fourth["challenge_id"],
-                    "values": None,
-                }
-            )
-            wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "unavailable")
+            if key_type == "hmac":
+                # Stopping the standalone service withdraws the still-pending form.
+                folio.terminate()
+                folio.wait(timeout=15)
+                wait(lambda: not request({"method": "pending"})["interactions"])
+                assert Store(tmp_path / "state").job(restarted_job["id"])["state"] == "failed"
+                folio = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).with_name("binance_zond_fixture.py")),
+                        "--daemon",
+                        "--config",
+                        str(config),
+                    ],
+                    stdout=log,
+                    stderr=log,
+                    cwd=tmp_path,
+                )
+                wait(healthy)
+            else:
+                request(
+                    {
+                        "method": "answer_interaction",
+                        "challenge_id": fourth["challenge_id"],
+                        "values": None,
+                    }
+                )
+            wait(lambda: call("job", restarted_job["id"])["state"] == "failed")
             env_file = tmp_path / ".env.local"
             env_file.write_text(f"BINANCE_API_KEY={KEY}\n")
-            request({"method": "retry_adapter", "adapter": "binance"})
+            partial = call("sync", "binance", "--detach")
             fifth = wait(restarted_form)[0]
             assert [f["id"] for f in fifth["fields"]] == [signing_field]
             assert KEY not in json.dumps(fifth)
@@ -226,18 +287,41 @@ cwd = {json.dumps(str(tmp_path))}
                     "values": {signing_field: signing_value},
                 }
             )
-            wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "ready")
+            wait(lambda: call("job", partial["id"])["state"] == "completed")
             zond.terminate()
             zond.wait(timeout=10)
             env_file.write_text(
                 f"BINANCE_API_KEY={KEY}\nBINANCE_{signing_field.upper()}={signing_value}\n"
             )
-            zond = subprocess.Popen(
-                [ZONDD, "serve", "--config", str(zond_config)], stdout=log, stderr=log
+            (tmp_path / "forbid-zond").touch()
+            folio.terminate()
+            folio.wait(timeout=15)
+            folio = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("binance_zond_fixture.py")),
+                    "--daemon",
+                    "--config",
+                    str(config),
+                ],
+                stdout=log,
+                stderr=log,
+                cwd=tmp_path,
             )
+            wait(healthy)
             from_file = call("sync", "binance", "--detach")
             wait(lambda: call("job", from_file["id"])["state"] == "completed")
-            assert not request({"method": "pending"})["interactions"]
+            detail = subprocess.run(
+                [*cli, "job", from_file["id"], "--verbose"], capture_output=True, check=True
+            )
+            assert json.loads(detail.stdout)["state"] == "completed"
+            assert b"request_started" in detail.stderr and b"request_finished" in detail.stderr
+            assert KEY.encode() not in detail.stderr and SECRET.encode() not in detail.stderr
+            history = subprocess.run(
+                [*cli, "logs", "binance", "--job", from_file["id"]], capture_output=True, check=True
+            )
+            assert b"https://api.binance.com/api/v3/account" in history.stdout
+            assert b"status=200" in history.stdout and b"duration_ms=" in history.stdout
             refreshed = call("read", "binance", "positions")["items"]
             assert [{k: v for k, v in row.items() if k != "observed_at"} for row in refreshed] == [
                 {k: v for k, v in row.items() if k != "observed_at"} for row in positions["items"]

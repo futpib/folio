@@ -60,6 +60,12 @@ class Store:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS one_sync_per_connection
                     ON jobs(connection) WHERE state IN ('queued', 'running');
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, connection TEXT NOT NULL,
+                    provider TEXT NOT NULL, job TEXT, created REAL NOT NULL,
+                    event TEXT NOT NULL, fields TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS logs_connection ON logs(connection, id);
                 CREATE TABLE IF NOT EXISTS snapshots (
                     connection TEXT NOT NULL, resource TEXT NOT NULL, synced REAL NOT NULL,
                     complete INTEGER NOT NULL, coverage TEXT NOT NULL,
@@ -121,6 +127,41 @@ class Store:
                 )
             ]
             return row
+
+    def append_log(self, connection, job, event, fields):
+        created = time.time()
+        with self.db() as db:
+            cursor = db.execute(
+                "INSERT INTO logs(connection,provider,job,created,event,fields) "
+                "VALUES(?,?,?,?,?,?)",
+                (connection.id, connection.provider, job, created, event, json.dumps(fields)),
+            )
+            ident = cursor.lastrowid
+            # Bound retention without deleting jobs, snapshots or account records.
+            db.execute(
+                "DELETE FROM logs WHERE connection=? AND id < (SELECT id FROM logs "
+                "WHERE connection=? ORDER BY id DESC LIMIT 1 OFFSET 9999)",
+                (connection.id, connection.id),
+            )
+        return {
+            "id": ident,
+            "connection": connection.id,
+            "provider": connection.provider,
+            "job": job,
+            "created": created,
+            "event": event,
+            "fields": fields,
+        }
+
+    def logs(self, connection, *, after=0, limit=1000, job=None):
+        with self.db() as db:
+            result = db.execute(
+                "SELECT * FROM logs WHERE connection=? AND id>? AND (? IS NULL OR job=?) "
+                "ORDER BY id LIMIT ?",
+                (connection, after, job, job, limit),
+            ).fetchall()
+        items = [{**dict(row), "fields": json.loads(row["fields"])} for row in result]
+        return {"items": items, "next_after": items[-1]["id"] if items else after}
 
     def queue(self, connection: str, since: str | None) -> dict[str, Any]:
         with self.db() as db:

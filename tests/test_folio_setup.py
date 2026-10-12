@@ -28,9 +28,9 @@ def test_setup_preserves_ibkr_config_and_builds_fixed_adapter_commands(tmp_path)
     assert result.startswith(zond)
     adapters = tomllib.loads(result)["credential_adapters"]
     assert set(adapters) == {"folio-bog", "folio-wolt"}
-    assert adapters["folio-bog"]["args"] == ["--config", str(config), "browser-adapter", "bog"]
+    assert adapters["folio-bog"]["args"][-2:] == ["credential-relay", "bog"]
     assert setup.adapter_config(result, config, parsed["connections"]) == result
-    with pytest.raises(ValueError, match="differs"):
+    with pytest.raises(ValueError, match="custom"):
         setup.adapter_config(
             result.replace("Folio bog", "Custom bank"), config, parsed["connections"]
         )
@@ -46,7 +46,7 @@ def test_setup_selects_api_adapter_for_binance(tmp_path):
         {"binance": {"provider": "binance", "credential_adapter": True}},
     )
     item = tomllib.loads(result)["credential_adapters"]["folio-binance"]
-    assert item["args"][-2:] == ["api-adapter", "binance"]
+    assert item["args"][-2:] == ["credential-relay", "binance"]
 
 
 def test_missing_chromium_keeps_default_toml_valid(tmp_path):

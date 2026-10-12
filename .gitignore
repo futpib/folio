@@ -9,3 +9,4 @@ build/
 .coverage
 htmlcov/
 config.toml
+.env.local

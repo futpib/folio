@@ -1,4 +1,4 @@
-"""Fixed Binance read endpoints. Keys belong only to the zond adapter process."""
+"""Fixed Binance read endpoints with local credentials and Zond fallback."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .config import BinanceSettings, Connection
+from .credentials import CredentialFileError, read_credentials
 from .models import ConnectorError, LoginRequired, RateLimited, Record, SchemaChanged, Snapshot
 
 DAY = 86_400_000
@@ -62,7 +63,7 @@ class Credentials:
             or not values[k].isalnum()
             for k in ("api_key", "api_secret")
         ):
-            raise LoginRequired("Enter a Binance HMAC API key and secret in zond.")
+            raise LoginRequired("Set a valid Binance HMAC key and secret in .env.local or Zond.")
         return cls(values["api_key"], values["api_secret"])
 
 
@@ -253,11 +254,14 @@ def income_record(market, row):
 
 
 class BinanceConnector:
-    def __init__(self, connection: Connection, broker=None, *, transport=None, pace=1.0):
+    def __init__(
+        self, connection: Connection, broker=None, *, transport=None, pace=1.0, env_file=None
+    ):
         self.connection, self.broker = connection, broker
         self.options = connection.binance or BinanceSettings()
         self.transport, self.pace = transport, pace
         self.credentials = None
+        self.env_file = env_file
         self.clocks = {}
         self.last_request = 0.0
 
@@ -301,7 +305,8 @@ class BinanceConnector:
                 if response.status_code == 401 or code in {-2014, -2015, -1022}:
                     self.credentials = None
                     raise LoginRequired(
-                        "Binance rejected the API key, signature or permissions. Retry in zond."
+                        "Binance rejected the API key, signature or permissions. "
+                        "Correct any values in .env.local, then retry in Zond."
                     )
                 if code == -1021:
                     raise ConnectorError(
@@ -430,27 +435,47 @@ class BinanceConnector:
         outcome = "failed"
         try:
             if self.credentials is None:
-                if self.broker is None:
-                    raise LoginRequired("Start the Binance API credential adapter through zond.")
-                challenge = await self.broker.challenge(
-                    "Binance HMAC API",
-                    [
+                try:
+                    values = read_credentials("binance", self.env_file)
+                except CredentialFileError as error:
+                    raise LoginRequired(str(error)) from None
+                try:
+                    fields = [
                         {"id": "api_key", "label": "API key", "kind": "secret"},
                         {"id": "api_secret", "label": "HMAC secret key", "kind": "secret"},
-                    ],
-                    ", ".join(ORIGINS[m] for m in dict.fromkeys(("spot", *self.options.markets))),
-                )
-                answer = await self.broker.receive()
-                if answer.get("type") != "answered" or answer.get("challenge_id") != challenge:
-                    raise RuntimeError("unexpected credential response")
-                values = answer.pop("values", None)
-                answered = values is not None
-                if not answered:
-                    resolved = True
-                    raise LoginRequired(
-                        "Binance API credentials were declined or expired; retry in zond."
-                    )
-                try:
+                    ]
+                    missing = [field for field in fields if field["id"] not in values]
+                    if missing:
+                        if self.broker is None:
+                            raise LoginRequired(
+                                "Start the Binance API credential adapter through zond."
+                            )
+                        challenge = await self.broker.challenge(
+                            "Binance HMAC API",
+                            missing,
+                            ", ".join(
+                                ORIGINS[m] for m in dict.fromkeys(("spot", *self.options.markets))
+                            ),
+                        )
+                        answer = await self.broker.receive()
+                        if (
+                            answer.get("type") != "answered"
+                            or answer.get("challenge_id") != challenge
+                        ):
+                            raise RuntimeError("unexpected credential response")
+                        supplied = answer.pop("values", None)
+                        answered = supplied is not None
+                        if not answered:
+                            resolved = True
+                            raise LoginRequired(
+                                "Binance API credentials were declined or expired; retry in zond."
+                            )
+                        try:
+                            values.update(
+                                {field["id"]: supplied.get(field["id"]) for field in missing}
+                            )
+                        finally:
+                            supplied.clear()
                     self.credentials = Credentials.from_values(values)
                 finally:
                     values.clear()

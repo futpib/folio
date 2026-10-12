@@ -170,6 +170,12 @@ def main():
         original_exec = os.execv
 
         def patched_exec(executable, command):
+            command = [
+                f"-Dfolio.credentials.file={base / '.env.local'}"
+                if arg.startswith("-Dfolio.credentials.file=")
+                else arg
+                for arg in command
+            ]
             index = next(i for i, arg in enumerate(command) if arg.startswith("-javaagent:"))
             command.insert(index, f"-javaagent:{HERE.parent}/build/authentication-patch.jar={base}")
             original_exec(executable, command)

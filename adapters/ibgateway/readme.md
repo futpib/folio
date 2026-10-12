@@ -5,7 +5,9 @@ This optional integration belongs to `ibkr-tws-http` and uses zondd's generic
 It runs separately from the HTTP server; the server never receives credentials.
 The adapter starts IB Gateway on a private Xvfb display. A Java agent
 observes Gateway's Swing login controls, selects IB API and the configured
-paper/live mode, and asks zondd for username/password. Android shows the
+paper/live mode, reads `IBKR_USERNAME` and `IBKR_PASSWORD` from the checkout's
+untracked `.env.local`, and asks zondd only for missing values. If the file is
+absent, both fields are requested. Android shows the
 configured recipient separately from the application's prompt. Credentials are
 supplied to the original login controls only after checking that they still
 belong to the same window. No coordinates, screenshots, or VNC are needed.
@@ -82,7 +84,12 @@ credentials, and approve the IBKR Mobile request when it arrives. Decline or
 expiry leaves the login waiting without repeatedly prompting. Use the Retry
 button or `zondctl retry-adapter ibkr` to request another form. Failed attempts
 also require Retry, avoiding a credential retry loop. No password is saved by
-the adapter. After reauthentication is required, a new form is generated.
+the adapter. At each reauthentication it rereads `.env.local`; a form is generated
+only for missing values. Zond answers are not written back to the file. See the
+[local credential format](../../docs/folio.md#local-credentials-and-zond-fallback).
+`--env-file PATH` selects a different credential file. The launcher passes only
+its path to Java; credentials travel over a private pipe, not arguments or
+process environment variables.
 
 The adapter recognizes the English Gateway login UI (the launcher selects
 English), including the current `IBKR Gateway` window. Unknown UI layouts are
@@ -100,7 +107,8 @@ is one authentication flow for the Gateway session, independent of HTTP clients.
 Gateway's own Auto Restart settings control token-preserving daily restarts.
 This adapter does not configure those settings or guarantee token persistence
 across a process/service restart. Weekly and server-triggered reauthentication
-still require the user. Restarting zondd stops its managed adapter/Gateway group;
+uses the same local-file/Zond fallback and may require IBKR Mobile approval.
+Restarting zondd stops its managed adapter/Gateway group;
 the bundled systemd service cleans up descendants. Run the broker as a user
 service for lifecycle cleanup after a daemon crash.
 

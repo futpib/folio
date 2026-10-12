@@ -80,6 +80,8 @@ def test_startup_builds_missing_and_changed_sources_without_stale_classes(checko
         assert "Removed.class" not in built.namelist()
     assert len(launches) == 2
     assert f"-javaagent:{jar}=paper:14002" in launches[-1]
+    assert f"-Dfolio.credentials.file={adapter.parents[1] / '.env.local'}" in launches[-1]
+    assert f"-Dfolio.credentials.python={sys.executable}" in launches[-1]
     assert not list(jar.parent.glob(".agent-*"))
 
 

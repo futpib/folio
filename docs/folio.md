@@ -18,7 +18,8 @@ remain supported.
 - **Binance:** Spot balances and per-symbol trades; USD-M and optional COIN-M
   Futures balances, open positions, trades, and income including funding fees,
   commissions and realized P&L. Uses signed REST API reads with HMAC credentials
-  entered through Zond. See [Binance setup](#binance-spot-and-futures).
+  read from `.env.local` or requested through Zond when missing.
+  See [Binance setup](#binance-spot-and-futures).
 - **Bank of Georgia personal banking:** browser collection of accounts,
   per-currency balances, and transactions in the internet banking page's date range.
 - **Wolt customer accounts:** paginated order history with merchant, status,
@@ -91,7 +92,8 @@ existing Folio config, first set `credential_adapter = true` on each browser
 connection. These connections are processed by the configured adapter, not the
 HTTP daemon. Both services must be running.
 
-A sync that encounters a recognized password/email or one-time-code form opens
+A sync that encounters a recognized password/email form first reads local
+credentials as described below. Missing values and one-time codes open
 an application-input request in zond. Answers use its private adapter channel,
 are filled only on the provider's allowed origin, and are never stored in the
 Folio database or logs. Each credential step is submitted at most once per sync.
@@ -100,6 +102,50 @@ adapter Retry action explicitly starts a new attempt. CAPTCHA, QR, magic-link,
 or otherwise unfamiliar flows require `folio login` and a subsequent sync.
 The account session itself can have broader authority than Folio's public API;
 the configured adapter executable and its Chromium profile must be trusted.
+
+## Local credentials and Zond fallback
+
+Put credentials in `.env.local` at the **root of this Folio checkout**, alongside
+`pyproject.toml`. This path does not depend on the shell or service's working
+directory. The file is ignored by Git. [`.env.local.example`](../.env.local.example)
+lists the supported names:
+
+```dotenv
+BINANCE_API_KEY=
+BINANCE_API_SECRET=
+BOG_USERNAME=
+BOG_PASSWORD=
+WOLT_EMAIL=
+WOLT_USERNAME=
+WOLT_PASSWORD=
+IBKR_USERNAME=
+IBKR_PASSWORD=
+```
+
+Fill in the values you want to keep locally; leave the others blank or omit them.
+If the file is absent, login uses Zond. If only some required values are present,
+Zond asks **only for the missing fields**. Configure browser connections with
+`credential_adapter = true` and run `scripts/setup-folio.py --zond` for this fallback.
+IBKR uses its separate Gateway adapter. One-time codes remain interactive, and
+IBKR Mobile approval still happens in IBKR Mobile. Wolt uses `WOLT_EMAIL` for its
+email form and username/password values only if those controls appear.
+
+Use one `NAME=value` per line; single or double quotes, `export`, and trailing
+comments are supported. Quote passwords containing spaces or `#`. Values are
+literal: `$variables`, `${expressions}`, and shell commands are never expanded.
+Inside quotes, backslash escapes the matching quote or another backslash.
+The file is read directly, without exporting secrets to process environment
+variables. Each adapter receives only its provider's entries. Keep the file
+readable only by its owner, for example with `chmod 600 .env.local`.
+
+Zond answers stay in memory; Folio does not write them back to `.env.local`,
+SQLite, or logs. Browser and Gateway logins reread the file at each attempt.
+Binance caches valid keys in its worker until restart or authentication rejection;
+edit the file and restart the worker to replace valid cached keys immediately.
+After rejection, correct the file and retry: existing values are not replaced by
+a Zond prompt. Malformed or unreadable files fail explicitly without echoing
+their contents. These names are shared by connections using the same provider;
+separate accounts need separate installations/credential files.
 
 ## Binance Spot and Futures
 
@@ -129,7 +175,7 @@ Portfolio Margin and Earn/Funding wallets use different APIs and are not include
 uv run foliod --check
 python3 scripts/setup-folio.py --zond
 uv run folio sync binance
-# Complete the API key form in Zond, then read the stored results:
+# Complete any missing API key fields in Zond, then read the stored results:
 uv run folio read binance balances
 uv run folio read binance positions
 uv run folio read binance trades --since 2026-10-01
@@ -144,16 +190,18 @@ adapter mechanism and restart Folio after adding the connection.
 
 Create a **system-generated HMAC API key** in Binance API Management. Enable
 reading and use the minimum permissions necessary for the selected accounts;
-leave withdrawals and transfers disabled. Enter the key and HMAC secret only in
-Zond's two masked fields. Folio does not accept secrets in TOML, CLI arguments,
-environment variables or its HTTP API. RSA and Ed25519 keys are not supported by
+leave withdrawals and transfers disabled. Set `BINANCE_API_KEY` and
+`BINANCE_API_SECRET` in `.env.local`, or leave them absent to enter them in Zond's
+masked fields. Folio does not accept secrets in TOML, CLI arguments,
+process environment variables or its HTTP API. RSA and Ed25519 keys are not supported by
 this connector. The configured adapter sees the secrets and must be trusted.
 Folio exposes only the fixed read endpoints listed below, even when a supplied
 key has broader account permissions.
 
 Keys are held in the adapter's memory and reused until it stops or Binance
-rejects authentication. They are not stored in SQLite or a credential file.
-After restart, the next sync asks again. Decline, expiry or failure ends the job;
+rejects authentication. They are never copied into SQLite or written to a file.
+After restart, the next sync rereads `.env.local` and asks through Zond for any
+missing values. Decline, expiry or failure ends the job;
 Zond's Retry action starts a fresh attempt. Network failures retain valid in-memory
 keys. The Spot account endpoint is read even for Futures-only connections so its
 UID can bind the snapshot to an account; Spot account reading must be permitted.

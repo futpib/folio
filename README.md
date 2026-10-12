@@ -2,7 +2,7 @@
 
 Folio provides local, read-only access to IBKR, Binance Spot and Futures, Bank of
 Georgia personal banking, and Wolt customer order history. It adds named
-connections, durable sync jobs, a SQLite data store, API credentials through Zond,
+connections, durable sync jobs, a SQLite data store, local credentials with Zond fallback,
 and private Chromium sessions for browser providers.
 
 Start with the [Folio setup and usage guide](docs/folio.md). BoG and Wolt browser
@@ -150,7 +150,8 @@ using this option. After login, the adapter configures Gateway's API socket port
 to match the HTTP bridge, enables **Read-Only API**, and restricts connections to
 localhost when Gateway exposes that setting. It saves and reopens the settings
 to verify them before reporting ready. No manual API configuration is needed.
-Credentials are entered in the Android zond **Approvals** screen, followed by any
+Credentials come from the checkout's untracked `.env.local`; missing values are
+entered in the Android zond **Approvals** screen, followed by any
 IBKR Mobile approval. See the [adapter guide](adapters/ibgateway/readme.md) for login/retry,
 Gateway settings, and reauthentication details. The HTTP service receives no
 Gateway credentials and may run while login is pending.
@@ -342,8 +343,9 @@ client_id = 37
 reconnect_delay_seconds = 5
 ```
 
-When Gateway's login screen appears, the adapter submits one form for that
-Gateway session. Enter credentials in zond and complete any IBKR Mobile
+When Gateway's login screen appears, the adapter reads `IBKR_USERNAME` and
+`IBKR_PASSWORD` from the checkout's `.env.local` and requests any missing fields
+through zond. Complete any IBKR Mobile
 approval in IBKR Mobile. Once Gateway's API becomes ready, this service's
 existing supervisor reconnects automatically. During login, `ibkr-tws status`
 reports `tws_connected: false` and reads can return HTTP 503; retry those reads

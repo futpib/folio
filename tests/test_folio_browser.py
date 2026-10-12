@@ -65,6 +65,54 @@ def test_real_chromium_profile_pagination_and_limits(tmp_path):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("present", [False, True])
+def test_wolt_email_uses_file_or_requests_missing_value(tmp_path, present):
+    if present:
+        (tmp_path / ".env.local").write_text("WOLT_EMAIL=fixture@example.com\n")
+
+    class EmailBroker:
+        def __init__(self):
+            self.fields = []
+
+        async def challenge(self, provider, fields, page_origin):
+            assert provider == "wolt" and page_origin == "https://wolt.com"
+            self.fields = fields
+            return "email"
+
+        async def receive(self):
+            return {
+                "type": "answered",
+                "challenge_id": "email",
+                "values": {"email": "fixture@example.com"},
+            }
+
+        async def result(self, ident, result):
+            assert result == "succeeded"
+
+    async def run():
+        connection = Connection("wolt", "wolt")
+        settings = Settings(tmp_path, (connection,), chromium=shutil.which("chromium"))
+        async with browser(settings, connection) as context:
+
+            async def route(request):
+                await request.fulfill(
+                    content_type="text/html",
+                    body="""
+                    <form onsubmit="event.preventDefault();
+                    if(this.querySelector('input').value==='fixture@example.com')this.remove()">
+                    <input type="email"><button type="submit">Continue</button></form>""",
+                )
+
+            await context.route("**/*", route)
+            page = await context.new_page()
+            await page.goto("https://wolt.com/login")
+            broker = EmailBroker()
+            assert await authenticate(page, "wolt", broker)
+            assert [f["id"] for f in broker.fields] == ([] if present else ["email"])
+
+    asyncio.run(run())
+
+
 def test_real_chromium_bog_accounts_and_cursor_pagination(tmp_path):
     async def run():
         connection = Connection("bog", "bog", max_pages=3)
@@ -157,7 +205,17 @@ class FixtureBroker:
         self.results.append(result)
 
 
-def test_real_chromium_login_fills_only_trusted_origin(tmp_path):
+@pytest.mark.parametrize("present", [(), ("username",), ("password",), ("username", "password")])
+def test_real_chromium_login_fills_only_trusted_origin(tmp_path, present):
+    values = {"username": "local-user", "password": "local-password"}
+    (tmp_path / ".env.local").write_text(
+        "".join(f"BOG_{name.upper()}={values[name]}\n" for name in present)
+    )
+    expected = {
+        "username": "local-user" if "username" in present else "fixture",
+        "password": "local-password" if "password" in present else "private-answer",
+    }
+
     async def run():
         connection = Connection("bog", "bog")
         settings = Settings(tmp_path, (connection,), chromium=shutil.which("chromium"))
@@ -167,7 +225,9 @@ def test_real_chromium_login_fills_only_trusted_origin(tmp_path):
                 await request.fulfill(
                     content_type="text/html",
                     body="""
-                    <form onsubmit="event.preventDefault();this.remove()">
+                    <form onsubmit="event.preventDefault();window.filled={
+                        username:this.querySelector('[name=username]').value,
+                        password:this.querySelector('[type=password]').value};this.remove()">
                     <input name="username"><input type="password">
                     <button type="submit">Log in</button></form>""",
                 )
@@ -180,7 +240,11 @@ def test_real_chromium_login_fills_only_trusted_origin(tmp_path):
             assert not broker.fields
             await page.goto("https://account.bog.ge/login")
             assert await authenticate(page, "bog", broker)
-            assert broker.results == ["succeeded"]
+            assert await page.evaluate("window.filled") == expected
+            assert [f["id"] for f in broker.fields] == [
+                name for name in values if name not in present
+            ]
+            assert broker.results == (["succeeded"] if len(present) < 2 else [])
             assert "private-answer" not in json.dumps(broker.fields)
 
     asyncio.run(run())

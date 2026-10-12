@@ -171,6 +171,7 @@ class Broker:
 
     async def challenge(self, provider, fields, origin):
         self.challenges += 1
+        self.fields = fields
         assert all(f["kind"] == "secret" for f in fields)
         assert "https://api.binance.com" in origin
         return "challenge"
@@ -193,6 +194,45 @@ def test_credentials_use_broker_once_and_are_reused_only_in_memory():
     with pytest.raises(LoginRequired, match="declined"):
         asyncio.run(declined.sync(None))
     assert declined.credentials is None and declined.broker.results == []
+
+
+@pytest.mark.parametrize("present", [(), ("api_key",), ("api_secret",), ("api_key", "api_secret")])
+def test_env_credentials_prompt_only_for_missing_fields(tmp_path, present):
+    expected = {"api_key": KEY, "api_secret": SECRET}
+    path = tmp_path / ".env.local"
+    if present:
+        path.write_text("".join(f"BINANCE_{name.upper()}={expected[name]}\n" for name in present))
+    broker = Broker({name: value for name, value in expected.items() if name not in present})
+    worker = connector(Api(), broker=broker)
+    assert asyncio.run(worker.sync(None)).account_identity == "binance:42"
+    assert broker.challenges == (len(present) < 2)
+    if broker.challenges:
+        assert [f["id"] for f in broker.fields] == [
+            name for name in expected if name not in present
+        ]
+        assert KEY not in json.dumps(broker.fields) and SECRET not in json.dumps(broker.fields)
+    assert (
+        not path.exists()
+        if not present
+        else all(
+            f"BINANCE_{name.upper()}" not in path.read_text()
+            for name in expected
+            if name not in present
+        )
+    )
+
+
+def test_rejected_file_credentials_are_reread_without_prompting(tmp_path):
+    path = tmp_path / ".env.local"
+    path.write_text(f"BINANCE_API_KEY=WrongFixtureApiKey123\nBINANCE_API_SECRET={SECRET}\n")
+    broker = Broker(None)
+    worker = connector(Api(), broker=broker)
+    with pytest.raises(LoginRequired):
+        asyncio.run(worker.sync(None))
+    assert worker.credentials is None and broker.challenges == 0
+    path.write_text(f"BINANCE_API_KEY={KEY}\nBINANCE_API_SECRET={SECRET}\n")
+    assert asyncio.run(worker.sync(None)).account_identity == "binance:42"
+    assert broker.challenges == 0
 
 
 def test_config_and_api_expose_only_fixed_reads(tmp_path):

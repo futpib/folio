@@ -25,7 +25,7 @@ max_pages = 100
 # For browser login through zond, set credential_adapter = true on each browser
 # connection and run scripts/setup-folio.py --zond. Otherwise use folio login.
 
-# Binance uses its REST API, with HMAC keys entered privately through Zond.
+# Binance uses its REST API, with HMAC keys from .env.local and Zond for missing values.
 # Uncomment and select the markets and trade symbols you use. Empty symbol
 # lists skip trade history; Futures income is collected across all symbols.
 # [connections.binance]

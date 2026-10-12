@@ -145,49 +145,79 @@ public final class LoginAgent {
     }
 
     private static void result(String id, String outcome) throws Exception {
+        if (id == null) return;
         send(JSON.createObjectNode().put("method", "result").put("challenge_id", id).put("outcome", outcome));
         receive("recorded");
+    }
+
+    private static ObjectNode localCredentials() throws Exception {
+        String file = System.getProperty("folio.credentials.file");
+        if (file == null) return JSON.createObjectNode();
+        Process reader = new ProcessBuilder(System.getProperty("folio.credentials.python", "python3"),
+            System.getProperty("folio.credentials.reader"), file)
+            .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+        try {
+            reader.getOutputStream().close();
+            byte[] data = reader.getInputStream().readNBytes(65537);
+            try {
+                if (!reader.waitFor(10, TimeUnit.SECONDS) || reader.exitValue() != 0 || data.length > 65536)
+                    throw new IOException("cannot read local credentials");
+                return (ObjectNode)JSON.readTree(data);
+            } finally { Arrays.fill(data, (byte)0); }
+        } finally { reader.destroyForcibly(); }
     }
 
     private static void authenticate(Login target) {
         String id = null;
         boolean answered = false;
+        ObjectNode values = null;
         try {
+            values = localCredentials();
             ObjectNode request = JSON.createObjectNode().put("method", "challenge")
                 .put("prompt", "Sign in to IB Gateway (" + mode + "). Approve IBKR Mobile authentication when prompted.");
-            request.putArray("fields")
-                .add(JSON.createObjectNode().put("id", "username").put("label", "IBKR username").put("kind", "text"))
-                .add(JSON.createObjectNode().put("id", "password").put("label", "IBKR password").put("kind", "secret"));
+            var fields = request.putArray("fields");
+            if (!values.hasNonNull("username")) fields.add(JSON.createObjectNode().put("id", "username").put("label", "IBKR username").put("kind", "text"));
+            if (!values.hasNonNull("password")) fields.add(JSON.createObjectNode().put("id", "password").put("label", "IBKR password").put("kind", "secret"));
             request.putObject("context").put("application", "IB Gateway").put("mode", mode)
                 .put("api_port", apiPort).put("read_only_api", true);
-            send(request);
-            id = receive("opened").path("challenge_id").asText();
-            JsonNode answer;
-            boolean withdrawing = false;
-            while (true) {
-                answer = replies.poll(500, TimeUnit.MILLISECONDS);
-                if (answer != null && answer.path("type").asText().equals("answered")) break;
-                if (!withdrawing && (login == null || login.window() != target.window())) {
-                    send(JSON.createObjectNode().put("method", "withdraw").put("challenge_id", id));
-                    withdrawing = true;
+            if (!fields.isEmpty()) {
+                send(request);
+                id = receive("opened").path("challenge_id").asText();
+                JsonNode answer;
+                boolean withdrawing = false;
+                while (true) {
+                    answer = replies.poll(500, TimeUnit.MILLISECONDS);
+                    if (answer != null && answer.path("type").asText().equals("answered")) break;
+                    if (!withdrawing && (login == null || login.window() != target.window())) {
+                        send(JSON.createObjectNode().put("method", "withdraw").put("challenge_id", id));
+                        withdrawing = true;
+                    }
                 }
-            }
-            JsonNode values = answer.path("values");
-            if (!values.isObject()) { suppressed = target.window(); return; }
-            answered = true;
-            if (withdrawing || login == null || login.window() != target.window()) {
-                result(id, "cancelled"); return;
+                if (!id.equals(answer.path("challenge_id").asText())) throw new IOException("unexpected answer");
+                JsonNode supplied = answer.path("values");
+                if (!supplied.isObject()) { suppressed = target.window(); return; }
+                answered = true;
+                try {
+                    if (withdrawing || login == null || login.window() != target.window()) {
+                        result(id, "cancelled"); return;
+                    }
+                    for (JsonNode field : fields) {
+                        String name = field.path("id").asText();
+                        values.put(name, supplied.path(name).asText());
+                    }
+                } finally { ((ObjectNode)supplied).removeAll(); }
             }
             // Re-check the exact controls on the EDT before delivering any secrets.
             boolean[] submitted = {false};
+            ObjectNode credentials = values;
             SwingUtilities.invokeAndWait(() -> {
                 Login current = findLogin();
                 if (current == null || current.window() != target.window() || current.password() != target.password()) return;
-                current.username().setText(values.path("username").asText());
-                current.password().setText(values.path("password").asText());
+                current.username().setText(credentials.path("username").asText());
+                current.password().setText(credentials.path("password").asText());
                 if (current.submit().isEnabled()) { current.submit().doClick(); submitted[0] = true; }
             });
-            ((ObjectNode)values).removeAll();
+            values.removeAll();
             if (!submitted[0]) { result(id, "failed"); setStatus("failed"); suppressed = target.window(); return; }
             setStatus("working");
             long deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(5);
@@ -204,6 +234,7 @@ public final class LoginAgent {
             try { setStatus("failed"); } catch (Exception ignoredAgain) {}
             suppressed = target.window();
         } finally {
+            if (values != null) values.removeAll();
             SwingUtilities.invokeLater(() -> target.password().setText(""));
             busy = false;
         }

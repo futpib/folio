@@ -12,6 +12,7 @@ from playwright.async_api import TimeoutError as BrowserTimeout
 from playwright.async_api import async_playwright
 
 from .config import Connection, Settings
+from .credentials import CredentialFileError, read_credentials
 from .models import ConnectorError, LoginRequired, RateLimited, SchemaChanged
 from .providers import (
     LOGIN_ORIGINS,
@@ -67,9 +68,7 @@ async def browser(settings: Settings, connection: Connection, *, headed=False):
         ) from None
 
 
-async def authenticate(page, provider, broker, attempted=None) -> bool:
-    if broker is None:
-        return False
+async def authenticate(page, provider, broker, attempted=None, *, env_file=None) -> bool:
     attempted = attempted if attempted is not None else set()
     # Only recognized login forms on provider-owned origins can receive answers.
     for frame in page.frames:
@@ -103,38 +102,57 @@ async def authenticate(page, provider, broker, attempted=None) -> bool:
         kind = fields[-1]["id"]
         if kind in attempted:
             return False
+        try:
+            local = read_credentials(provider, env_file)
+        except CredentialFileError as error:
+            raise LoginRequired(str(error)) from None
+        values = {field["id"]: local[field["id"]] for field in fields if field["id"] in local}
+        local.clear()
+        missing = [field for field in fields if field["id"] not in values]
+        if missing and broker is None:
+            values.clear()
+            return False
         attempted.add(kind)
         elements = [await locator.element_handle() for locator in locators]
         submit_element = await submit.element_handle()
         page_url = frame.url
-        ident = await broker.challenge(provider, fields, page_origin)
-        answer_task = asyncio.create_task(broker.receive())
+        ident = None
+        answer_task = None
         delivered = False
         resolved = False
         try:
-            while not answer_task.done():
-                await asyncio.wait({answer_task}, timeout=1)
-                if frame.url != page_url or not all(
-                    [await locator.is_visible() for locator in locators]
-                ):
-                    if answer_task.done():
-                        delivered = bool(answer_task.result().get("values"))
-                        if delivered:
-                            await broker.result(ident, "cancelled")
-                    else:
-                        answer_task.cancel()
-                        await asyncio.gather(answer_task, return_exceptions=True)
-                        await broker.withdraw(ident)
+            if missing:
+                ident = await broker.challenge(provider, missing, page_origin)
+                answer_task = asyncio.create_task(broker.receive())
+                while not answer_task.done():
+                    await asyncio.wait({answer_task}, timeout=1)
+                    if frame.url != page_url or not all(
+                        [await locator.is_visible() for locator in locators]
+                    ):
+                        if answer_task.done():
+                            supplied = answer_task.result().get("values")
+                            delivered = bool(supplied)
+                            if delivered:
+                                supplied.clear()
+                                await broker.result(ident, "cancelled")
+                        else:
+                            answer_task.cancel()
+                            await asyncio.gather(answer_task, return_exceptions=True)
+                            await broker.withdraw(ident)
+                        resolved = True
+                        return False
+                answer = answer_task.result()
+                if answer.get("challenge_id") != ident or answer.get("type") != "answered":
+                    raise RuntimeError("unexpected credential response")
+                supplied = answer.pop("values", None)
+                delivered = bool(supplied)
+                if not supplied:
                     resolved = True
                     return False
-            answer = answer_task.result()
-            if answer.get("challenge_id") != ident or answer.get("type") != "answered":
-                raise RuntimeError("unexpected credential response")
-            values = answer.get("values")
-            delivered = bool(values)
-            if not values:
-                resolved = True
-                return False
+                try:
+                    values.update({field["id"]: supplied[field["id"]] for field in missing})
+                finally:
+                    supplied.clear()
             # Recipient validation and filling happen in one browser task, using the
             # original elements. Navigation cannot retarget a waiting locator to a new form.
             try:
@@ -170,11 +188,13 @@ async def authenticate(page, provider, broker, attempted=None) -> bool:
                 values.clear()
             await page.wait_for_timeout(2000)
             success = not await locators[-1].is_visible()
-            await broker.result(ident, "succeeded" if success else "failed")
+            if ident:
+                await broker.result(ident, "succeeded" if success else "failed")
             resolved = True
             return success
         finally:
-            if not resolved:
+            values.clear()
+            if ident and not resolved:
                 if not answer_task.done():
                     answer_task.cancel()
                     await asyncio.gather(answer_task, return_exceptions=True)
@@ -185,8 +205,9 @@ async def authenticate(page, provider, broker, attempted=None) -> bool:
 
 
 class BrowserConnector:
-    def __init__(self, settings: Settings, connection: Connection, broker=None):
+    def __init__(self, settings: Settings, connection: Connection, broker=None, *, env_file=None):
         self.settings, self.connection, self.broker = settings, connection, broker
+        self.env_file = env_file
 
     async def sync(self, since: str | None):
         async with browser(self.settings, self.connection) as context:
@@ -219,11 +240,13 @@ class BrowserConnector:
                         payload = await self.response_json(response)
                         break
                     except (TimeoutError, LoginRequired):
-                        if provider == "wolt" and self.broker and stage == 0:
+                        if provider == "wolt" and stage == 0:
                             login = page.get_by_role("button", name="Log in", exact=True)
                             if await login.count() == 1:
                                 await login.click()
-                        if await authenticate(page, provider, self.broker, attempted):
+                        if await authenticate(
+                            page, provider, self.broker, attempted, env_file=self.env_file
+                        ):
                             continue
                         if attempted and not revisited:
                             revisited = True

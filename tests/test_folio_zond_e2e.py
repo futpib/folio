@@ -18,7 +18,16 @@ ZONDD = os.environ.get("FOLIO_TEST_ZONDD")
     not ZONDD or not shutil.which("chromium"),
     reason="set FOLIO_TEST_ZONDD and install Chromium for real zond E2E",
 )
-def test_real_zond_chromium_decline_retry_password_and_otp(tmp_path):
+@pytest.mark.parametrize("present", [(), ("username",), ("password",), ("username", "password")])
+def test_real_zond_chromium_decline_retry_password_and_otp(tmp_path, present):
+    expected = {"username": "fixture-user", "password": "folio-test-secret"}
+    if present:
+        (tmp_path / ".env.local").write_text(
+            "".join(f"BOG_{name.upper()}={expected[name]}\n" for name in present)
+        )
+    missing = {name: value for name, value in expected.items() if name not in present}
+    if not missing:
+        (tmp_path / "full-credentials").touch()
     fixture = Path(__file__).with_name("folio_zond_fixture.py")
     config = tmp_path / "zond.toml"
     config.write_text(f"""runtime_dir = {json.dumps(str(tmp_path / "run"))}
@@ -52,28 +61,31 @@ cwd = {json.dumps(str(tmp_path))}
             def challenge():
                 return wait(lambda: request({"method": "pending"})["interactions"])[0]
 
-            first = challenge()
-            assert first["recipient"]["label"] == "Configured Folio fixture"
-            assert [f["id"] for f in first["fields"]] == ["username", "password"]
-            request(
-                {
-                    "method": "answer_interaction",
-                    "challenge_id": first["challenge_id"],
-                    "values": None,
-                }
-            )
-            wait(lambda: (tmp_path / "declined").exists())
-            assert not request({"method": "pending"})["interactions"]
-            request({"method": "retry_adapter", "adapter": "folio"})
-            second = challenge()
-            assert first["challenge_id"] != second["challenge_id"]
-            request(
-                {
-                    "method": "answer_interaction",
-                    "challenge_id": second["challenge_id"],
-                    "values": {"username": "fixture-user", "password": "folio-test-secret"},
-                }
-            )
+            if missing:
+                first = challenge()
+                assert first["recipient"]["label"] == "Configured Folio fixture"
+                assert [f["id"] for f in first["fields"]] == list(missing)
+                assert "folio-test-secret" not in json.dumps(first)
+                request(
+                    {
+                        "method": "answer_interaction",
+                        "challenge_id": first["challenge_id"],
+                        "values": None,
+                    }
+                )
+                wait(lambda: (tmp_path / "declined").exists())
+                assert not request({"method": "pending"})["interactions"]
+                request({"method": "retry_adapter", "adapter": "folio"})
+                second = challenge()
+                assert first["challenge_id"] != second["challenge_id"]
+                assert [f["id"] for f in second["fields"]] == list(missing)
+                request(
+                    {
+                        "method": "answer_interaction",
+                        "challenge_id": second["challenge_id"],
+                        "values": missing,
+                    }
+                )
             third = challenge()
             assert [f["id"] for f in third["fields"]] == ["otp"]
             request(

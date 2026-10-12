@@ -161,6 +161,34 @@ cwd = {json.dumps(str(tmp_path))}
                     "values": None,
                 }
             )
+            wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "unavailable")
+            env_file = tmp_path / ".env.local"
+            env_file.write_text(f"BINANCE_API_KEY={KEY}\n")
+            request({"method": "retry_adapter", "adapter": "binance"})
+            fifth = wait(restarted_form)[0]
+            assert [f["id"] for f in fifth["fields"]] == ["api_secret"]
+            assert KEY not in json.dumps(fifth)
+            request(
+                {
+                    "method": "answer_interaction",
+                    "challenge_id": fifth["challenge_id"],
+                    "values": {"api_secret": SECRET},
+                }
+            )
+            wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "ready")
+            zond.terminate()
+            zond.wait(timeout=10)
+            env_file.write_text(f"BINANCE_API_KEY={KEY}\nBINANCE_API_SECRET={SECRET}\n")
+            zond = subprocess.Popen(
+                [ZONDD, "serve", "--config", str(zond_config)], stdout=log, stderr=log
+            )
+            from_file = call("sync", "binance", "--detach")
+            wait(lambda: call("job", from_file["id"])["state"] == "completed")
+            assert not request({"method": "pending"})["interactions"]
+            refreshed = call("read", "binance", "positions")["items"]
+            assert [{k: v for k, v in row.items() if k != "observed_at"} for row in refreshed] == [
+                {k: v for k, v in row.items() if k != "observed_at"} for row in positions["items"]
+            ]
         finally:
             for process in (folio, zond):
                 process.terminate()
@@ -168,6 +196,6 @@ cwd = {json.dumps(str(tmp_path))}
         log.seek(0)
         assert KEY not in log.read()
         for file in tmp_path.rglob("*"):
-            if file.is_file():
+            if file.is_file() and file != tmp_path / ".env.local":
                 content = file.read_bytes()
                 assert KEY.encode() not in content and SECRET.encode() not in content, file

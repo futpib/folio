@@ -84,6 +84,8 @@ def main():
             argv = [
                 "--settings-dir",
                 str(base / "settings"),
+                "--env-file",
+                str(base / ".env.local"),
                 "--mode",
                 "paper",
                 "--api-port",
@@ -96,6 +98,9 @@ def main():
                 "-e",
                 "/dev/null",
                 "/usr/bin/java",
+                f"-Dfolio.credentials.python={sys.executable}",
+                f"-Dfolio.credentials.reader={ADAPTER.parents[1] / 'src/folio/credentials.py'}",
+                f"-Dfolio.credentials.file={base / '.env.local'}",
                 f"-javaagent:{ADAPTER}/build/zond-ibgateway.jar=paper:{port}",
                 "-cp",
                 f"{ADAPTER}/build/test:/usr/share/ib-tws/jars/*",
@@ -175,7 +180,7 @@ cwd = {json.dumps(str(base))}
                         "no credentials submitted"
                     )
                     return
-                for current in [second, None]:
+                for index, current in enumerate([second, None]):
                     current = current or challenge()
                     if args.stub_auth:
                         wait_for(
@@ -206,7 +211,45 @@ cwd = {json.dumps(str(base))}
                     if args.stub_auth:
                         accounts = wait_for(lambda: control("accounts"), lambda r: r["code"] == 0)
                         assert "DU424242" in accounts["stdout"]
+                    if index == 0:
+                        (base / "reauth").touch()
+                # Re-read the same file at each login, requesting only absent fields.
+                for local in [
+                    {"username": "test-user"},
+                    {"password": "test-gateway-password"},
+                    {"username": "test-user", "password": "test-gateway-password"},
+                ]:
+                    (base / ".env.local").write_text(
+                        "".join(f"IBKR_{name.upper()}={value}\n" for name, value in local.items())
+                    )
+                    (base / "submitted").unlink(missing_ok=True)
                     (base / "reauth").touch()
+                    missing = {
+                        name: value
+                        for name, value in {
+                            "username": "test-user",
+                            "password": "test-gateway-password",
+                        }.items()
+                        if name not in local
+                    }
+                    if missing:
+                        current = challenge()
+                        assert [f["id"] for f in current["fields"]] == list(missing)
+                        assert "test-gateway-password" not in json.dumps(current)
+                        request(
+                            {
+                                "method": "answer_interaction",
+                                "challenge_id": current["challenge_id"],
+                                "values": missing,
+                            }
+                        )
+                    wait_for(lambda: (base / "submitted").exists(), bool)
+                    if args.stub_auth:
+                        control("accept-mfa")
+                    wait_for(pending, lambda q: q["adapters"][0]["state"] == "ready")
+                    assert not pending()["interactions"]
+                (base / ".env.local").unlink()
+                (base / "reauth").touch()
                 challenge()
                 (base / "hide").touch()
                 wait_for(pending, lambda q: not q["interactions"])

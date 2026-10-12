@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 from binance_fixture import Api
@@ -38,7 +39,7 @@ if __name__ == "__main__":
     original = binance.BinanceConnector.__init__
 
     def initialize(self, *args, **kwargs):
-        original(self, *args, **kwargs, pace=0)
+        original(self, *args, **kwargs, pace=0, env_file=Path.cwd() / ".env.local")
 
     binance.BinanceConnector.__init__ = initialize
     threading.Thread(target=server.serve_forever, daemon=True).start()

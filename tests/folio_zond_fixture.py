@@ -18,6 +18,7 @@ async def main():
     connection = Connection("bog", "bog")
     settings = Settings(root, (connection,), chromium=shutil.which("chromium"))
     broker = Broker()
+    env_file = root / ".env.local"
     await broker.start()
     try:
         async with browser(
@@ -29,6 +30,9 @@ async def main():
                     content_type="text/html",
                     body="""
                     <form id="login" onsubmit="event.preventDefault();
+                      if(this.querySelector('[name=username]').value !== 'fixture-user' ||
+                         this.querySelector('[type=password]').value !== 'folio-test-secret')
+                         return;
                       document.getElementById('otp').hidden=false;this.remove()">
                       <input name="username"><input type="password">
                       <button type="submit">Sign in</button>
@@ -42,13 +46,14 @@ async def main():
             await ctx.route("**/*", route)
             page = await ctx.new_page()
             await page.goto("https://account.bog.ge/auth/login")
-            assert not await authenticate(page, "bog", broker)  # user declines
-            (root / "declined").touch()
-            await broker.status("unavailable")
-            await broker.retry.wait()
-            broker.retry.clear()
-            assert await authenticate(page, "bog", broker)
-            assert await authenticate(page, "bog", broker)
+            if not (root / "full-credentials").exists():
+                assert not await authenticate(page, "bog", broker, env_file=env_file)
+                (root / "declined").touch()
+                await broker.status("unavailable")
+                await broker.retry.wait()
+                broker.retry.clear()
+            assert await authenticate(page, "bog", broker, env_file=env_file)
+            assert await authenticate(page, "bog", broker, env_file=env_file)
             (root / "authenticated").touch()
             await broker.status("ready")
             await asyncio.Event().wait()

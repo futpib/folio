@@ -17,6 +17,12 @@ def main():
     parser.add_argument("--mode", choices=["paper", "live"], required=True)
     parser.add_argument("--api-port", type=int, required=True)
     parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=ADAPTER.parents[1] / ".env.local",
+        help="local credentials file (default: this checkout's .env.local)",
+    )
+    parser.add_argument(
         "--agent-jar",
         type=Path,
         help="use a prebuilt agent instead of building this checkout's adapter at startup",
@@ -56,6 +62,9 @@ def main():
         "-Xmx768m",
         "-Duser.language=en",
         "-Duser.country=US",
+        f"-Dfolio.credentials.python={sys.executable}",
+        f"-Dfolio.credentials.reader={ADAPTER.parents[1] / 'src/folio/credentials.py'}",
+        f"-Dfolio.credentials.file={args.env_file.expanduser().resolve()}",
         f"-javaagent:{args.agent_jar.resolve()}={args.mode}:{args.api_port}",
         "-cp",
         str(args.gateway_home / "jars/*"),

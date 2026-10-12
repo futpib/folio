@@ -7,11 +7,13 @@ import javax.swing.*;
 public final class AuthenticationPatch {
     private static Path directory;
     private static Window login;
-    private static GatewaySettingsFixture settings;
+    private static GatewaySession settings;
+    private static String savedSettings;
     private static final Set<AbstractButton> patched = Collections.newSetFromMap(new IdentityHashMap<>());
 
     public static void premain(String options) {
         directory = Path.of(options);
+        Thread.setDefaultUncaughtExceptionHandler((thread, failure) -> failed(failure));
         SwingUtilities.invokeLater(() -> new javax.swing.Timer(50, event -> scan()).start());
     }
 
@@ -29,19 +31,36 @@ public final class AuthenticationPatch {
         Files.writeString(directory.resolve(name), "yes");
     }
 
+    private static void failed(Throwable failure) {
+        try {
+            var trace = new java.io.StringWriter();
+            failure.printStackTrace(new java.io.PrintWriter(trace));
+            Files.writeString(directory.resolve("patch-failed"), trace.toString());
+        } catch (Exception ignored) {}
+    }
+
     private static void scan() {
         try {
             if (Files.deleteIfExists(directory.resolve("reauth")) && login != null) {
                 Files.deleteIfExists(directory.resolve("authenticated"));
                 Files.deleteIfExists(directory.resolve("submitted"));
-                if (settings != null) settings.frame.setVisible(false);
+                if (settings != null) settings.show(false);
                 login.setVisible(true);
             }
+            if (Files.deleteIfExists(directory.resolve("hide")) && login != null) login.setVisible(false);
             if (Files.deleteIfExists(directory.resolve("accept-mfa"))) {
                 if (!Files.exists(directory.resolve("submitted"))) throw new IllegalStateException("no login submitted");
-                mark("authenticated");
-                if (settings == null) settings = new GatewaySettingsFixture(directory);
-                settings.frame.setVisible(true);
+                if (settings == null) settings = new GatewaySession(login, () -> {
+                    try { mark("authenticated"); } catch (Exception failure) { failed(failure); }
+                });
+                else { settings.show(true); mark("authenticated"); }
+            }
+            if (settings != null) {
+                String current = settings.settings();
+                if (!current.equals(savedSettings)) {
+                    Files.writeString(directory.resolve("api-settings"), current);
+                    savedSettings = current;
+                }
             }
             for (Window window : Window.getWindows()) {
                 if (!window.isShowing()) continue;
@@ -66,14 +85,14 @@ public final class AuthenticationPatch {
                             window.setVisible(false);
                             mark("submitted");
                         } catch (Exception failure) {
-                            try { mark("patch-failed"); } catch (Exception ignored) {}
+                            failed(failure);
                         }
                     });
                     mark("patched");
                 }
             }
         } catch (Exception failure) {
-            try { mark("patch-failed"); } catch (Exception ignored) {}
+            failed(failure);
         }
     }
 }

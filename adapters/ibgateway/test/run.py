@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Real daemon + Swing adapter E2E; --real only observes installed Gateway login."""
+"""Gateway adapter E2E with a fixture or the installed application."""
 
 import argparse
 import json
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+from monkeypatch import API_PORT, build_patch
 
 ADAPTER = Path(__file__).resolve().parents[1]
 
@@ -24,10 +27,18 @@ def wait_for(read, predicate, seconds=45):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--real", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--real", action="store_true", help="observe installed Gateway login only")
+    mode.add_argument(
+        "--stub-auth",
+        action="store_true",
+        help="installed Gateway with offline authentication and its real settings UI",
+    )
     parser.add_argument("--zondd", type=Path, required=True, help="zondd daemon executable")
     args = parser.parse_args()
     subprocess.run([str(ADAPTER / "build.sh")], check=True)
+    if args.stub_auth:
+        build_patch()
     subprocess.run(
         [
             "javac",
@@ -59,7 +70,16 @@ def main():
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
-        if args.real:
+        if args.stub_auth:
+            port = API_PORT
+            program = sys.executable
+            argv = [
+                str(ADAPTER / "test/monkeypatch.py"),
+                "adapter",
+                str(base),
+                str(ADAPTER.parents[1]),
+            ]
+        elif args.real:
             program = str(ADAPTER / "launch.py")
             argv = [
                 "--settings-dir",
@@ -109,7 +129,16 @@ cwd = {json.dumps(str(base))}
                     return json.loads(client.makefile("rb").readline())["body"]
 
             def pending():
+                if (base / "patch-failed").exists():
+                    raise AssertionError((base / "patch-failed").read_text())
                 return request({"method": "pending"})
+
+            def control(action):
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.settimeout(15)
+                    client.connect(str(base / "control.sock"))
+                    client.sendall((action + "\n").encode())
+                    return json.loads(client.makefile("rb").readline())
 
             def challenge():
                 return wait_for(pending, lambda q: bool(q["interactions"]))["interactions"][0]
@@ -148,6 +177,13 @@ cwd = {json.dumps(str(base))}
                     return
                 for current in [second, None]:
                     current = current or challenge()
+                    if args.stub_auth:
+                        wait_for(
+                            lambda: control("status"),
+                            lambda r: (
+                                r["code"] == 0 and not json.loads(r["stdout"])["tws_connected"]
+                            ),
+                        )
                     response = request(
                         {
                             "method": "answer_interaction",
@@ -159,9 +195,17 @@ cwd = {json.dumps(str(base))}
                         }
                     )
                     assert response["type"] == "credential_answered"
+                    if args.stub_auth:
+                        wait_for(lambda: (base / "submitted").exists(), bool)
+                        assert not (base / "authenticated").exists()
+                        assert pending()["adapters"][0]["state"] != "ready"
+                        control("accept-mfa")
                     wait_for(pending, lambda q: q["adapters"][0]["state"] == "ready")
                     assert (base / "submitted").read_text() == "yes"
                     assert (base / "api-settings").read_text() == f"{port} true true"
+                    if args.stub_auth:
+                        accounts = wait_for(lambda: control("accounts"), lambda r: r["code"] == 0)
+                        assert "DU424242" in accounts["stdout"]
                     (base / "reauth").touch()
                 challenge()
                 (base / "hide").touch()
@@ -174,11 +218,17 @@ cwd = {json.dumps(str(base))}
                 for path in base.glob("config.history.sqlite3*"):
                     assert b"test-gateway-password" not in path.read_bytes()
                 assert "test-gateway-password" not in (base / "daemon.log").read_text()
+                if args.stub_auth:
+                    assert "test-gateway-password" not in (base / "http.log").read_text()
                 print(
-                    "PASS: Swing login, private delivery, saved read-only API settings, "
+                    f"PASS: {'installed Gateway' if args.stub_auth else 'Swing fixture'} login, "
+                    "private delivery, saved read-only API settings, "
                     "API handshake, reauthentication, "
                     "decline/retry, withdrawal, audit"
                 )
+            except Exception:
+                print((base / "daemon.log").read_text()[-6000:])
+                raise
             finally:
                 daemon.terminate()
                 daemon.wait(timeout=15)

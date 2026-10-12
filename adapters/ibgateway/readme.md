@@ -104,6 +104,7 @@ service for lifecycle cleanup after a daemon crash.
 cargo build --manifest-path "$HOME/code/zondd/Cargo.toml" --workspace --bins
 python3 adapters/ibgateway/test/run.py --zondd "$HOME/code/zondd/target/debug/zondd"
 python3 adapters/ibgateway/test/run.py --zondd "$HOME/code/zondd/target/debug/zondd" --real
+python3 adapters/ibgateway/test/run.py --zondd "$HOME/code/zondd/target/debug/zondd" --stub-auth
 ```
 
 The first test runs an actual Swing UI under Xvfb with the production Java
@@ -113,7 +114,15 @@ reauthentication, rejection/retry, withdrawal when the window disappears, and
 secret-free audit storage. Its API endpoint is a local fixture and never calls
 IBKR. The second starts the installed Gateway with temporary settings, observes
 its real login form, and verifies rejection/retry without submitting credentials.
-Neither test authenticates a live IBKR account or completes IBKR Mobile 2FA.
+The third uses the installed Gateway's real login controls, settings dialog, and
+settings models, with a test-only authentication stub. It starts with a different
+API port and read-only/localhost restrictions disabled, then verifies the
+production adapter saves the requested settings and the HTTP bridge reconnects.
+It also exercises a custom Gateway window title and a second login. Gateway and
+the HTTP bridge run in a private network namespace containing only loopback; no
+test credentials or other traffic can reach IBKR. This requires unprivileged
+Linux user/network namespaces, `ip`, and the repository's installed `.venv`.
+None of these tests authenticates a live IBKR account or completes IBKR Mobile 2FA.
 
 To exercise the complete Android and HTTP path against the installed Gateway:
 
@@ -131,8 +140,10 @@ The test starts the unmodified installed Gateway with a **test-only second Java
 agent** that replaces its login action. Android fills the original Swing controls
 through the production adapter over SSH and Iroh. Dummy credentials are checked
 inside that action, and a test signal simulates accepting mobile authentication.
-Post-login API settings use a Swing fixture, since the test does not authenticate
-with IBKR and therefore cannot open Gateway's authenticated settings window.
+The stub initializes Gateway's own offline session model, then opens its real
+post-login settings UI. The test bootstrap uses internal Gateway 10.51 classes
+and may need updating for another installed version; production automation uses
+Swing controls and does not depend on these internal classes.
 Both Gateway and the real HTTP server run in a private network namespace with
 only loopback, so they cannot contact IBKR. A small local TWS protocol peer supplies
 the handshake and account callbacks to the HTTP server's real official API client.

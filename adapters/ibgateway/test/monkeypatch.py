@@ -4,6 +4,7 @@
 import json
 import os
 import runpy
+import shutil
 import socket
 import socketserver
 import struct
@@ -17,6 +18,42 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 API_PORT = 14002
 HTTP_PORT = 18080
+
+
+def build_patch():
+    classes = HERE.parent / "build/patch"
+    shutil.rmtree(classes, ignore_errors=True)
+    classes.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "javac",
+            "--release",
+            "17",
+            "-cp",
+            "/usr/share/ib-tws/jars/*",
+            "-d",
+            str(classes),
+            str(HERE / "AuthenticationPatch.java"),
+            str(HERE / "GatewaySession.java"),
+        ],
+        check=True,
+    )
+    manifest = HERE.parent / "build/patch.mf"
+    manifest.write_text("Premain-Class: AuthenticationPatch\n")
+    subprocess.run(
+        [
+            "jar",
+            "--create",
+            "--file",
+            str(HERE.parent / "build/authentication-patch.jar"),
+            "--manifest",
+            str(manifest),
+            "-C",
+            str(classes),
+            ".",
+        ],
+        check=True,
+    )
 
 
 def frame(*fields):
@@ -165,6 +202,8 @@ def main():
         "reauth",
         "accept-mfa",
         "control.sock",
+        "api-settings",
+        "hide",
     ]:
         (base / name).unlink(missing_ok=True)
     config = base / "http.toml"

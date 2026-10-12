@@ -80,7 +80,7 @@ final class ApiConfiguration {
     private void open() {
         for (Window window : Window.getWindows()) {
             if (!(window instanceof JFrame frame) || !frame.isShowing()
-                || !frame.getTitle().contains("Gateway") || frame.getJMenuBar() == null) continue;
+                || frame.getJMenuBar() == null) continue;
             JMenuBar bar = frame.getJMenuBar();
             for (int i = 0; i < bar.getMenuCount(); i++) {
                 JMenu menu = bar.getMenu(i);

@@ -24,3 +24,17 @@ max_pages = 100
 
 # For browser login through zond, set credential_adapter = true on each browser
 # connection and run scripts/setup-folio.py --zond. Otherwise use folio login.
+
+# Binance uses its REST API, with HMAC keys entered privately through Zond.
+# Uncomment and select the markets and trade symbols you use. Empty symbol
+# lists skip trade history; Futures income is collected across all symbols.
+# [connections.binance]
+# provider = "binance"
+# credential_adapter = true
+# max_pages = 100
+# [connections.binance.binance]
+# markets = ["spot", "usdm"] # Add "coinm" for COIN-M Futures.
+# spot_symbols = ["BTCUSDT", "ETHUSDT"]
+# usdm_symbols = ["BTCUSDT"]
+# coinm_symbols = []
+# history_days = 7

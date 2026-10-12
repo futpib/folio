@@ -24,6 +24,7 @@ class Snapshot(BaseModel):
     resources: list[str]
     complete: bool
     coverage: str
+    account_identity: str | None = None
 
 
 class ConnectorError(Exception):

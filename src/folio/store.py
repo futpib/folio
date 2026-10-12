@@ -50,6 +50,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS connection_revisions (
                     id TEXT PRIMARY KEY, revision TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS connection_accounts (
+                    id TEXT PRIMARY KEY, account_identity TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, connection TEXT NOT NULL, state TEXT NOT NULL,
                     created REAL NOT NULL, started REAL, finished REAL, since TEXT,
@@ -173,6 +176,19 @@ class Store:
     def finish(self, job: dict, snapshot: Snapshot, cooldown: int) -> None:
         now = time.time()
         with self.db() as db:
+            if snapshot.account_identity is not None:
+                previous = db.execute(
+                    "SELECT account_identity FROM connection_accounts WHERE id=?",
+                    (job["connection"],),
+                ).fetchone()
+                if previous is None or previous[0] != snapshot.account_identity:
+                    # A replacement API key may belong to a different account.
+                    db.execute("DELETE FROM records WHERE connection=?", (job["connection"],))
+                    db.execute("DELETE FROM snapshots WHERE connection=?", (job["connection"],))
+                db.execute(
+                    "INSERT OR REPLACE INTO connection_accounts VALUES (?,?)",
+                    (job["connection"], snapshot.account_identity),
+                )
             for resource in snapshot.resources:
                 # Current holdings and balances are snapshots; histories accumulate by source ID.
                 if resource in {"accounts", "balances", "positions"}:

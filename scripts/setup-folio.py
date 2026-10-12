@@ -61,7 +61,12 @@ def adapter_config(source: str, config: Path, connections: dict) -> str:
         item = {
             "label": f"Folio {connection['provider']} ({name})",
             "program": str(ROOT / ".venv/bin/folio"),
-            "args": ["--config", str(config), "browser-adapter", name],
+            "args": [
+                "--config",
+                str(config),
+                "api-adapter" if connection["provider"] == "binance" else "browser-adapter",
+                name,
+            ],
             "cwd": str(ROOT),
         }
         if ident in existing:
@@ -81,7 +86,7 @@ def main():
         help="replace the legacy HTTP service, retaining its config and Gateway",
     )
     parser.add_argument(
-        "--zond", action="store_true", help="broker browser login forms through zond"
+        "--zond", action="store_true", help="broker browser logins and API credentials through zond"
     )
     parser.add_argument("--no-linger", action="store_true")
     parser.add_argument("--port", type=legacy.port)
@@ -95,7 +100,12 @@ def main():
     config = home / "folio/config.toml"
     unit = home / "systemd/user" / UNIT
     zond = home / "zondd/config.toml"
-    required = ["uv", "systemctl", "systemd-analyze", "chromium"]
+    required = ["uv", "systemctl", "systemd-analyze"]
+    current = tomllib.loads(config.read_text()) if config.exists() else None
+    if current is None or any(
+        c.get("provider") in {"bog", "wolt"} for c in current.get("connections", {}).values()
+    ):
+        required.append("chromium")
     if args.zond:
         required += ["zondd", "zondctl"]
     if not args.no_linger:
@@ -132,6 +142,11 @@ def main():
         home, zond=args.zond, chromium=shutil.which("chromium"), port=args.port
     )
     data = tomllib.loads(source)
+    if (
+        any(c.get("provider") == "binance" for c in data.get("connections", {}).values())
+        and not args.zond
+    ):
+        parser.error("Binance requires --zond to install its API credential adapter")
     if original and args.port is not None and data.get("server", {}).get("port", 8080) != args.port:
         parser.error(
             "existing config is preserved; edit server.port before requesting another port"

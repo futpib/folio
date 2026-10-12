@@ -39,16 +39,24 @@ def daemon():
 
 
 async def adapter(settings, connection):
+    from .binance import BinanceConnector
     from .broker import Broker
     from .service import worker
 
     broker = Broker()
     await broker.start()
+    connector = (
+        BinanceConnector(connection, broker)
+        if connection.provider == "binance"
+        else BrowserConnector(settings, connection, broker)
+    )
     try:
         store = Store(settings.state_dir)
         store.register(connection)
-        await worker(store, connection, BrowserConnector(settings, connection, broker), broker)
+        await worker(store, connection, connector, broker)
     finally:
+        if isinstance(connector, BinanceConnector):
+            connector.credentials = None
         broker.close()
 
 
@@ -73,20 +81,28 @@ def main():
     signin.add_argument("connection")
     broker = sub.add_parser("browser-adapter", help="run as a zond credential adapter")
     broker.add_argument("connection")
+    api = sub.add_parser("api-adapter", help="run the Binance API worker through zond")
+    api.add_argument("connection")
     args = parser.parse_args()
     try:
         settings = Settings.load(args.config)
         os.umask(0o077)
-        if args.command in {"login", "browser-adapter"}:
+        if args.command in {"login", "browser-adapter", "api-adapter"}:
             connection = settings.connection(args.connection)
             if connection.provider == "ibkr":
                 parser.error("IBKR uses the existing Gateway credential adapter")
+            if connection.provider == "binance" and args.command != "api-adapter":
+                parser.error(
+                    "Binance uses API keys through zond's api-adapter; run 'folio sync NAME'"
+                )
+            if args.command == "api-adapter" and connection.provider != "binance":
+                parser.error("api-adapter requires a Binance connection")
             Store(settings.state_dir)
             if args.command == "login":
                 asyncio.run(login(settings, connection))
             else:
                 if os.environ.get("ZOND_ADAPTER_PROTOCOL") != "1":
-                    parser.error("browser-adapter must be launched by zond")
+                    parser.error("credential adapters must be launched by zond")
                 if not connection.credential_adapter:
                     parser.error("set credential_adapter = true for this connection first")
                 asyncio.run(adapter(settings, connection))

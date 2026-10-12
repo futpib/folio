@@ -15,6 +15,10 @@ remain supported.
 
 - **IBKR:** collected accounts, account-summary values, and positions. All existing
   live contract, quote, option, and historical-bar endpoints remain available.
+- **Binance:** Spot balances and per-symbol trades; USD-M and optional COIN-M
+  Futures balances, open positions, trades, and income including funding fees,
+  commissions and realized P&L. Uses signed REST API reads with HMAC credentials
+  entered through Zond. See [Binance setup](#binance-spot-and-futures).
 - **Bank of Georgia personal banking:** browser collection of accounts,
   per-currency balances, and transactions in the internet banking page's date range.
 - **Wolt customer accounts:** paginated order history with merchant, status,
@@ -96,6 +100,108 @@ adapter Retry action explicitly starts a new attempt. CAPTCHA, QR, magic-link,
 or otherwise unfamiliar flows require `folio login` and a subsequent sync.
 The account session itself can have broader authority than Folio's public API;
 the configured adapter executable and its Chromium profile must be trusted.
+
+## Binance Spot and Futures
+
+Add a named connection to `~/.config/folio/config.toml`:
+
+```toml
+[connections.binance]
+provider = "binance"
+credential_adapter = true
+min_sync_seconds = 300
+max_pages = 100
+
+[connections.binance.binance]
+markets = ["spot", "usdm"]
+spot_symbols = ["BTCUSDT", "ETHUSDT"]
+usdm_symbols = ["BTCUSDT"]
+history_days = 7
+```
+
+`usdm` is USD-M Futures. To include COIN-M contracts, add `"coinm"` to `markets`
+and configure e.g. `coinm_symbols = ["BTCUSD_PERP"]`. Choose only markets enabled
+for your account; a rejected market fails the sync and preserves the previous
+snapshot. Standard Binance.com accounts are supported; Binance.US, testnet,
+Portfolio Margin and Earn/Funding wallets use different APIs and are not included.
+
+```sh
+uv run foliod --check
+python3 scripts/setup-folio.py --zond
+uv run folio sync binance
+# Complete the API key form in Zond, then read the stored results:
+uv run folio read binance balances
+uv run folio read binance positions
+uv run folio read binance trades --since 2026-10-01
+uv run folio read binance income --since 2026-10-01
+```
+
+Setup registers `folio-binance` using `folio api-adapter binance`, with fixed
+configuration and executable paths. A Binance-only configuration needs no
+Chromium installation. The Folio daemon and Zond adapter must both be running.
+For manual setup, register that command using the existing Zond credential
+adapter mechanism and restart Folio after adding the connection.
+
+Create a **system-generated HMAC API key** in Binance API Management. Enable
+reading and use the minimum permissions necessary for the selected accounts;
+leave withdrawals and transfers disabled. Enter the key and HMAC secret only in
+Zond's two masked fields. Folio does not accept secrets in TOML, CLI arguments,
+environment variables or its HTTP API. RSA and Ed25519 keys are not supported by
+this connector. The configured adapter sees the secrets and must be trusted.
+Folio exposes only the fixed read endpoints listed below, even when a supplied
+key has broader account permissions.
+
+Keys are held in the adapter's memory and reused until it stops or Binance
+rejects authentication. They are not stored in SQLite or a credential file.
+After restart, the next sync asks again. Decline, expiry or failure ends the job;
+Zond's Retry action starts a fresh attempt. Network failures retain valid in-memory
+keys. The Spot account endpoint is read even for Futures-only connections so its
+UID can bind the snapshot to an account; Spot account reading must be permitted.
+A successful sync with a different UID replaces the prior account's stored data
+atomically, preventing histories from two accounts from being mixed.
+
+History covers the configured lookback (`history_days`, 1–90, default 7), subject
+to Binance's retention. Select every symbol whose trades you need: Binance's
+trade endpoints require a symbol, including for contracts you already closed.
+An empty symbol list skips that market's trades; it does not discover past trading
+pairs. Futures income covers **all symbols** within the lookback, independent of
+the trade symbol list. There is no order-placement, cancellation, withdrawal,
+transfer or account-setting endpoint.
+
+Each sync reports its markets, trade symbols and exact UTC range in
+`snapshot.coverage`. `complete` applies only to those selections, not all account
+history. Spot trade windows are at most one day; Futures windows are at most seven
+days. Full windows are subdivided to avoid skipping trades with equal timestamps.
+`max_pages` limits the total number of history requests across markets. Exhausting
+it, or an indivisible millisecond containing a full page, produces
+`complete: false`; increase the limit or narrow the selection. Previously stored
+history is retained. Any API error discards the entire new snapshot.
+
+Decimal strings are preserved exactly. Crypto asset codes are not constrained to
+three-letter fiat currencies. Futures position IDs include the market, symbol
+and hedge side; COIN-M quantities are labelled as contracts. Per-asset balances
+are not summed across currencies. Income IDs include their type so funding and
+realized P&L records cannot overwrite each other. Positions are snapshots, not a
+live risk feed. `read --since` filters stored history; it does not extend a sync's
+lookback or trigger a provider request.
+
+Requests use HTTPS to fixed `api.binance.com`, `fapi.binance.com` and
+`dapi.binance.com` origins, server-time-based timestamps and a 5-second receive
+window. Proxy environment settings are ignored and redirects are refused. API
+requests are paced at one per second per worker. HTTP 429/418 responses stop the
+sync and defer later jobs for `Retry-After`, including bans of up to three days.
+Operator Retry explicitly overrides that cooldown; wait out an active ban.
+
+The implementation follows Binance's official
+[Spot signing/account/trade API](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md),
+[USD-M account and income API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/account),
+[USD-M trade and position API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade),
+[COIN-M account and income API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-coin-m-futures/api/rest-api/account),
+and [COIN-M trade and position API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-coin-m-futures/api/rest-api/trade).
+It calls only `GET`: each market's `time` and `account`, Spot `myTrades`, Futures
+`positionRisk`, `userTrades` and `income`. Binance tests use independent HMAC
+verification and a local API fixture with the real Folio CLI, worker and Zond
+broker. Authenticated live account access has not yet been verified.
 
 ## Manual run and configuration
 
@@ -183,6 +289,7 @@ uv run ruff check .
 uv run pytest -q
 FOLIO_TEST_ZONDD=/path/to/zondd FOLIO_TEST_HEADED=1 \
   xvfb-run -a uv run pytest -q tests/test_folio_zond_e2e.py
+FOLIO_TEST_ZONDD=/path/to/zondd uv run pytest -q tests/test_binance_zond_e2e.py
 ```
 
 Browser tests run the installed Chromium with locally intercepted fixture traffic.

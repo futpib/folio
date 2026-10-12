@@ -37,3 +37,13 @@ def test_setup_preserves_ibkr_config_and_builds_fixed_adapter_commands(tmp_path)
     unit = setup.render_unit(config)
     assert "UMask=0077" in unit and "Restart=on-failure" in unit
     assert str(config) in unit
+
+
+def test_setup_selects_api_adapter_for_binance(tmp_path):
+    result = setup.adapter_config(
+        "",
+        tmp_path / "folio.toml",
+        {"binance": {"provider": "binance", "credential_adapter": True}},
+    )
+    item = tomllib.loads(result)["credential_adapters"]["folio-binance"]
+    assert item["args"][-2:] == ["api-adapter", "binance"]

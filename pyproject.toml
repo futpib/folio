@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ibkr-tws-http"
 version = "0.11.0"
-description = "Folio: local read-only access to IBKR, Bank of Georgia and Wolt data"
+description = "Folio: local read-only access to IBKR, Binance, Bank of Georgia and Wolt data"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import __version__
+from .binance import BinanceConnector
 from .browser import BrowserConnector
 from .config import Connection, Settings
 from .ibkr import IbkrConnector
@@ -81,7 +82,13 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
         connectors
         if connectors is not None
         else {
-            c.id: IbkrConnector(c) if c.provider == "ibkr" else BrowserConnector(settings, c)
+            c.id: (
+                IbkrConnector(c)
+                if c.provider == "ibkr"
+                else BinanceConnector(c)
+                if c.provider == "binance"
+                else BrowserConnector(settings, c)
+            )
             for c in settings.connections
         }
     )
@@ -141,7 +148,19 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
                 **store.status(c.id),
                 "resources": c.resources,
                 "worker": "zond" if c.credential_adapter else "foliod",
-                "browser_support": "experimental" if c.provider != "ibkr" else None,
+                "browser_support": "experimental" if c.provider in {"bog", "wolt"} else None,
+                **(
+                    {
+                        "api_support": "binance-hmac",
+                        "markets": c.binance.markets,
+                        "history_days": c.binance.history_days,
+                        "trade_symbols": {
+                            m: getattr(c.binance, f"{m}_symbols") for m in c.binance.markets
+                        },
+                    }
+                    if c.binance
+                    else {}
+                ),
                 "live_api": f"/v1/connections/{c.id}/ibkr" if c.provider == "ibkr" else None,
             }
             for c in settings.connections

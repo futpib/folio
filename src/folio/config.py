@@ -13,7 +13,56 @@ RESOURCES = {
     "ibkr": ("accounts", "balances", "positions"),
     "bog": ("accounts", "balances", "transactions"),
     "wolt": ("orders",),
+    "binance": ("accounts", "balances", "positions", "trades", "income"),
 }
+
+
+@dataclass(frozen=True)
+class BinanceSettings:
+    markets: tuple[str, ...] = ("spot", "usdm")
+    spot_symbols: tuple[str, ...] = ()
+    usdm_symbols: tuple[str, ...] = ()
+    coinm_symbols: tuple[str, ...] = ()
+    history_days: int = 7
+
+    @classmethod
+    def load(cls, data):
+        if not isinstance(data, dict) or data.keys() - {
+            "markets",
+            "spot_symbols",
+            "usdm_symbols",
+            "coinm_symbols",
+            "history_days",
+        }:
+            raise ConfigError("unknown Binance settings")
+        markets = data.get("markets", ["spot", "usdm"])
+        if (
+            not isinstance(markets, list)
+            or not markets
+            or any(not isinstance(m, str) or m not in {"spot", "usdm", "coinm"} for m in markets)
+            or len(set(markets)) != len(markets)
+        ):
+            raise ConfigError("binance.markets must select spot, usdm and/or coinm once each")
+        symbols = {}
+        for market in ("spot", "usdm", "coinm"):
+            key = f"{market}_symbols"
+            values = data.get(key, [])
+            if (
+                not isinstance(values, list)
+                or len(values) > 50
+                or any(
+                    not isinstance(v, str) or not re.fullmatch(r"[A-Z0-9_]{1,40}", v)
+                    for v in values
+                )
+                or len(set(values)) != len(values)
+                or (values and market not in markets)
+            ):
+                raise ConfigError(f"binance.{key} needs unique symbols for an enabled market")
+            symbols[key] = tuple(values)
+        days = data.get("history_days", 7)
+        if type(days) is not int or not 1 <= days <= 90:
+            raise ConfigError("binance.history_days must be between 1 and 90")
+        return cls(markets=tuple(markets), history_days=days, **symbols)
 
 
 def default_config() -> Path:
@@ -32,6 +81,7 @@ class Connection:
     credential_adapter: bool = False
     min_sync_seconds: int = 300
     max_pages: int = 100
+    binance: BinanceSettings | None = None
 
     @property
     def resources(self) -> tuple[str, ...]:
@@ -82,11 +132,17 @@ class Settings:
                 "credential_adapter",
                 "min_sync_seconds",
                 "max_pages",
+                "binance",
             }:
                 raise ConfigError(f"unknown configuration for connection {name}")
             provider = item.get("provider")
             if provider not in RESOURCES:
                 raise ConfigError(f"unknown provider for {name}")
+            if "binance" in item and provider != "binance":
+                raise ConfigError("binance settings require the Binance provider")
+            binance = (
+                BinanceSettings.load(item.get("binance", {})) if provider == "binance" else None
+            )
             ibkr_config = None
             if provider == "ibkr":
                 if "ibkr_config" not in item:
@@ -106,7 +162,9 @@ class Settings:
                     raise ConfigError(f"{name}.{key} must be between {low} and {high}")
             broker = item.get("credential_adapter", False)
             if type(broker) is not bool or (broker and provider == "ibkr"):
-                raise ConfigError("credential_adapter is a boolean for browser connections only")
+                raise ConfigError("credential_adapter is a boolean for browser or API connections")
+            if provider == "binance" and not broker:
+                raise ConfigError("Binance requires credential_adapter = true for private API keys")
             connections.append(
                 Connection(
                     name,
@@ -115,6 +173,7 @@ class Settings:
                     broker,
                     item.get("min_sync_seconds", 300),
                     item.get("max_pages", 100),
+                    binance,
                 )
             )
         if not connections:

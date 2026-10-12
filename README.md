@@ -1,8 +1,9 @@
 # Folio
 
-Folio generalizes this project into a local, read-only service for IBKR, Bank of
+Folio provides local, read-only access to IBKR, Binance Spot and Futures, Bank of
 Georgia personal banking, and Wolt customer order history. It adds named
-connections, durable sync jobs, a SQLite data store, and private Chromium sessions.
+connections, durable sync jobs, a SQLite data store, API credentials through Zond,
+and private Chromium sessions for browser providers.
 
 Start with the [Folio setup and usage guide](docs/folio.md). BoG and Wolt browser
 connectors are experimental and still need verification with authenticated real

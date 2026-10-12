@@ -15,6 +15,7 @@ RESOURCES = {
     "wolt": ("orders",),
     "binance": ("accounts", "balances", "positions", "trades", "income"),
 }
+BINANCE_ACCOUNT_MODES = ("auto", "classic", "portfolio", "portfolio_pro", "portfolio_pro_span")
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class BinanceSettings:
     coinm_symbols: tuple[str, ...] = ()
     history_days: int = 7
     key_type: str = "auto"
+    account_mode: str = "auto"
 
     @classmethod
     def load(cls, data):
@@ -35,6 +37,7 @@ class BinanceSettings:
             "coinm_symbols",
             "history_days",
             "key_type",
+            "account_mode",
         }:
             raise ConfigError("unknown Binance settings")
         markets = data.get("markets", ["spot", "usdm"])
@@ -67,7 +70,16 @@ class BinanceSettings:
         key_type = data.get("key_type", "auto")
         if key_type not in ("auto", "hmac", "ed25519", "rsa"):
             raise ConfigError("binance.key_type must be auto, hmac, ed25519 or rsa")
-        return cls(markets=tuple(markets), history_days=days, key_type=key_type, **symbols)
+        mode = data.get("account_mode", "auto")
+        if mode not in BINANCE_ACCOUNT_MODES:
+            raise ConfigError("binance.account_mode must be " + ", ".join(BINANCE_ACCOUNT_MODES))
+        return cls(
+            markets=tuple(markets),
+            history_days=days,
+            key_type=key_type,
+            account_mode=mode,
+            **symbols,
+        )
 
 
 def default_config() -> Path:

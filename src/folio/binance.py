@@ -33,6 +33,8 @@ ORIGINS = {
     "spot": "https://api.binance.com",
     "usdm": "https://fapi.binance.com",
     "coinm": "https://dapi.binance.com",
+    "portfolio": "https://papi.binance.com",
+    "portfolio_pro": "https://api.binance.com",
 }
 ENDPOINTS = {
     "spot": {
@@ -54,11 +56,44 @@ ENDPOINTS = {
         "trades": "/dapi/v1/userTrades",
         "income": "/dapi/v1/income",
     },
+    "portfolio": {"account": "/papi/v1/account", "balances": "/papi/v1/balance"},
+    "portfolio_pro": {
+        "account": "/sapi/v1/portfolio/account",
+        "span_account": "/sapi/v2/portfolio/account",
+        "balances": "/sapi/v1/portfolio/balance",
+    },
 }
+PORTFOLIO_ENDPOINTS = {
+    market: {
+        "account": f"/papi/v1/{prefix}/account",
+        "positions": f"/papi/v1/{prefix}/positionRisk",
+        "trades": f"/papi/v1/{prefix}/userTrades",
+        "income": f"/papi/v1/{prefix}/income",
+    }
+    for market, prefix in (("usdm", "um"), ("coinm", "cm"))
+}
+ACCOUNT_TYPES = {"PM_1": "portfolio_pro", "PM_2": "portfolio", "PM_3": "portfolio_pro_span"}
+
+
+def endpoint(market, operation, api_mode="classic"):
+    if api_mode == "portfolio" and market in PORTFOLIO_ENDPOINTS and operation != "time":
+        return ORIGINS["portfolio"] + PORTFOLIO_ENDPOINTS[market][operation]
+    return ORIGINS[market] + ENDPOINTS[market][operation]
+
+
+def credential_origins(options):
+    origins = {ORIGINS[market] for market in ("spot", *options.markets)}
+    if options.account_mode in {"auto", "portfolio"} and set(options.markets) - {"spot"}:
+        origins.add(ORIGINS["portfolio"])
+    return origins
 
 
 class AccessDenied(LoginRequired):
     """An endpoint rejection that may reflect a missing permission."""
+
+
+class ModeUnavailable(ConnectorError):
+    """The account is not enrolled in the requested account mode."""
 
 
 def decimal(value) -> str:
@@ -112,8 +147,8 @@ def record(resource, key, market, data, occurred_at=None):
     )
 
 
-def account_records(market, payload):
-    result = [record("accounts", market, market, {"name": market})]
+def account_records(market, payload, api_mode="classic"):
+    result = [record("accounts", market, market, {"name": market, "account_mode": api_mode})]
     if market == "spot":
         for row in rows(payload["balances"]):
             asset = text(row["asset"])
@@ -139,19 +174,99 @@ def account_records(market, payload):
                     market,
                     {
                         "asset": asset,
+                        "account_mode": api_mode,
                         **{
                             key: decimal(row[key])
                             for key in (
-                                "walletBalance",
-                                "unrealizedProfit",
-                                "marginBalance",
-                                "availableBalance",
+                                ("crossWalletBalance", "crossUnPnl", "maintMargin", "initialMargin")
+                                if api_mode == "portfolio"
+                                else (
+                                    "walletBalance",
+                                    "unrealizedProfit",
+                                    "marginBalance",
+                                    "availableBalance",
+                                )
                             )
                         },
                     },
                 )
             )
     return result
+
+
+def portfolio_account(payload, mode):
+    return record(
+        "accounts",
+        "portfolio",
+        "portfolio",
+        {
+            "name": "portfolio",
+            "account_mode": mode,
+            "equity_unit": "USD",
+            "account_status": text(payload["accountStatus"]),
+            **{
+                key: decimal(payload[key])
+                for key in (
+                    "accountEquity",
+                    "actualEquity",
+                    "accountMaintMargin",
+                    "uniMMR",
+                    "marginMM",
+                    "otherMM",
+                )
+                if key in payload and payload[key] != ""
+            },
+            **(
+                {
+                    "risk_units": [
+                        {
+                            "asset": text(row["asset"]),
+                            "maintenance_margin_usd": decimal(row["uniMaintainUsd"]),
+                        }
+                        for row in rows(payload["riskUnitMMList"])
+                    ]
+                }
+                if "riskUnitMMList" in payload
+                else {}
+            ),
+            **({"account_type": text(payload["accountType"])} if "accountType" in payload else {}),
+        },
+    )
+
+
+def portfolio_balances(payload, mode):
+    return [
+        record(
+            "balances",
+            text(row["asset"]),
+            "portfolio",
+            {
+                "asset": text(row["asset"]),
+                "account_mode": mode,
+                "balance_scope": "unified",
+                "totalWalletBalance": decimal(row["totalWalletBalance"]),
+                **{
+                    key: decimal(row[key])
+                    for key in (
+                        "crossMarginAsset",
+                        "crossMarginBorrowed",
+                        "crossMarginFree",
+                        "crossMarginInterest",
+                        "crossMarginLocked",
+                        "umWalletBalance",
+                        "umUnrealizedPNL",
+                        "cmWalletBalance",
+                        "cmUnrealizedPNL",
+                        "negativeBalance",
+                        "optionWalletBalance",
+                        "optionEquity",
+                    )
+                    if key in row and row[key] != ""
+                },
+            },
+        )
+        for row in rows(payload)
+    ]
 
 
 def position_records(market, payload):
@@ -259,13 +374,15 @@ class BinanceConnector:
         self.clocks = {}
         self.last_request = 0.0
 
-    async def request(self, client, market, operation, **params):
+    async def request(self, client, market, operation, *, api_mode="classic", **params):
         # Callers cannot provide a URL, HTTP method, path, headers or signing parameters.
-        url = ORIGINS[market] + ENDPOINTS[market][operation]
+        url = endpoint(market, operation, api_mode)
         await asyncio.sleep(max(0, self.last_request + self.pace - time.monotonic()))
         headers = {}
         if operation != "time":
-            server, observed = self.clocks[market]
+            server, observed = self.clocks[
+                "spot" if market in {"portfolio", "portfolio_pro"} else market
+            ]
             params.update(
                 timestamp=server + int((time.monotonic() - observed) * 1000), recvWindow=5000
             )
@@ -274,7 +391,7 @@ class BinanceConnector:
             url += f"?{query}&{urlencode({'signature': signature})}"
             headers["X-MBX-APIKEY"] = self.credentials.key
         self.last_request = time.monotonic()
-        log = RequestLog("GET", ORIGINS[market] + ENDPOINTS[market][operation])
+        log = RequestLog("GET", endpoint(market, operation, api_mode))
         status, api_code, failure = None, None, None
         try:
             async with client.stream("GET", url, headers=headers) as response:
@@ -302,8 +419,9 @@ class BinanceConnector:
                 if type(code) is not int or not -999999 <= code <= 999999:
                     code = None
                 api_code = code
+                path = httpx.URL(endpoint(market, operation, api_mode)).path
                 context = (
-                    f"Binance {market} {operation} ({ENDPOINTS[market][operation]}, "
+                    f"Binance {market} {operation} ({path}, "
                     f"HTTP {response.status_code}"
                     + (f", code {code}" if code is not None else "")
                     + "): "
@@ -339,6 +457,10 @@ class BinanceConnector:
                     raise ConnectorError(
                         context + "INVALID_TIMESTAMP: Retry sync to refresh Binance server time."
                     )
+                if code == -21001:
+                    raise ModeUnavailable(
+                        context + "This account is not a Portfolio Margin account."
+                    )
                 if not response.is_success or (isinstance(code, int) and code < 0):
                     raise ConnectorError(
                         context + "API request failed; check account access and configured symbols."
@@ -362,11 +484,34 @@ class BinanceConnector:
         self.clocks[market] = (now, time.monotonic())
         return now
 
+    async def account_mode(self, client):
+        mode = self.options.account_mode
+        if mode != "auto" or not set(self.options.markets) - {"spot"}:
+            return ("classic" if mode == "auto" else mode), None, False
+        try:
+            account = await self.request(client, "portfolio_pro", "account")
+        except ModeUnavailable:
+            return "classic", None, False
+        except AccessDenied:
+            try:
+                account = await self.request(client, "portfolio", "account")
+            except (AccessDenied, ModeUnavailable):
+                # A restricted key may read positions but not account metadata.
+                return "classic", None, True
+            return "portfolio", account, False
+        kind = text(account["accountType"])
+        if kind not in ACCOUNT_TYPES:
+            raise SchemaChanged("Binance returned an unknown Portfolio Margin account type.")
+        mode = ACCOUNT_TYPES[kind]
+        return mode, account, False
+
     async def collect(self, client):
         # Spot's UID binds the collected history to one account even after a key rotation.
         # When Spot is denied, a key fingerprint prevents histories from crossing accounts.
         binding = hashlib.sha256(self.credentials.key.encode()).hexdigest()
         scopes, warnings, denials = {}, [], []
+        api_modes = {}
+        uncertain = False
 
         def scope(market, resource):
             return scopes.setdefault(
@@ -376,11 +521,25 @@ class BinanceConnector:
 
         async def fetch(market, operation, resources, **params):
             sections = [scope(market, resource) for resource in resources]
-            try:
-                payload = await self.request(client, market, operation, **params)
-            except AccessDenied as error:
-                denials.append(error)
-                warning = str(error)
+            selected = api_modes.get(market, "classic")
+            candidates = (
+                (selected, "portfolio" if selected == "classic" else "classic")
+                if uncertain and market in PORTFOLIO_ENDPOINTS
+                else (selected,)
+            )
+            errors = []
+            for candidate in candidates:
+                try:
+                    payload = await self.request(
+                        client, market, operation, api_mode=candidate, **params
+                    )
+                    api_modes[market] = candidate
+                    break
+                except (AccessDenied, ModeUnavailable) as error:
+                    errors.append(error)
+            else:
+                denials.extend(error for error in errors if isinstance(error, AccessDenied))
+                warning = " | ".join(str(error) for error in errors)
                 if params.get("symbol"):
                     warning += f" Symbol: {params['symbol']}."
                 warnings.append(warning)
@@ -390,7 +549,7 @@ class BinanceConnector:
                     "section_skipped",
                     market=market,
                     operation=operation,
-                    endpoint=ORIGINS[market] + ENDPOINTS[market][operation],
+                    endpoint=endpoint(market, operation, candidates[-1]),
                     error_code="permission_denied",
                 )
                 return None
@@ -412,17 +571,73 @@ class BinanceConnector:
             if spot is not None and "spot" in self.options.markets
             else []
         )
+        mode, metadata, uncertain = await self.account_mode(client)
+        emit(
+            "account_mode_detected",
+            account_mode=mode,
+            detection="endpoint_fallback"
+            if uncertain
+            else "metadata"
+            if metadata
+            else "configured",
+        )
+        if uncertain:
+            warnings.append(
+                "Binance account mode metadata is inaccessible; Classic and Portfolio Margin "
+                "read endpoints are tried independently. Unified account data may be stale."
+            )
+            for resource in ("accounts", "balances"):
+                scope("portfolio", resource).status = "denied"
+        if mode != "classic":
+            aggregate_api = "portfolio" if mode == "portfolio" else "portfolio_pro"
+            operation = "span_account" if mode == "portfolio_pro_span" else "account"
+            if metadata is None or mode == "portfolio_pro_span":
+                specific = await fetch(aggregate_api, operation, ())
+                if specific is not None:
+                    metadata = specific
+                elif metadata is not None:
+                    scope("portfolio", "accounts").status = "incomplete"
+            if metadata is not None:
+                section = scope("portfolio", "accounts")
+                section.refreshed = True
+                result.append(portfolio_account(metadata, mode))
+            else:
+                scope("portfolio", "accounts").status = "denied"
+            balances = await fetch(aggregate_api, "balances", ())
+            if balances is not None:
+                section = scope("portfolio", "balances")
+                section.refreshed = True
+                result.extend(portfolio_balances(balances, mode))
+            else:
+                scope("portfolio", "balances").status = "denied"
         ends = {"spot": self.clocks["spot"][0]}
         for market in self.options.markets:
             if market == "spot":
                 continue
+            api_modes[market] = "portfolio" if mode == "portfolio" else "classic"
             ends[market] = await self.time(client, market)
             account = await fetch(market, "account", ("accounts", "balances"))
             if account is not None:
-                result.extend(account_records(market, account))
+                result.extend(
+                    account_records(market, account, api_modes[market] if uncertain else mode)
+                )
             positions = await fetch(market, "positions", ("positions",))
             if positions is not None:
-                result.extend(position_records(market, positions))
+                positions = position_records(market, positions)
+                for position in positions:
+                    position.data["account_mode"] = mode if not uncertain else api_modes[market]
+                result.extend(positions)
+        if uncertain:
+            # Unified balances can remain readable even when both metadata probes are denied.
+            for aggregate_api in ("portfolio", "portfolio_pro"):
+                try:
+                    balances = await self.request(client, aggregate_api, "balances")
+                except (AccessDenied, ModeUnavailable):
+                    continue
+                section = scope("portfolio", "balances")
+                section.refreshed, section.status = True, "complete"
+                result.extend(portfolio_balances(balances, "auto"))
+                break
         budget = self.connection.max_pages
         coverage = []
         for market in self.options.markets:
@@ -459,6 +674,13 @@ class BinanceConnector:
                                 "Binance returned trades outside the requested range."
                             )
                         result.append(trade_record(market, symbol, row))
+                        result[-1].data["account_mode"] = (
+                            "classic"
+                            if market == "spot"
+                            else api_modes[market]
+                            if uncertain
+                            else mode
+                        )
                     if len(page) >= PAGE_SIZE:
                         if low == high:
                             trades.status = "incomplete"
@@ -491,6 +713,7 @@ class BinanceConnector:
                                 "Binance returned income outside the requested range."
                             )
                         added.append(income_record(market, row))
+                        added[-1].data["account_mode"] = api_modes[market] if uncertain else mode
                     keys = {r.id for r in added}
                     if page and not keys - seen:
                         raise SchemaChanged("Binance income pagination did not advance.")
@@ -501,15 +724,20 @@ class BinanceConnector:
                     page_number += 1
                 else:
                     incomes.status = "incomplete"
-        if not any(section.refreshed for section in scopes.values()) and denials:
-            raise denials[0]
+        if not any(section.refreshed for section in scopes.values()):
+            if denials:
+                raise denials[0]
+            raise ConnectorError("Binance has no readable sections for the selected account mode.")
         complete = not warnings and all(section.status == "complete" for section in scopes.values())
         unique = {(r.resource, r.id): r for r in result}
         return Snapshot(
             records=list(unique.values()),
             resources=list(self.connection.resources),
             complete=complete,
-            coverage=" | ".join(coverage)
+            coverage=f"account mode={mode}"
+            + (" (metadata denied; endpoint fallback)" if uncertain else "")
+            + " | "
+            + " | ".join(coverage)
             + "; current balances/positions; configured markets only; "
             "empty symbol lists skip trades; "
             + (

@@ -38,6 +38,7 @@ max_pages = 100
 # max_pages = 100
 # [connections.binance.binance]
 # key_type = "auto" # Or ed25519/rsa/hmac to require a particular signing algorithm.
+# account_mode = "auto" # Detects Classic, Portfolio Margin, Pro and Pro SPAN.
 # markets = ["spot", "usdm"] # Add "coinm" for COIN-M Futures.
 # spot_symbols = ["BTCUSDT", "ETHUSDT"]
 # usdm_symbols = ["BTCUSDT"]

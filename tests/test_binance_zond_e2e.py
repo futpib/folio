@@ -240,6 +240,19 @@ history_days = 1
             wait(lambda: call("job", independent["id"])["state"] == "completed")
             positions = call("read", "binance", "positions")
             # Zond owns authentication only; restarting it does not discard Folio's valid keys.
+            for account_type, mode in (
+                ("PM_2", "portfolio"),
+                ("PM_1", "portfolio_pro"),
+                ("PM_3", "portfolio_pro_span"),
+                (None, "classic"),
+            ):
+                (tmp_path / "account-mode.json").write_text(json.dumps(account_type))
+                changed = call("sync", "binance", "--detach")
+                wait(lambda job=changed: call("job", job["id"])["state"] == "completed")
+                assert call("job", changed["id"])["complete"]
+                positions = call("read", "binance", "positions")
+                assert len(positions["items"]) == 4
+                assert {p["account_mode"] for p in positions["items"]} == {mode}
             zond = subprocess.Popen(
                 [ZONDD, "serve", "--config", str(zond_config)], stdout=log, stderr=log
             )

@@ -162,6 +162,35 @@ coinm_symbols = ["BTCUSD_PERP"]
             refreshed = next(s for s in read("positions")["scopes"] if s["market"] == "usdm")
             assert refreshed["synced"] > before["positions"]["snapshot"]["synced"]
             assert refreshed["status"] == "complete"
+            for account_type, mode, prefix in (
+                ("PM_2", "portfolio", "https://papi.binance.com/papi/v1/um"),
+                ("PM_1", "portfolio_pro", "https://fapi.binance.com/fapi/v3"),
+                ("PM_3", "portfolio_pro_span", "https://fapi.binance.com/fapi/v3"),
+            ):
+                (tmp_path / "account-mode.json").write_text(json.dumps(account_type))
+                migrated = subprocess.run(
+                    [*cli, "sync", "binance", "--verbose"],
+                    capture_output=True,
+                    timeout=15,
+                    check=True,
+                )
+                job = json.loads(migrated.stdout)
+                assert job["complete"] is True and job["warnings"] == []
+                assert (prefix + "/positionRisk").encode() in migrated.stderr
+                assert ("account_mode=" + mode).encode() in migrated.stderr
+                holdings = read("positions")["items"]
+                assert len(holdings) == 4 and {p["account_mode"] for p in holdings} == {mode}
+                assert len(read("trades")["items"]) == 3
+                assert len(read("income")["items"]) == 4
+                unified = next(p for p in read("balances")["items"] if p["market"] == "portfolio")
+                assert unified["balance_scope"] == "unified"
+                assert unified["totalWalletBalance"] == "126.724692060001"
+                assert b"credentials_requested" not in migrated.stderr
+                if account_type == "PM_3":
+                    assert b"/sapi/v2/portfolio/account" in migrated.stderr
+                assert (
+                    KEY.encode() not in migrated.stderr and SECRET.encode() not in migrated.stderr
+                )
         finally:
             service.terminate()
             service.wait(timeout=15)

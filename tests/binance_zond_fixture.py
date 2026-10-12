@@ -20,6 +20,9 @@ api = Api()
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        mode = Path.cwd() / "account-mode.json"
+        if mode.exists():
+            api.account_type = json.loads(mode.read_text())
         response = api.handle(
             httpx.Request("GET", "http://localhost" + self.path, headers=dict(self.headers))
         )

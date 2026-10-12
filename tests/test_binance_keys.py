@@ -179,7 +179,10 @@ def test_signatures_verified_by_openssl_and_all_markets(signing_key, tmp_path):
     connector.credentials = credential
     result = asyncio.run(connector.sync(None))
     assert result.complete and result.account_identity == "binance:42"
-    assert {path.split("/")[1] for path, _ in api.requests} == {"api", "fapi", "dapi"}
+    assert {path.split("/")[1] for path, _ in api.requests} == {"api", "fapi", "dapi", "sapi"}
+    assert [path for path, _ in api.requests if path.startswith("/sapi/")] == [
+        "/sapi/v1/portfolio/account"
+    ]
     assert pem(signing_key) not in repr(credential)
     assert "PRIVATE KEY" not in result.model_dump_json()
 

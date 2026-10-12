@@ -54,6 +54,7 @@ class Api:
         self.failure = None
         self.history = None
         self.public_key = public_key
+        self.account_type = None
 
     def handle(self, request):
         path = request.url.path
@@ -88,6 +89,60 @@ class Api:
             response = self.failure(request)
             if response is not None:
                 return response
+        if self.account_type == "PM_2" and path.startswith(("/fapi/", "/dapi/")):
+            return httpx.Response(401, json={"code": -2015})
+        if self.account_type != "PM_2" and path.startswith("/papi/"):
+            return httpx.Response(401, json={"code": -2015})
+        if path in {"/sapi/v1/portfolio/account", "/sapi/v2/portfolio/account", "/papi/v1/account"}:
+            if self.account_type is None:
+                return httpx.Response(400, json={"code": -21001})
+            return httpx.Response(
+                200,
+                json={
+                    "accountType": self.account_type,
+                    "accountStatus": "NORMAL",
+                    "accountEquity": "73.474280580001",
+                    "actualEquity": "122607.35137903",
+                    "accountMaintMargin": "23.72469206",
+                    "uniMMR": "5167.92171923",
+                    "totalAvailableBalance": "122,559.90199491",
+                    **(
+                        {
+                            "riskUnitMMList": [{"asset": "BTC", "uniMaintainUsd": "23.72469206"}],
+                            "marginMM": "0.00000000",
+                            "otherMM": "0.00000000",
+                        }
+                        if path == "/sapi/v2/portfolio/account"
+                        else {}
+                    ),
+                    "unneeded": "never persist this field",
+                },
+            )
+        if path in {"/sapi/v1/portfolio/balance", "/papi/v1/balance"}:
+            if self.account_type is None:
+                return httpx.Response(400, json={"code": -21001})
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "asset": "USDT",
+                        "totalWalletBalance": "126.724692060001",
+                        "crossMarginAsset": "103.00000000",
+                        "crossMarginBorrowed": "10",
+                        "crossMarginFree": "100",
+                        "crossMarginLocked": "3",
+                        "crossMarginInterest": "0.72469206",
+                        "umWalletBalance": "0",
+                        "umUnrealizedPNL": "23.72469206",
+                        "cmWalletBalance": "23.72469206",
+                        "cmUnrealizedPNL": "",
+                        "negativeBalance": "0",
+                        "optionWalletBalance": "0",
+                        "optionEquity": "0",
+                        "unneeded": "never persist this field",
+                    }
+                ],
+            )
         if path == "/api/v3/account":
             return httpx.Response(
                 200,
@@ -112,12 +167,34 @@ class Api:
                     ]
                 },
             )
-        if path in {"/fapi/v3/positionRisk", "/dapi/v1/positionRisk"}:
+        if path in {"/papi/v1/um/account", "/papi/v1/cm/account"}:
+            return httpx.Response(
+                200,
+                json={
+                    "assets": [
+                        {
+                            "asset": "BTC" if "/cm/" in path else "USDT",
+                            "crossWalletBalance": "23.724692060001",
+                            "crossUnPnl": "-1.5",
+                            "maintMargin": "0.02",
+                            "initialMargin": "2.0",
+                        }
+                    ]
+                },
+            )
+        if path in {
+            "/fapi/v3/positionRisk",
+            "/dapi/v1/positionRisk",
+            "/papi/v1/um/positionRisk",
+            "/papi/v1/cm/positionRisk",
+        }:
             return httpx.Response(
                 200,
                 json=[
                     {
-                        "symbol": "BTCUSD_PERP" if path.startswith("/dapi") else "BTCUSDT",
+                        "symbol": "BTCUSD_PERP"
+                        if path.startswith("/dapi") or "/cm/" in path
+                        else "BTCUSDT",
                         "positionSide": side,
                         "positionAmt": amount,
                         "entryPrice": "50000.00",
@@ -129,7 +206,13 @@ class Api:
                     for side, amount in [("LONG", "0.1"), ("SHORT", "-0.2"), ("BOTH", "0")]
                 ],
             )
-        if path in {"/api/v3/myTrades", "/fapi/v1/userTrades", "/dapi/v1/userTrades"}:
+        if path in {
+            "/api/v3/myTrades",
+            "/fapi/v1/userTrades",
+            "/dapi/v1/userTrades",
+            "/papi/v1/um/userTrades",
+            "/papi/v1/cm/userTrades",
+        }:
             assert int(params["endTime"]) - int(params["startTime"]) < (
                 86_400_000 if path.startswith("/api") else 7 * 86_400_000
             )
@@ -145,6 +228,11 @@ class Api:
                 200,
                 json=sorted(records, key=lambda r: r["time"], reverse=True)[: int(params["limit"])],
             )
-        if path in {"/fapi/v1/income", "/dapi/v1/income"}:
+        if path in {
+            "/fapi/v1/income",
+            "/dapi/v1/income",
+            "/papi/v1/um/income",
+            "/papi/v1/cm/income",
+        }:
             return httpx.Response(200, json=[income(), income(kind="REALIZED_PNL")])
         raise AssertionError("Unexpected Binance endpoint: " + path)

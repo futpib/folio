@@ -171,6 +171,7 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
                     {
                         "api_support": "binance-rest",
                         "markets": c.binance.markets,
+                        "account_mode": c.binance.account_mode,
                         "history_days": c.binance.history_days,
                         "trade_symbols": {
                             m: getattr(c.binance, f"{m}_symbols") for m in c.binance.markets

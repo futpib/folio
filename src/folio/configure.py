@@ -15,7 +15,7 @@ from pathlib import Path
 
 import tomlkit
 
-from .config import RESOURCES, Settings
+from .config import BINANCE_ACCOUNT_MODES, RESOURCES, Settings
 from .credentials import FIELDS, credential_path, read_credentials
 from .models import LoginRequired
 from .store import exclusive
@@ -54,6 +54,7 @@ def add_commands(sub):
         setup.add_argument(f"--{market}-symbols", type=csv, help="comma-separated trade symbols")
     setup.add_argument("--history-days", type=int)
     setup.add_argument("--key-type", choices=["auto", "hmac", "ed25519", "rsa"])
+    setup.add_argument("--account-mode", choices=BINANCE_ACCOUNT_MODES)
     config = sub.add_parser(
         "config", help="inspect or edit validated configuration without a daemon"
     )
@@ -163,6 +164,7 @@ def candidate(args, path, original, *, interactive):
             "coinm_symbols",
             "history_days",
             "key_type",
+            "account_mode",
         )
         if provider != "binance" and any(getattr(args, key) is not None for key in binance_fields):
             raise ValueError(
@@ -225,6 +227,12 @@ def candidate(args, path, original, *, interactive):
             for key, label, default, convert in (
                 ("history_days", "History lookback in days (1-90)", 7, int),
                 ("key_type", "Signing key type (auto, ed25519, rsa, hmac)", "auto", str),
+                (
+                    "account_mode",
+                    "Account mode (auto detects Classic/Portfolio/Pro/SPAN)",
+                    "auto",
+                    str,
+                ),
             ):
                 value = getattr(args, key)
                 if interactive and value is None:
@@ -254,6 +262,7 @@ def candidate(args, path, original, *, interactive):
             "coinm_symbols",
             "history_days",
             "key_type",
+            "account_mode",
             "min_sync_seconds",
             "max_pages",
         )
@@ -303,7 +312,7 @@ def installer():
 
 
 def recipient_config(source, config, connections, settings=None):
-    from .binance import ORIGINS
+    from .binance import credential_origins
     from .broker import provision_identity, read_identity, recipient_name
     from .providers import LOGIN_ORIGINS
 
@@ -321,7 +330,7 @@ def recipient_config(source, config, connections, settings=None):
                     | ({"otp"} if connection.provider != "binance" else set())
                 ),
                 "origins": sorted(
-                    {ORIGINS[market] for market in ("spot", *connection.binance.markets)}
+                    credential_origins(connection.binance)
                     if connection.provider == "binance"
                     else LOGIN_ORIGINS[connection.provider]
                 ),

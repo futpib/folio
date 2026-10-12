@@ -1,6 +1,7 @@
 # Folio
 
-Folio provides local, read-only access to IBKR, Binance Spot and Futures, Bank of
+Folio provides local, read-only access to IBKR, Binance Spot and Futures across
+Classic, Portfolio Margin and Portfolio Margin Pro accounts, Bank of
 Georgia personal banking, and Wolt customer order history. It adds named
 connections, durable sync jobs, a SQLite data store, local credentials with Zond fallback,
 and private Chromium sessions for browser providers. `folio.service` runs all

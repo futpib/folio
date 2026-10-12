@@ -277,6 +277,7 @@ max_pages = 100
 
 [connections.binance.binance]
 key_type = "auto"
+account_mode = "auto"
 markets = ["spot", "usdm"]
 spot_symbols = ["BTCUSDT", "ETHUSDT"]
 usdm_symbols = ["BTCUSDT"]
@@ -285,9 +286,57 @@ history_days = 7
 
 `usdm` is USD-M Futures. To include COIN-M contracts, add `"coinm"` to `markets`
 and configure e.g. `coinm_symbols = ["BTCUSD_PERP"]`. Choose only markets enabled
-for your account; a rejected market fails the sync and preserves the previous
-snapshot. Standard Binance.com accounts are supported; Binance.US, testnet,
-Portfolio Margin and Earn/Funding wallets use different APIs and are not included.
+for your account; rejected sections produce a partial sync and preserve their
+previous values. Binance.com Classic, Portfolio Margin, Portfolio Margin Pro and
+Pro SPAN account modes are supported. Binance.US, testnet and Earn/Funding wallets
+are separate products and are not included in this connector.
+
+### Binance account modes
+
+`account_mode = "auto"` is the default, including for existing configurations.
+It reads `/sapi/v1/portfolio/account` to distinguish `PM_1` (Pro), `PM_2`
+(Portfolio Margin) and `PM_3` (Pro SPAN). A response explicitly identifying a
+non-Portfolio account selects Classic. When that metadata is denied, Folio tries
+`/papi/v1/account`, then falls back to trying the Classic and PAPI read endpoints
+independently. A permission rejection is not treated as proof that the account
+has no positions. Unknown account types, invalid signatures, network failures
+and rate limits fail the sync rather than silently selecting another mode.
+
+- Classic uses Spot API, FAPI for USD-M and DAPI for COIN-M.
+- Portfolio Margin uses PAPI `/papi/v1/um/*` and `/papi/v1/cm/*` for Futures
+  accounts, positions, trades and income, plus `/papi/v1/account` and
+  `/papi/v1/balance` for unified account information.
+- Portfolio Margin Pro uses SAPI `/sapi/v1/portfolio/account` and `/balance`
+  for unified account information, with the regular FAPI/DAPI Futures reads.
+- Pro SPAN additionally reads `/sapi/v2/portfolio/account` for its account summary.
+
+The detected mode appears in verbose logs as `account_mode_detected`, in
+snapshot coverage, and in collected account and Futures records. Detection runs
+on each sync, so changing account mode does not require replacing keys or
+creating another connection. Spot's UID continues to bind history to the account.
+
+An optional `--account-mode` setup argument or TOML setting can select `classic`,
+`portfolio`, `portfolio_pro` or `portfolio_pro_span` when account metadata is
+unavailable. Selecting a mode does not change anything on Binance:
+
+```sh
+uv run folio setup binance --yes --account-mode portfolio
+uv run folio sync binance --verbose
+```
+
+Unified balances are stored under `market: "portfolio"` with
+`balance_scope: "unified"`. Their total and component wallet fields describe
+overlapping amounts; do not add them to each other or to the per-market wallet
+balances. PAPI market balances retain `crossWalletBalance`, `crossUnPnl` and
+margin requirements; Folio does not invent an available balance. Empty optional
+amounts are omitted. Denied unified sections retain their last successful data.
+
+Binance [removes the normal Futures permission when Portfolio Margin is enabled](https://www.binance.com/en/support/faq/detail/ccf04078d7774d479f11ae15c4f56081).
+Such a key needs PAPI for user data; adding Spot trading permission does not
+make FAPI account reads work. Folio supports the read endpoints for each mode
+and never places trades. Local credentials still take precedence; Zond is only
+used for missing fields. Rerun setup after updating to reconcile the credential
+recipient's PAPI origin, then sync on the machine holding your credentials.
 
 ```sh
 uv run foliod --check
@@ -481,8 +530,8 @@ realized P&L records cannot overwrite each other. Positions are snapshots, not a
 live risk feed. `read --since` filters stored history; it does not extend a sync's
 lookback or trigger a provider request.
 
-Requests use HTTPS to fixed `api.binance.com`, `fapi.binance.com` and
-`dapi.binance.com` origins, server-time-based timestamps and a 5-second receive
+Requests use HTTPS to fixed `api.binance.com`, `fapi.binance.com`,
+`dapi.binance.com` and `papi.binance.com` origins, server-time-based timestamps and a 5-second receive
 window. Proxy environment settings are ignored and redirects are refused. API
 requests are paced at one per second per worker. HTTP 429/418 responses stop the
 sync and defer later jobs for `Retry-After`, including bans of up to three days.
@@ -493,12 +542,17 @@ The implementation follows Binance's official
 [USD-M account and income API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/account),
 [USD-M trade and position API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade),
 [COIN-M account and income API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-coin-m-futures/api/rest-api/account),
-and [COIN-M trade and position API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-coin-m-futures/api/rest-api/trade).
+the [COIN-M trade and position API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-coin-m-futures/api/rest-api/trade),
+[Portfolio Margin account API](https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account),
+[Portfolio Margin trade API](https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/trade)
+and [Portfolio Margin Pro account API](https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin-pro/api/rest-api/account).
 It calls only `GET`: each market's `time` and `account`, Spot `myTrades`, Futures
-`positionRisk`, `userTrades` and `income`. Tests verify HMAC and public-key
+`positionRisk`, `userTrades` and `income`, plus Portfolio `account` and `balance`
+and Pro SPAN `account`. Tests verify HMAC and public-key
 signatures independently, cross-check Ed25519/RSA signatures with OpenSSL, and
 exercise a local API fixture with the real Folio CLI, worker and Zond broker.
-Authenticated live account access has not yet been verified.
+Tests cover all four account modes with local fixtures. A verbose sync on the
+deployment machine verifies that its Binance account and key can read each section.
 
 ## Manual run and configuration
 

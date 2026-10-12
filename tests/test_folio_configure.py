@@ -205,6 +205,7 @@ def test_interactive_setup_prompts_for_provider_and_history(tmp_path, monkeypatc
             "BTCUSDT",
             "30",
             "ed25519",
+            "portfolio",
             "9888",
             str(tmp_path / "data"),
         ]
@@ -216,6 +217,7 @@ def test_interactive_setup_prompts_for_provider_and_history(tmp_path, monkeypatc
     assert name == "exchange" and settings.port == 9888
     connection = settings.connection(name)
     assert connection.binance.history_days == 30 and connection.binance.key_type == "ed25519"
+    assert connection.binance.account_mode == "portfolio"
     assert connection.binance.spot_symbols == ("BTCUSDT", "ETHUSDT")
     assert connection.max_pages == 200 and connection.min_sync_seconds == 60
     assert tomllib.loads(source)["storage"]["path"] == str(tmp_path / "data")
@@ -289,6 +291,11 @@ def test_recipient_reconciliation_migrates_owned_relays_and_preserves_policy(tmp
     assert "credential_adapters" not in parsed
     assert not parsed["principals"]["default"]["allow_exec"]
     assert set(parsed["credential_recipients"]) == {"folio-bank", "folio-binance", "other"}
+    assert parsed["credential_recipients"]["folio-binance"]["origins"] == [
+        "https://api.binance.com",
+        "https://fapi.binance.com",
+        "https://papi.binance.com",
+    ]
     assert parsed["credential_recipients"]["folio-bank"]["field_ids"] == [
         "otp",
         "password",

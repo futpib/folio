@@ -125,6 +125,7 @@ history_days = 1
         zond = subprocess.Popen(
             [ZONDD, "serve", "--config", str(zond_config)], stdout=log, stderr=log
         )
+        smoke = None
         try:
             wait(lambda: (tmp_path / "run/admin.sock").exists())
 
@@ -136,6 +137,58 @@ history_days = 1
                     return False
 
             wait(healthy)
+            call("call", "binance", "/api/v3/time")
+            smoke = subprocess.Popen(
+                [*cli, "call", "binance", "/api/v3/account", "--verbose"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            smoke_form = wait(lambda: request({"method": "pending"})["interactions"])[0]
+            assert [f["id"] for f in smoke_form["fields"]] == ["api_key", signing_field]
+            request(
+                {
+                    "method": "answer_interaction",
+                    "challenge_id": smoke_form["challenge_id"],
+                    "values": None,
+                }
+            )
+            smoke_out, smoke_err = smoke.communicate(timeout=10)
+            assert smoke.returncode == 1 and not smoke_out
+            assert b"declined or expired" in smoke_err
+            assert not request({"method": "pending"})["interactions"]
+            smoke = subprocess.Popen(
+                [*cli, "call", "binance", "/api/v3/account"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            wait(lambda: request({"method": "pending"})["interactions"])
+            smoke.terminate()
+            smoke.communicate(timeout=10)
+            wait(lambda: not request({"method": "pending"})["interactions"])
+            if key_type == "hmac":
+                smoke = subprocess.Popen(
+                    [*cli, "call", "binance", "/api/v3/account"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                wait(lambda: request({"method": "pending"})["interactions"])
+                folio.terminate()
+                folio.wait(timeout=15)
+                smoke.communicate(timeout=10)
+                wait(lambda: not request({"method": "pending"})["interactions"])
+                folio = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).with_name("binance_zond_fixture.py")),
+                        "--daemon",
+                        "--config",
+                        str(config),
+                    ],
+                    stdout=log,
+                    stderr=log,
+                    cwd=tmp_path,
+                )
+                wait(healthy)
             key_file = identity_path(settings, settings.connection("binance"))
             assert key_file.stat().st_mode & 0o777 == 0o600
             assert key_file.parent.stat().st_mode & 0o777 == 0o700
@@ -364,9 +417,16 @@ history_days = 1
                 {k: v for k, v in row.items() if k != "observed_at"} for row in positions["items"]
             ]
         finally:
+            if smoke is not None and smoke.poll() is None:
+                smoke.terminate()
+                smoke.communicate(timeout=10)
             for process in (folio, zond):
                 process.terminate()
-                process.wait(timeout=15)
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
         log.seek(0)
         assert KEY not in log.read()
         for file in tmp_path.rglob("*"):

@@ -11,12 +11,15 @@ from urllib.parse import parse_qs, urlsplit
 from playwright.async_api import TimeoutError as BrowserTimeout
 from playwright.async_api import async_playwright
 
+from .calls import CallRequest, CallResult, redact
+from .calls import target as call_target
 from .config import Connection, Settings
 from .credentials import CredentialFileError, read_credentials
 from .models import ConnectorError, LoginRequired, RateLimited, SchemaChanged
 from .observability import Recorder, browser_logging, current
 from .providers import (
     LOGIN_ORIGINS,
+    ORIGINS,
     PAGES,
     next_url,
     origin,
@@ -213,6 +216,131 @@ class BrowserConnector:
     def __init__(self, settings: Settings, connection: Connection, broker=None, *, env_file=None):
         self.settings, self.connection, self.broker = settings, connection, broker
         self.env_file = env_file
+
+    async def call(self, request: CallRequest):
+        provider = self.connection.provider
+        if request.method != "GET":
+            raise ValueError("Browser provider smoke calls support GET")
+        if request.public:
+            raise ValueError("--public applies to Binance calls")
+        call_target(request, ORIGINS[provider], origin(PAGES[provider][0]))
+        async with browser(self.settings, self.connection) as context:
+            return await self.call_in_context(context, request)
+
+    async def call_in_context(self, context, request):
+        provider = self.connection.provider
+        page = await context.new_page()
+        captured = asyncio.Queue()
+
+        def on_response(response):
+            if resource_for(provider, response.url, response.request.method):
+                captured.put_nowait(response)
+
+        page.on("response", on_response)
+        try:
+            await page.goto(PAGES[provider][0], wait_until="domcontentloaded", timeout=45000)
+            attempted, revisited = set(), False
+            for stage in range(5):
+                try:
+                    response = await asyncio.wait_for(captured.get(), 15 if stage == 0 else 3)
+                    await self.response_json(response)
+                    break
+                except (TimeoutError, LoginRequired):
+                    if provider == "wolt" and stage == 0:
+                        login_button = page.get_by_role("button", name="Log in", exact=True)
+                        if await login_button.count() == 1:
+                            await login_button.click()
+                    if await authenticate(
+                        page, provider, self.broker, attempted, env_file=self.env_file
+                    ):
+                        continue
+                    if attempted and not revisited:
+                        revisited = True
+                        await page.goto(
+                            PAGES[provider][0], wait_until="domcontentloaded", timeout=45000
+                        )
+                        continue
+                    raise LoginRequired(
+                        "Sign in with 'folio login CONNECTION' or finish the Zond form."
+                    ) from None
+            else:
+                raise LoginRequired("Browser login needs attention in 'folio login CONNECTION'.")
+            url, params = call_target(request, ORIGINS[provider], origin(response.url))
+            headers = {
+                k: v
+                for k, v in (await response.request.all_headers()).items()
+                if k.lower()
+                in {
+                    "authorization",
+                    "x-xsrf-token",
+                    "x-csrf-token",
+                    "x-auth-token",
+                    "x-ext-customer-id",
+                    "platform",
+                    "client-version",
+                    "clientversionnumber",
+                    "app-language",
+                    "app-locale",
+                    "client-language",
+                    "accept-language",
+                }
+            }
+            # The existing provider session supplies headers; callers never supply credentials.
+            result = await page.evaluate(
+                """async ({url, params, headers, max}) => {
+                const target = new URL(url);
+                for (const [key, value] of params) target.searchParams.append(key, value);
+                const response = await fetch(target, {headers, credentials: 'include',
+                    redirect: 'manual', signal: AbortSignal.timeout(30000)});
+                if (response.type === 'opaqueredirect')
+                    return {redirected: true};
+                const reader = response.body?.getReader();
+                const decoder = new TextDecoder();
+                let size = 0, body = '';
+                if (reader) {
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        size += value.length;
+                        if (size > max) { await reader.cancel(); throw new Error('Body limit'); }
+                        body += decoder.decode(value, {stream: true});
+                    }
+                    body += decoder.decode();
+                }
+                return {status: response.status, body,
+                    content_type: response.headers.get('content-type')};
+            }""",
+                {"url": url, "params": params, "headers": headers, "max": MAX_BODY},
+            )
+            if result.get("redirected"):
+                raise ConnectorError(
+                    "Provider redirected the call; the browser hides its status and body."
+                )
+            secrets = [
+                v
+                for k, v in headers.items()
+                if k.lower()
+                in {
+                    "authorization",
+                    "x-xsrf-token",
+                    "x-csrf-token",
+                    "x-auth-token",
+                    "x-ext-customer-id",
+                }
+            ]
+            secrets += [h.removeprefix("Bearer ") for h in secrets]
+            secrets += [
+                cookie["value"] for cookie in await context.cookies() if len(cookie["value"]) >= 8
+            ]
+            return CallResult(
+                result["status"], redact(result["body"], secrets), result["content_type"]
+            )
+        except (TimeoutError, BrowserTimeout):
+            raise LoginRequired(
+                "Browser session did not load; use 'folio login CONNECTION'."
+            ) from None
+        finally:
+            page.remove_listener("response", on_response)
 
     async def sync(self, since: str | None):
         async with browser(self.settings, self.connection) as context:

@@ -452,8 +452,8 @@ Enable reading and use the minimum permissions necessary for the selected accoun
 leave withdrawals and transfers disabled. Folio does not accept secrets in TOML,
 CLI arguments, process environment variables or its HTTP API.
 The Folio service receives credentials and must be trusted.
-Folio exposes only the fixed read endpoints listed below, even when a supplied
-key has broader account permissions.
+Normal Binance sync uses the fixed read endpoints listed below. One-off
+`folio call` diagnostics allow other GET endpoints on the supported API origins.
 
 Keys are held in Folio's memory and reused until it stops, all configured reads
 are rejected, or Binance reports an invalid key format or signature. They are
@@ -635,6 +635,66 @@ UTC and includes undated records with `occurred_at: null` and
 `undated_included: true`, rather than silently dropping them. Money amounts are
 decimal strings paired with a currency code when the provider supplies one.
 
+## One-off API calls
+
+`folio call CONNECTION ENDPOINT` runs one requested live call through the adapter.
+It uses the running Folio service, its credentials or browser profile, and the
+normal `.env.local`-first, Zond-if-missing authentication. It does not create a
+sync job, follow pagination, change connection configuration or save the response
+in the record store. Request metadata appears in `folio logs` with a `call_id`;
+queries, headers and response bodies are not logged. Unknown endpoint paths are
+redacted in logs because they may contain private identifiers.
+
+```sh
+# Portfolio Margin USD-M execution history, using Binance's default range:
+uv run folio call binance /papi/v1/um/userTrades \
+  --param symbol=ETHUSDT --param limit=1000 --verbose
+# Public request without loading credentials:
+uv run folio call binance /api/v3/time
+uv run folio call binance /api/v3/exchangeInfo --public
+# Classic Spot / USD-M / COIN-M:
+uv run folio call binance /api/v3/account
+uv run folio call binance /fapi/v3/positionRisk --param symbol=ETHUSDT
+uv run folio call binance /dapi/v1/positionRisk --param symbol=BTCUSD_PERP
+# Browser providers reuse the signed-in session:
+uv run folio call bog /rest/rb --param serviceId=ACCOUNTS_GET_ACCOUNTS_AND_DETAILS
+uv run folio call wolt https://consumer-api.wolt.com/order-xp/web/v1/pages/orders
+# IBKR uses its existing local read API and exposure policy:
+uv run folio call ibkr /v1/positions
+uv run folio call ibkr /v1/contracts/details --method POST --data '{"symbol":"AAPL"}'
+```
+
+GET is supported by every adapter; IBKR also supports POST for its read queries
+and accepts `--data-file PATH` for longer JSON bodies. An endpoint can contain a
+query string, or repeat `--param KEY=VALUE`, including repeated parameter names.
+Binance chooses the API origin from `/api/`, `/sapi/`, `/fapi/`, `/dapi/` or `/papi/`;
+the exact endpoint you specify is used without account-mode probing or fallback.
+Browser URLs must belong to that provider's supported origins; relative browser
+paths use the captured API origin. IBKR paths stay inside its local adapter.
+Redirects and automatic retries are not followed.
+
+Binance signs calls by default; use `--public` for public endpoints. Its known
+server-time endpoints automatically omit authentication and update the in-memory
+clock. A signed call uses a clock already available from a sync/time call, or the
+machine clock, so it sends exactly one HTTP request. On a timestamp rejection,
+call the corresponding `/api/v3/time`, `/fapi/v1/time` or `/dapi/v1/time` and retry.
+Browser adapters first load their application page to obtain session headers and
+complete login if needed; this preparation can make additional requests before
+the single requested API call.
+
+The provider body is printed as text, preserving JSON decimal precision and
+showing provider error messages. Known API keys, signing secrets, signatures and
+browser session credentials echoed in a body are redacted. HTTP status is printed
+to stderr; non-2xx status exits with code 1. `--verbose` also prints request logs.
+Responses are bounded at 16 MiB for Binance/IBKR and 8 MiB for browser providers.
+These are one-off diagnostics: approve an exact `folio call` command in Zond when
+needed, rather than granting an arbitrary-endpoint rule. Lot matching and other
+interpretation belong in separate tools consuming the returned data.
+
+After updating an existing installation, run `uv sync --locked`, then
+`systemctl --user restart folio.service` to load the new code. Service setup is
+not needed when connection and credential-recipient configuration are unchanged.
+
 ## HTTP interface
 
 The new service binds only to `127.0.0.1`; it has no remote authentication or TLS.
@@ -645,14 +705,20 @@ accounts can reach the loopback listener, so use a trusted machine.
 ```text
 GET  /v1/connections
 POST /v1/connections/{name}/sync              JSON body: {}
+POST /v1/connections/{name}/call              JSON body: {"endpoint":"...","params":[["key","value"]]}
 GET  /v1/jobs/{id}
 GET  /v1/connections/{name}/logs?after=0&limit=1000&job=...
 GET  /v1/connections/{name}/records/{resource}?since=...&limit=100&offset=0
 ```
 
+The call response contains `id`, provider `status`, `content_type`, raw text
+`body`, and metadata-only `logs`. A received provider error still returns this
+envelope; transport/authentication failures return a Folio error with HTTP 502.
+
 Follow `next_offset` to paginate stored records, or `next_after` for logs. The
-optional `job` filter limits logs to that connection's job. There is no public profile,
-password-answer, browser-control, arbitrary URL, or CDP endpoint.
+optional `job` filter limits logs to that connection's job. Provider calls stay
+within adapter-owned origins. There is no public profile, password-answer,
+browser-control or CDP endpoint.
 
 An IBKR connection also exposes the existing typed live API under
 `/v1/connections/{name}/ibkr/v1/...`. The first configured IBKR connection serves

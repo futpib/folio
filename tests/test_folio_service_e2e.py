@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from binance_fixture import KEY, SECRET
+from binance_fixture import KEY, NOW, SECRET
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 
@@ -88,6 +88,24 @@ coinm_symbols = ["BTCUSD_PERP"]
                     time.sleep(0.05)
                 else:
                     raise AssertionError("standalone Folio did not start")
+            public = subprocess.run(
+                [*cli, "call", "binance", "/api/v3/time", "--verbose"],
+                capture_output=True,
+                timeout=15,
+                check=True,
+            )
+            assert json.loads(public.stdout)["serverTime"] == NOW
+            assert b"HTTP 200" in public.stderr and b"call_completed" in public.stderr
+            assert b"credentials_requested" not in public.stderr
+            call_error = subprocess.run(
+                [*cli, "call", "binance", "/api/v3/account", "--verbose"],
+                capture_output=True,
+                timeout=15,
+            )
+            assert call_error.returncode == 1
+            assert json.loads(call_error.stdout)["code"] == -2015
+            assert b"HTTP 401" in call_error.stderr
+            assert signing_value.encode() not in call_error.stdout + call_error.stderr
             rejected = subprocess.run(
                 [*cli, "sync", "binance", "--verbose"], capture_output=True, timeout=15
             )
@@ -115,6 +133,30 @@ coinm_symbols = ["BTCUSD_PERP"]
                 return json.loads(response.stdout)
 
             before = {r: read(r) for r in ("balances", "positions", "trades")}
+            calls = subprocess.run(
+                [
+                    *cli,
+                    "call",
+                    "binance",
+                    "/fapi/v1/userTrades",
+                    "--param",
+                    "symbol=BTCUSDT",
+                    "--param",
+                    f"startTime={NOW - 86400000}",
+                    "--param",
+                    f"endTime={NOW}",
+                    "--param",
+                    "limit=1000",
+                    "--verbose",
+                ],
+                capture_output=True,
+                timeout=15,
+                check=True,
+            )
+            assert len(json.loads(calls.stdout)) == 1
+            assert b"HTTP 200" in calls.stderr
+            assert calls.stderr.count(b"request_started") == 1
+            assert {r: read(r) for r in before} == before
             denied = tmp_path / "denied-endpoints.json"
             denied.write_text(
                 json.dumps(

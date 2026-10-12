@@ -4,6 +4,7 @@ import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -13,6 +14,7 @@ from . import __version__
 from .binance import BinanceConnector
 from .broker import ServiceBroker
 from .browser import BrowserConnector
+from .calls import CallRequest
 from .config import Connection, Settings
 from .ibkr import IbkrConnector
 from .models import ConnectorError, SyncRequest
@@ -28,7 +30,8 @@ def utc(value: datetime | None) -> str | None:
     return value.astimezone(UTC).isoformat()
 
 
-async def worker(store: Store, connection: Connection, connector, broker=None):
+async def worker(store: Store, connection: Connection, connector, broker=None, *, lock=None):
+    lock = lock or asyncio.Lock()
     with exclusive(store.directory / f"{connection.id}.worker.lock"):
         store.recover(connection.id)
         while True:
@@ -36,9 +39,10 @@ async def worker(store: Store, connection: Connection, connector, broker=None):
             if job is None:
                 await asyncio.sleep(0.25)
                 continue
-            with recording(store, connection, job["id"]) as log:
-                log.emit("job_started")
-                await run_job(store, connection, connector, broker, job, log)
+            async with lock:
+                with recording(store, connection, job["id"]) as log:
+                    log.emit("job_started")
+                    await run_job(store, connection, connector, broker, job, log)
 
 
 async def run_job(store, connection, connector, broker, job, log):
@@ -85,6 +89,7 @@ async def run_job(store, connection, connector, broker, job, log):
 def create_app(settings: Settings, *, connectors=None) -> FastAPI:
     store = Store(settings.state_dir)
     configured = {c.id: c for c in settings.connections}
+    locks = {name: asyncio.Lock() for name in configured}
     brokers = {
         c.id: ServiceBroker(settings, c)
         for c in settings.connections
@@ -118,7 +123,9 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
                         )
                 async with asyncio.TaskGroup() as tasks:
                     running = [
-                        tasks.create_task(worker(store, c, connectors[c.id], brokers.get(c.id)))
+                        tasks.create_task(
+                            worker(store, c, connectors[c.id], brokers.get(c.id), lock=locks[c.id])
+                        )
                         for c in settings.connections
                     ]
                     try:
@@ -181,6 +188,7 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
                     else {}
                 ),
                 "live_api": f"/v1/connections/{c.id}/ibkr" if c.provider == "ibkr" else None,
+                "call_api": f"/v1/connections/{c.id}/call",
             }
             for c in settings.connections
         ]
@@ -189,6 +197,76 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
     async def sync(name: str, request: SyncRequest):
         connection(name)
         return store.queue(name, None)
+
+    @app.post("/v1/connections/{name}/call")
+    async def call(name: str, spec: CallRequest, request: Request):
+        selected = connection(name)
+        ident = str(uuid4())
+
+        async def run():
+            async with locks[name]:
+                with recording(store, selected, call_id=ident) as log:
+                    log.emit("call_started")
+                    try:
+                        result = await connectors[name].call(spec)
+                        log.emit("call_completed", status=result.status)
+                        return {
+                            "id": ident,
+                            "status": result.status,
+                            "content_type": result.content_type,
+                            "body": result.body,
+                            "logs": log.items,
+                        }
+                    except ValueError as error:
+                        log.emit("call_failed", error_code="invalid_call")
+                        raise HTTPException(400, str(error)) from None
+                    except ConnectorError as error:
+                        log.emit("call_failed", error_code=error.code)
+                        return JSONResponse(
+                            status_code=502,
+                            content={
+                                "id": ident,
+                                "error": str(error),
+                                "error_code": error.code,
+                                "logs": log.items,
+                            },
+                        )
+                    except asyncio.CancelledError:
+                        log.emit("call_failed", error_code="cancelled")
+                        raise
+                    except Exception:
+                        log.emit("call_failed", error_code="connector_failed")
+                        return JSONResponse(
+                            status_code=502,
+                            content={
+                                "id": ident,
+                                "error": "Provider call failed; check connectivity "
+                                "or sign in again.",
+                                "error_code": "connector_failed",
+                                "logs": log.items,
+                            },
+                        )
+                    finally:
+                        if isinstance(brokers.get(name), ServiceBroker):
+                            brokers[name].close()
+
+        task = asyncio.create_task(run())
+
+        async def disconnected():
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+
+        watcher = asyncio.create_task(disconnected())
+        try:
+            done, _ = await asyncio.wait({task, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            if task not in done:
+                raise HTTPException(499, "caller disconnected")
+            return await task
+        finally:
+            for pending in (task, watcher):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(task, watcher, return_exceptions=True)
 
     @app.get("/v1/jobs/{ident}")
     async def job(ident: str):

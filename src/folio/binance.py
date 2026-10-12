@@ -1,4 +1,4 @@
-"""Fixed Binance read endpoints with local credentials and Zond fallback."""
+"""Binance collection and one-off read calls with local credentials and Zond fallback."""
 
 from __future__ import annotations
 
@@ -8,12 +8,13 @@ import json
 import time
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 
 from .binance_keys import Credentials as Credentials
 from .binance_keys import PassphraseRequired, private_pem, read_binance_credentials
+from .calls import CallRequest, CallResult, response_result, target
 from .config import BinanceSettings, Connection
 from .credentials import CredentialFileError
 from .models import (
@@ -752,7 +753,87 @@ class BinanceConnector:
             warnings=warnings,
         )
 
+    async def call(self, request: CallRequest):
+        if request.method != "GET":
+            raise ValueError("Binance smoke calls support GET")
+        prefix = httpx.URL(request.endpoint).path.split("/")[1:2]
+        market = {
+            "api": "spot",
+            "sapi": "spot",
+            "fapi": "usdm",
+            "dapi": "coinm",
+            "papi": "portfolio",
+        }.get(prefix[0] if prefix else "")
+        if market is None:
+            raise ValueError(
+                "Binance endpoint must start with /api/, /sapi/, /fapi/, /dapi/ or /papi/"
+            )
+        url, params = target(request, {ORIGINS[market]}, ORIGINS[market])
+        public = request.public or any(
+            url == endpoint(m, "time") for m in ("spot", "usdm", "coinm")
+        )
+
+        async def single(client):
+            headers, secrets = {}, []
+            query = list(params)
+            if not public:
+                server, observed = self.clocks.get(
+                    "spot" if market == "portfolio" else market,
+                    (int(time.time() * 1000), time.monotonic()),
+                )
+                query += [
+                    ("timestamp", str(server + int((time.monotonic() - observed) * 1000))),
+                    ("recvWindow", "5000"),
+                ]
+                signature = self.credentials.sign(urlencode(query))
+                query.append(("signature", signature))
+                headers["X-MBX-APIKEY"] = self.credentials.key
+                secrets = [
+                    self.credentials.key,
+                    signature,
+                    quote(signature, safe=""),
+                    self.credentials.secret,
+                ]
+            await asyncio.sleep(max(0, self.last_request + self.pace - time.monotonic()))
+            self.last_request = time.monotonic()
+            known = {endpoint(m, op) for m, ops in ENDPOINTS.items() for op in ops}
+            known |= {
+                endpoint(m, op, "portfolio") for m, ops in PORTFOLIO_ENDPOINTS.items() for op in ops
+            }
+            with RequestLog(
+                "GET", url if url in known else ORIGINS[market] + "/<smoke-call>"
+            ) as log:
+                try:
+                    # Preserve duplicate parameter order: sign exactly the transmitted query.
+                    requested = url + ("?" + urlencode(query) if query else "")
+                    async with client.stream("GET", requested, headers=headers) as response:
+                        result = await response_result(response, secrets=secrets)
+                    try:
+                        payload = json.loads(result.body)
+                    except ValueError:
+                        payload = None
+                    code = payload.get("code") if isinstance(payload, dict) else None
+                    code = code if type(code) is int else None
+                    log.finish(status=result.status, code=code)
+                    if public and isinstance(payload, dict) and "serverTime" in payload:
+                        self.clocks[market] = (millis(payload["serverTime"]), time.monotonic())
+                    if code in {-2014, -1022}:
+                        self.credentials = None
+                    return result
+                except httpx.HTTPError:
+                    raise ConnectorError("Could not reach the Binance API securely.") from None
+
+        if not public:
+            return await self.authenticated(single)
+        async with httpx.AsyncClient(
+            trust_env=False, follow_redirects=False, timeout=20, transport=self.transport
+        ) as client:
+            return await single(client)
+
     async def sync(self, since):
+        return await self.authenticated(self.collect)
+
+    async def authenticated(self, action):
         challenge = None
         answered = False
         resolved = False
@@ -817,7 +898,7 @@ class BinanceConnector:
                                 resolved = True
                                 raise LoginRequired(
                                     "Binance API credentials were declined or expired; "
-                                    f"retry 'folio sync {self.connection.id}'."
+                                    "retry the Folio command."
                                 )
                             try:
                                 if any(
@@ -848,9 +929,10 @@ class BinanceConnector:
                 timeout=20,
                 transport=self.transport,
             ) as client:
-                result = await self.collect(client)
+                result = await action(client)
             if challenge:
-                await self.broker.result(challenge, "succeeded")
+                success = not isinstance(result, CallResult) or 200 <= result.status < 300
+                await self.broker.result(challenge, "succeeded" if success else "failed")
                 resolved = True
             return result
         except asyncio.CancelledError:

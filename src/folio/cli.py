@@ -36,7 +36,13 @@ def daemon():
             print("Folio configuration is valid")
             return
         os.umask(0o077)
-        uvicorn.run(create_app(settings), host="127.0.0.1", port=settings.port, access_log=False)
+        uvicorn.run(
+            create_app(settings),
+            host="127.0.0.1",
+            port=settings.port,
+            access_log=False,
+            timeout_graceful_shutdown=5,
+        )
     except (OSError, ValueError) as error:
         parser.exit(1, f"foliod: {error}\n")
 
@@ -59,6 +65,20 @@ def main():
     sync.add_argument("connection")
     sync.add_argument("--detach", action="store_true")
     sync.add_argument("--verbose", action="store_true", help="show each provider request on stderr")
+    call = sub.add_parser("call", help="make one live adapter call for a smoke test")
+    call.add_argument("connection")
+    call.add_argument("endpoint", help="provider path or URL (IBKR: local /v1/... route)")
+    call.add_argument("--param", action="append", default=[], metavar="KEY=VALUE")
+    call.add_argument(
+        "--method", choices=["GET", "POST"], default="GET", help="POST is for IBKR read queries"
+    )
+    data = call.add_mutually_exclusive_group()
+    data.add_argument("--data", help="JSON request body for IBKR POST queries")
+    data.add_argument("--data-file", type=Path, help="file containing a JSON request body")
+    call.add_argument(
+        "--public", action="store_true", help="Binance: omit credentials and signature"
+    )
+    call.add_argument("--verbose", action="store_true", help="show request metadata on stderr")
     job = sub.add_parser("job", help="inspect or follow a durable sync job")
     job.add_argument("id")
     job.add_argument("--follow", action="store_true")
@@ -113,6 +133,40 @@ def main():
                     time.sleep(1)
             if args.command == "connections":
                 response = client.get("/v1/connections")
+            elif args.command == "call":
+                from .calls import CallRequest
+
+                connection = settings.connection(args.connection)
+                params = []
+                for value in args.param:
+                    key, separator, value = value.partition("=")
+                    if not separator or not key:
+                        parser.error("--param requires KEY=VALUE")
+                    params.append((key, value))
+                spec = CallRequest(
+                    endpoint=args.endpoint,
+                    method=args.method,
+                    params=params,
+                    body=args.data_file.read_text() if args.data_file else args.data,
+                    public=args.public,
+                )
+                response = client.post(
+                    f"/v1/connections/{connection.id}/call",
+                    json=spec.model_dump(),
+                    timeout=httpx.Timeout(360, connect=15),
+                )
+                result = response.json()
+                if args.verbose:
+                    for row in result.get("logs", []):
+                        print(format_log(row), file=sys.stderr)
+                if "body" not in result:
+                    print(json.dumps(result, indent=2, ensure_ascii=False), file=sys.stderr)
+                    raise SystemExit(1)
+                print(f"HTTP {result['status']}", file=sys.stderr)
+                print(result["body"], end="" if result["body"].endswith("\n") else "\n")
+                if not 200 <= result["status"] < 300:
+                    raise SystemExit(1)
+                return
             elif args.command == "read":
                 connection = settings.connection(args.connection)
                 if args.resource not in connection.resources:
@@ -166,6 +220,8 @@ def main():
             if isinstance(result, dict) and result.get("state") == "failed":
                 raise SystemExit(1)
     except KeyboardInterrupt:
+        if args.command == "call":
+            parser.exit(130, "Stopped the one-off call.\n")
         if args.command == "logs":
             parser.exit(130, "Stopped following logs.\n")
         if args.command in {"setup", "config", "credentials", "binance-keygen"}:

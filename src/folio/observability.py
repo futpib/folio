@@ -18,10 +18,13 @@ current = ContextVar("folio_request_log", default=None)
 
 
 class Recorder:
-    def __init__(self, store, connection, job=None):
+    def __init__(self, store, connection, job=None, *, call_id=None):
         self.store, self.connection, self.job = store, connection, job
+        self.call_id, self.items = call_id, []
 
     def emit(self, event, **fields):
+        if self.call_id is not None:
+            fields["call_id"] = self.call_id
         try:
             row = self.store.append_log(self.connection, self.job, event, fields)
         except (OSError, sqlite3.Error):
@@ -35,11 +38,13 @@ class Recorder:
             }
         with suppress(OSError, ValueError):
             print(json.dumps(row, separators=(",", ":")), file=sys.stderr, flush=True)
+        if self.call_id is not None:
+            self.items.append(row)
 
 
 @contextmanager
-def recording(store, connection, job=None):
-    recorder = Recorder(store, connection, job)
+def recording(store, connection, job=None, *, call_id=None):
+    recorder = Recorder(store, connection, job, call_id=call_id)
     token = current.set(recorder)
     try:
         yield recorder

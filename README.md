@@ -45,6 +45,18 @@ Use `folio logs NAME --follow` to watch retained logs, or
 endpoints, timing, HTTP status and safe error codes; credentials, query strings,
 headers and response bodies are excluded.
 
+For a one-off API smoke test, use `folio call` with a provider endpoint:
+
+```sh
+uv run folio call binance /papi/v1/um/userTrades --param symbol=ETHUSDT --verbose
+```
+
+It prints the provider body to stdout and HTTP status to stderr, using the adapter's
+existing authentication. Binance, BoG, Wolt and IBKR support calls; they do not
+collect pages, alter sync selections or save responses as account records.
+Use individual Zond command approvals for these diagnostics. Keep reusable rules
+scoped to the regular data-reading commands. See the [call guide](docs/folio.md#one-off-api-calls).
+
 Binance sync keeps the sections the API key can read. Denied sections produce
 warnings and `complete: false`; cached data from those sections retains its
 previous timestamps. A key that cannot read any configured section still fails

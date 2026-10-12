@@ -1,4 +1,14 @@
-# IBKR TWS HTTP
+# Folio
+
+Folio generalizes this project into a local, read-only service for IBKR, Bank of
+Georgia personal banking, and Wolt customer order history. It adds named
+connections, durable sync jobs, a SQLite data store, and private Chromium sessions.
+
+Start with the [Folio setup and usage guide](docs/folio.md). BoG and Wolt browser
+connectors are experimental and still need verification with authenticated real
+accounts. Existing IBKR interfaces and exposure policies remain supported.
+
+## Existing IBKR interface
 
 `ibkr-tws-http` exposes a deliberately small, read-only HTTP API backed by a
 local Interactive Brokers TWS or IB Gateway connection. It uses IBKR's official

@@ -1,0 +1,14 @@
+# Managed by scripts/setup-folio.py. Use systemctl --user edit for overrides.
+[Unit]
+Description=Folio read-only personal data service
+
+[Service]
+Type=simple
+ExecStart=@EXECUTABLE@ --config @CONFIG@
+UMask=0077
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

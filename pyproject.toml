@@ -4,34 +4,37 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ibkr-tws-http"
-version = "0.10.2"
-description = "A narrow, read-only HTTP facade for a local IBKR TWS API"
+version = "0.11.0"
+description = "Folio: local read-only access to IBKR, Bank of Georgia and Wolt data"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
   "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
   "ibapi @ git+https://github.com/deepentropy/ibapi.git@e27eff9c8cd9da7d91ffabaa4db86fec683956e7",
+  "playwright>=1.56,<2",
   "protobuf==5.29.5",
   "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "httpx>=0.28,<1",
   "pytest>=8.3,<9",
   "pytest-cov>=6,<8",
   "ruff>=0.11,<1",
 ]
 
 [project.scripts]
+folio = "folio.cli:main"
+foliod = "folio.cli:daemon"
 ibkr-tws = "ibkr_tws_http.cli:main"
 ibkr-tws-http = "ibkr_tws_http.main:main"
 ibkr-tws-http-smoke = "ibkr_tws_http.smoke:main"
 ibkr-tws-http-mock = "ibkr_tws_http.mock_tws:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ibkr_tws_http"]
+packages = ["src/ibkr_tws_http", "src/folio"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

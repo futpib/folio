@@ -1,0 +1,26 @@
+[server]
+port = 8080
+
+# On Arch/Manjaro, install chromium. Omit this section to use Playwright's
+# bundled browser after running: uv run playwright install chromium
+[browser]
+executable = "/usr/bin/chromium"
+
+# Uncomment to preserve an existing IBKR policy and Gateway connection.
+# Stop the old HTTP service before starting foliod: they must not share a client ID.
+# [connections.ibkr]
+# provider = "ibkr"
+# ibkr_config = "~/.config/ibkr-tws-http/config.toml"
+
+[connections.bog]
+provider = "bog"
+min_sync_seconds = 300
+max_pages = 100
+
+[connections.wolt]
+provider = "wolt"
+min_sync_seconds = 300
+max_pages = 100
+
+# For browser login through zond, set credential_adapter = true on each browser
+# connection and run scripts/setup-folio.py --zond. Otherwise use folio login.

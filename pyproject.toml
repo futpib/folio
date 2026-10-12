@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
+  "cryptography>=46,<51",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "ibapi @ git+https://github.com/deepentropy/ibapi.git@e27eff9c8cd9da7d91ffabaa4db86fec683956e7",

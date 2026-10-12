@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import time
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 
 import httpx
 
+from .binance_keys import Credentials as Credentials
+from .binance_keys import PassphraseRequired, private_pem, read_binance_credentials
 from .config import BinanceSettings, Connection
-from .credentials import CredentialFileError, read_credentials
+from .credentials import CredentialFileError
 from .models import ConnectorError, LoginRequired, RateLimited, Record, SchemaChanged, Snapshot
 
 DAY = 86_400_000
@@ -46,25 +45,6 @@ ENDPOINTS = {
         "income": "/dapi/v1/income",
     },
 }
-
-
-@dataclass(repr=False)
-class Credentials:
-    key: str = field(repr=False)
-    secret: str = field(repr=False)
-
-    @classmethod
-    def from_values(cls, values):
-        # HMAC credentials are single ASCII tokens, not RSA/Ed25519 PEM private keys.
-        if not isinstance(values, dict) or any(
-            not isinstance(values.get(k), str)
-            or not 16 <= len(values[k]) <= 512
-            or not values[k].isascii()
-            or not values[k].isalnum()
-            for k in ("api_key", "api_secret")
-        ):
-            raise LoginRequired("Set a valid Binance HMAC key and secret in .env.local or Zond.")
-        return cls(values["api_key"], values["api_secret"])
 
 
 def decimal(value) -> str:
@@ -276,8 +256,8 @@ class BinanceConnector:
                 timestamp=server + int((time.monotonic() - observed) * 1000), recvWindow=5000
             )
             query = urlencode(params)
-            signature = hmac.new(self.credentials.secret.encode(), query.encode(), hashlib.sha256)
-            url += f"?{query}&signature={signature.hexdigest()}"
+            signature = self.credentials.sign(query)
+            url += f"?{query}&{urlencode({'signature': signature})}"
             headers["X-MBX-APIKEY"] = self.credentials.key
         self.last_request = time.monotonic()
         try:
@@ -436,47 +416,88 @@ class BinanceConnector:
         try:
             if self.credentials is None:
                 try:
-                    values = read_credentials("binance", self.env_file)
+                    values = read_binance_credentials(self.env_file, key_type=self.options.key_type)
                 except CredentialFileError as error:
                     raise LoginRequired(str(error)) from None
                 try:
+                    asymmetric = self.options.key_type in ("ed25519", "rsa") or (
+                        self.options.key_type == "auto"
+                        and ("private_key" in values or "private_key_file" in values)
+                    )
                     fields = [
                         {"id": "api_key", "label": "API key", "kind": "secret"},
-                        {"id": "api_secret", "label": "HMAC secret key", "kind": "secret"},
+                        {
+                            "id": "private_key" if asymmetric else "api_secret",
+                            "label": "Private PEM key (use \\n for newlines)"
+                            if asymmetric
+                            else "Signing key: HMAC secret or PEM (use \\n for newlines)",
+                            "kind": "secret",
+                        },
                     ]
-                    missing = [field for field in fields if field["id"] not in values]
-                    if missing:
-                        if self.broker is None:
-                            raise LoginRequired(
-                                "Start the Binance API credential adapter through zond."
+                    passphrase = {
+                        "id": "private_key_passphrase",
+                        "label": "Private key passphrase",
+                        "kind": "secret",
+                    }
+                    pem = values.get("private_key", "")
+                    if asymmetric and private_pem(pem).startswith(
+                        b"-----BEGIN ENCRYPTED PRIVATE KEY-----"
+                    ):
+                        fields.append(passphrase)
+                    while True:
+                        missing = [field for field in fields if field["id"] not in values]
+                        if missing:
+                            if self.broker is None:
+                                raise LoginRequired(
+                                    "Start the Binance API credential adapter through zond."
+                                )
+                            if challenge:
+                                # Zond requires a result before opening the next credential step.
+                                await self.broker.result(challenge, "succeeded")
+                                challenge, answered, resolved = None, False, False
+                            challenge = await self.broker.challenge(
+                                "Binance API",
+                                missing,
+                                ", ".join(
+                                    ORIGINS[m]
+                                    for m in dict.fromkeys(("spot", *self.options.markets))
+                                ),
                             )
-                        challenge = await self.broker.challenge(
-                            "Binance HMAC API",
-                            missing,
-                            ", ".join(
-                                ORIGINS[m] for m in dict.fromkeys(("spot", *self.options.markets))
-                            ),
-                        )
-                        answer = await self.broker.receive()
-                        if (
-                            answer.get("type") != "answered"
-                            or answer.get("challenge_id") != challenge
-                        ):
-                            raise RuntimeError("unexpected credential response")
-                        supplied = answer.pop("values", None)
-                        answered = supplied is not None
-                        if not answered:
-                            resolved = True
-                            raise LoginRequired(
-                                "Binance API credentials were declined or expired; retry in zond."
-                            )
+                            answer = await self.broker.receive()
+                            if (
+                                answer.get("type") != "answered"
+                                or answer.get("challenge_id") != challenge
+                            ):
+                                raise RuntimeError("unexpected credential response")
+                            supplied = answer.pop("values", None)
+                            answered = supplied is not None
+                            if not answered:
+                                resolved = True
+                                raise LoginRequired(
+                                    "Binance API credentials were declined or expired; "
+                                    "retry in zond."
+                                )
+                            try:
+                                if any(
+                                    not isinstance(supplied.get(field["id"]), str)
+                                    or not supplied[field["id"]]
+                                    for field in missing
+                                ):
+                                    raise LoginRequired(
+                                        "Binance credential fields cannot be empty."
+                                    )
+                                values.update(
+                                    {field["id"]: supplied[field["id"]] for field in missing}
+                                )
+                            finally:
+                                supplied.clear()
                         try:
-                            values.update(
-                                {field["id"]: supplied.get(field["id"]) for field in missing}
+                            self.credentials = Credentials.from_values(
+                                values, self.options.key_type
                             )
-                        finally:
-                            supplied.clear()
-                    self.credentials = Credentials.from_values(values)
+                            break
+                        except PassphraseRequired:
+                            fields = [passphrase]
                 finally:
                     values.clear()
             async with httpx.AsyncClient(

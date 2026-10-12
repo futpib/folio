@@ -17,7 +17,7 @@ remain supported.
   live contract, quote, option, and historical-bar endpoints remain available.
 - **Binance:** Spot balances and per-symbol trades; USD-M and optional COIN-M
   Futures balances, open positions, trades, and income including funding fees,
-  commissions and realized P&L. Uses signed REST API reads with HMAC credentials
+  commissions and realized P&L. Uses signed REST API reads with Ed25519, RSA or HMAC credentials
   read from `.env.local` or requested through Zond when missing.
   See [Binance setup](#binance-spot-and-futures).
 - **Bank of Georgia personal banking:** browser collection of accounts,
@@ -113,6 +113,9 @@ lists the supported names:
 ```dotenv
 BINANCE_API_KEY=
 BINANCE_API_SECRET=
+BINANCE_PRIVATE_KEY_FILE=
+BINANCE_PRIVATE_KEY=
+BINANCE_PRIVATE_KEY_PASSPHRASE=
 BOG_USERNAME=
 BOG_PASSWORD=
 WOLT_EMAIL=
@@ -134,6 +137,8 @@ Use one `NAME=value` per line; single or double quotes, `export`, and trailing
 comments are supported. Quote passwords containing spaces or `#`. Values are
 literal: `$variables`, `${expressions}`, and shell commands are never expanded.
 Inside quotes, backslash escapes the matching quote or another backslash.
+For Binance PEM material only, literal `\n` sequences become newlines after
+loading; passwords and passphrases stay literal.
 The file is read directly, without exporting secrets to process environment
 variables. Each adapter receives only its provider's entries. Keep the file
 readable only by its owner, for example with `chmod 600 .env.local`.
@@ -159,6 +164,7 @@ min_sync_seconds = 300
 max_pages = 100
 
 [connections.binance.binance]
+key_type = "auto"
 markets = ["spot", "usdm"]
 spot_symbols = ["BTCUSDT", "ETHUSDT"]
 usdm_symbols = ["BTCUSDT"]
@@ -188,13 +194,50 @@ Chromium installation. The Folio daemon and Zond adapter must both be running.
 For manual setup, register that command using the existing Zond credential
 adapter mechanism and restart Folio after adding the connection.
 
-Create a **system-generated HMAC API key** in Binance API Management. Enable
-reading and use the minimum permissions necessary for the selected accounts;
-leave withdrawals and transfers disabled. Set `BINANCE_API_KEY` and
-`BINANCE_API_SECRET` in `.env.local`, or leave them absent to enter them in Zond's
-masked fields. Folio does not accept secrets in TOML, CLI arguments,
-process environment variables or its HTTP API. RSA and Ed25519 keys are not supported by
-this connector. The configured adapter sees the secrets and must be trusted.
+For a new key, choose **Self-generated** on Binance and use **Ed25519**.
+Binance [recommends Ed25519 and marks HMAC deprecated](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/api_key_types.md).
+Generate the key locally, even before configuring a connection or starting Folio:
+
+```sh
+uv run folio binance-keygen
+```
+
+This prints only the public PEM key. Paste the complete output, including the
+`BEGIN PUBLIC KEY` and `END PUBLIC KEY` lines, into Binance. Folio saves the
+private key as `.secrets/binance-ed25519.pem` with owner-only permissions and
+registers its relative path as `BINANCE_PRIVATE_KEY_FILE` in `.env.local`.
+Both locations are ignored by Git. Repeating the command prints the same public
+key; it does not rotate or overwrite the private key. Other credentials and
+comments in `.env.local` are preserved. A different configured private key is
+never replaced. `--type rsa` generates a 2048-bit RSA key instead, and
+`--env-file PATH` selects another credential file and adjacent `.secrets` directory.
+
+When Binance supplies the API key, set `BINANCE_API_KEY` in `.env.local`, or
+leave it empty to enter it through Zond. The generated private key is unencrypted;
+access is controlled by owner-only file and directory permissions. Keep it with
+your private backups: the public key cannot recreate it.
+
+Existing Ed25519 or RSA keys can be supplied through `BINANCE_PRIVATE_KEY_FILE`
+(absolute, home-relative, or relative to `.env.local`) or `BINANCE_PRIVATE_KEY`
+(PKCS#8 PEM on one line using literal `\n` separators). RSA keys must be 2048 or
+4096 bits. For an encrypted PKCS#8 file, supply `BINANCE_PRIVATE_KEY_PASSPHRASE`
+or let Zond request it. Zond requests only missing values; if an encrypted key
+is entered interactively, its passphrase is a subsequent masked step. A missing
+referenced key file falls back to Zond; an unreadable or malformed one fails
+without printing its contents. Only signatures and the API key go to Binance.
+
+`key_type = "auto"` detects the supplied key. A configured private key takes
+precedence over a legacy HMAC secret. With no private-key configuration, Zond's
+signing-key field accepts either an HMAC secret or a PEM with literal `\n`
+separators. Set `key_type = "ed25519"` or `"rsa"` to enforce that type and request
+a private key even when `.env.local` is entirely absent. Existing system-generated
+keys continue to work with `BINANCE_API_SECRET`; `key_type = "hmac"` explicitly
+selects that legacy mode.
+
+Enable reading and use the minimum permissions necessary for the selected accounts;
+leave withdrawals and transfers disabled. Folio does not accept secrets in TOML,
+CLI arguments, process environment variables or its HTTP API.
+The configured adapter sees the secrets and must be trusted.
 Folio exposes only the fixed read endpoints listed below, even when a supplied
 key has broader account permissions.
 
@@ -247,9 +290,10 @@ The implementation follows Binance's official
 [COIN-M account and income API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-coin-m-futures/api/rest-api/account),
 and [COIN-M trade and position API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-coin-m-futures/api/rest-api/trade).
 It calls only `GET`: each market's `time` and `account`, Spot `myTrades`, Futures
-`positionRisk`, `userTrades` and `income`. Binance tests use independent HMAC
-verification and a local API fixture with the real Folio CLI, worker and Zond
-broker. Authenticated live account access has not yet been verified.
+`positionRisk`, `userTrades` and `income`. Tests verify HMAC and public-key
+signatures independently, cross-check Ed25519/RSA signatures with OpenSSL, and
+exercise a local API fixture with the real Folio CLI, worker and Zond broker.
+Authenticated live account access has not yet been verified.
 
 ## Manual run and configuration
 

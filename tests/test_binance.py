@@ -255,6 +255,8 @@ def test_config_and_api_expose_only_fixed_reads(tmp_path):
         valid + 'api_key="no"',
         valid + '[connections.binance.binance]\nurl="https://attacker.test"',
         valid + '[connections.binance.binance]\nmarkets=["wrong"]',
+        valid + '[connections.binance.binance]\nkey_type="ecdsa"',
+        valid + '[connections.binance.binance]\nkey_type={}',
         valid + "[connections.binance.binance]\nmarkets=[{}]",
         valid + "[connections.binance.binance]\nhistory_days=91",
         valid + '[connections.binance.binance]\nspot_symbols=["BTCUSDT", "BTCUSDT"]',

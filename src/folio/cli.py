@@ -13,6 +13,7 @@ import uvicorn
 
 from .browser import BrowserConnector, login
 from .config import Settings, default_config
+from .credentials import CredentialFileError
 from .store import Store
 
 
@@ -83,10 +84,22 @@ def main():
     broker.add_argument("connection")
     api = sub.add_parser("api-adapter", help="run the Binance API worker through zond")
     api.add_argument("connection")
+    keygen = sub.add_parser(
+        "binance-keygen", help="store a signing key locally and print its public key"
+    )
+    keygen.add_argument("--type", choices=["ed25519", "rsa"], default="ed25519")
+    keygen.add_argument(
+        "--env-file", type=Path, help="credentials file (default: checkout .env.local)"
+    )
     args = parser.parse_args()
     try:
-        settings = Settings.load(args.config)
         os.umask(0o077)
+        if args.command == "binance-keygen":
+            from .binance_keys import generate_key
+
+            print(generate_key(args.type, env_file=args.env_file), end="")
+            return
+        settings = Settings.load(args.config)
         if args.command in {"login", "browser-adapter", "api-adapter"}:
             connection = settings.connection(args.connection)
             if connection.provider == "ibkr":
@@ -159,6 +172,6 @@ def main():
                 raise SystemExit(1)
     except KeyboardInterrupt:
         parser.exit(130, "Detached. Use 'folio job ID --follow' to resume following.\n")
-    except (OSError, ValueError, httpx.HTTPError) as error:
+    except (OSError, ValueError, httpx.HTTPError, CredentialFileError) as error:
         # No provider response bodies, credentials or browser exceptions in CLI diagnostics.
         parser.exit(1, f"folio: {error}\n")

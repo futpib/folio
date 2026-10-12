@@ -25,7 +25,8 @@ max_pages = 100
 # For browser login through zond, set credential_adapter = true on each browser
 # connection and run scripts/setup-folio.py --zond. Otherwise use folio login.
 
-# Binance uses its REST API, with HMAC keys from .env.local and Zond for missing values.
+# Binance uses its REST API, with local keys and Zond for missing values.
+# Run `uv run folio binance-keygen` for an Ed25519 public key to register with Binance.
 # Uncomment and select the markets and trade symbols you use. Empty symbol
 # lists skip trade history; Futures income is collected across all symbols.
 # [connections.binance]
@@ -33,6 +34,7 @@ max_pages = 100
 # credential_adapter = true
 # max_pages = 100
 # [connections.binance.binance]
+# key_type = "auto" # Or ed25519/rsa/hmac to require a particular signing algorithm.
 # markets = ["spot", "usdm"] # Add "coinm" for COIN-M Futures.
 # spot_symbols = ["BTCUSDT", "ETHUSDT"]
 # usdm_symbols = ["BTCUSDT"]

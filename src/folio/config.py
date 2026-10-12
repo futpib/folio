@@ -24,6 +24,7 @@ class BinanceSettings:
     usdm_symbols: tuple[str, ...] = ()
     coinm_symbols: tuple[str, ...] = ()
     history_days: int = 7
+    key_type: str = "auto"
 
     @classmethod
     def load(cls, data):
@@ -33,6 +34,7 @@ class BinanceSettings:
             "usdm_symbols",
             "coinm_symbols",
             "history_days",
+            "key_type",
         }:
             raise ConfigError("unknown Binance settings")
         markets = data.get("markets", ["spot", "usdm"])
@@ -62,7 +64,10 @@ class BinanceSettings:
         days = data.get("history_days", 7)
         if type(days) is not int or not 1 <= days <= 90:
             raise ConfigError("binance.history_days must be between 1 and 90")
-        return cls(markets=tuple(markets), history_days=days, **symbols)
+        key_type = data.get("key_type", "auto")
+        if key_type not in ("auto", "hmac", "ed25519", "rsa"):
+            raise ConfigError("binance.key_type must be auto, hmac, ed25519 or rsa")
+        return cls(markets=tuple(markets), history_days=days, key_type=key_type, **symbols)
 
 
 def default_config() -> Path:

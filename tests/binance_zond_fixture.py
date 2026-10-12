@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 from binance_fixture import Api
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
 import folio.binance as binance
 from folio.cli import main
@@ -32,6 +33,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    public = Path.cwd() / "fixture-public.pem"
+    if public.exists():
+        api.public_key = load_pem_public_key(public.read_bytes())
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     for market in binance.ORIGINS:
         binance.ORIGINS[market] = f"http://127.0.0.1:{server.server_port}"

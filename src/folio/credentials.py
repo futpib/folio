@@ -9,7 +9,13 @@ from pathlib import Path
 
 DEFAULT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env.local"
 FIELDS = {
-    "binance": ("api_key", "api_secret"),
+    "binance": (
+        "api_key",
+        "api_secret",
+        "private_key",
+        "private_key_file",
+        "private_key_passphrase",
+    ),
     "bog": ("username", "password"),
     "wolt": ("username", "email", "password"),
     "ibkr": ("username", "password"),
@@ -20,10 +26,14 @@ class CredentialFileError(Exception):
     pass
 
 
+def credential_path(path: Path | None = None) -> Path:
+    return path if path is not None else DEFAULT_ENV_FILE
+
+
 def read_credentials(provider: str, path: Path | None = None) -> dict[str, str]:
     names = {f"{provider}_{field}".upper(): field for field in FIELDS[provider]}
     try:
-        with (path if path is not None else DEFAULT_ENV_FILE).open(encoding="utf-8") as stream:
+        with credential_path(path).open(encoding="utf-8") as stream:
             content = stream.read(65537)
     except FileNotFoundError:
         return {}

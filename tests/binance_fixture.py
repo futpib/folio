@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
 
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 NOW = 1_792_000_000_000
 KEY = "FolioFixtureApiKey123456"
@@ -44,11 +48,12 @@ def income(ident=1, kind="FUNDING_FEE"):
 
 
 class Api:
-    def __init__(self):
+    def __init__(self, public_key=None):
         self.requests = []
         self.uid = 42
         self.failure = None
         self.history = None
+        self.public_key = public_key
 
     def handle(self, request):
         path = request.url.path
@@ -57,8 +62,23 @@ class Api:
             assert "X-MBX-APIKEY" not in request.headers
             return httpx.Response(200, json={"serverTime": NOW})
         encoded, signature = request.url.query.decode().rsplit("&signature=", 1)
-        expected = hmac.new(SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
-        if request.headers["X-MBX-APIKEY"] != KEY or not hmac.compare_digest(expected, signature):
+        if self.public_key is None:
+            expected = hmac.new(SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+            valid = hmac.compare_digest(expected, signature)
+        else:
+            try:
+                raw = base64.b64decode(unquote(signature), validate=True)
+                if isinstance(self.public_key, rsa.RSAPublicKey):
+                    self.public_key.verify(
+                        raw, encoded.encode(), padding.PKCS1v15(), hashes.SHA256()
+                    )
+                else:
+                    self.public_key.verify(raw, encoded.encode())
+                valid = True
+            except (ValueError, InvalidSignature):
+                valid = False
+            assert all(c not in signature for c in "+/="), "base64 signatures must be URL encoded"
+        if request.headers["X-MBX-APIKEY"] != KEY or not valid:
             return httpx.Response(401, json={"code": -2015, "msg": "Bad key: " + KEY + SECRET})
         params = {k: v[0] for k, v in parse_qs(encoded).items()}
         assert NOW <= int(params.pop("timestamp")) < NOW + 60_000

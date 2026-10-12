@@ -11,12 +11,47 @@ from pathlib import Path
 import httpx
 import pytest
 from binance_fixture import KEY, SECRET
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 
 ZONDD = os.environ.get("FOLIO_TEST_ZONDD")
 
 
 @pytest.mark.skipif(not ZONDD, reason="set FOLIO_TEST_ZONDD for real API adapter E2E")
-def test_real_cli_http_worker_and_zond_decline_retry_authentication_and_restart(tmp_path):
+@pytest.mark.parametrize("key_type", ["hmac", "ed25519", "rsa"])
+def test_real_cli_http_worker_and_zond_decline_retry_authentication_and_restart(tmp_path, key_type):
+    signing_field = "api_secret" if key_type == "hmac" else "private_key"
+    signing_value = SECRET
+    encrypted_signing_value = SECRET
+    if key_type != "hmac":
+        private = (
+            ed25519.Ed25519PrivateKey.generate()
+            if key_type == "ed25519"
+            else rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        )
+        signing_value = (
+            private.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+            .decode()
+            .replace("\n", "\\n")
+        )
+        encrypted_signing_value = (
+            private.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.BestAvailableEncryption(b"FixtureKeyPassphrase"),
+            )
+            .decode()
+            .replace("\n", "\\n")
+        )
+        (tmp_path / "fixture-public.pem").write_bytes(
+            private.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        )
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -30,6 +65,7 @@ provider = "binance"
 credential_adapter = true
 min_sync_seconds = 1
 [connections.binance.binance]
+key_type = "{key_type}"
 markets = ["spot", "usdm", "coinm"]
 spot_symbols = ["BTCUSDT"]
 usdm_symbols = ["BTCUSDT"]
@@ -95,7 +131,7 @@ cwd = {json.dumps(str(tmp_path))}
             job = call("sync", "binance", "--detach")
             first = wait(lambda: request({"method": "pending"})["interactions"])[0]
             assert first["recipient"]["label"] == "Configured Binance API fixture"
-            assert [f["id"] for f in first["fields"]] == ["api_key", "api_secret"]
+            assert [f["id"] for f in first["fields"]] == ["api_key", signing_field]
             request(
                 {
                     "method": "answer_interaction",
@@ -112,7 +148,7 @@ cwd = {json.dumps(str(tmp_path))}
                 {
                     "method": "answer_interaction",
                     "challenge_id": second["challenge_id"],
-                    "values": {"api_key": "WrongFixtureApiKey123", "api_secret": SECRET},
+                    "values": {"api_key": "WrongFixtureApiKey123", signing_field: signing_value},
                 }
             )
             wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "unavailable")
@@ -124,9 +160,20 @@ cwd = {json.dumps(str(tmp_path))}
                 {
                     "method": "answer_interaction",
                     "challenge_id": third["challenge_id"],
-                    "values": {"api_key": KEY, "api_secret": SECRET},
+                    "values": {"api_key": KEY, signing_field: encrypted_signing_value},
                 }
             )
+            if key_type != "hmac":
+                unlock = wait(lambda: request({"method": "pending"})["interactions"])[0]
+                assert [f["id"] for f in unlock["fields"]] == ["private_key_passphrase"]
+                assert unlock["challenge_id"] != third["challenge_id"]
+                request(
+                    {
+                        "method": "answer_interaction",
+                        "challenge_id": unlock["challenge_id"],
+                        "values": {"private_key_passphrase": "FixtureKeyPassphrase"},
+                    }
+                )
             wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "ready")
             positions = call("read", "binance", "positions")
             assert len(positions["items"]) == 4
@@ -166,19 +213,21 @@ cwd = {json.dumps(str(tmp_path))}
             env_file.write_text(f"BINANCE_API_KEY={KEY}\n")
             request({"method": "retry_adapter", "adapter": "binance"})
             fifth = wait(restarted_form)[0]
-            assert [f["id"] for f in fifth["fields"]] == ["api_secret"]
+            assert [f["id"] for f in fifth["fields"]] == [signing_field]
             assert KEY not in json.dumps(fifth)
             request(
                 {
                     "method": "answer_interaction",
                     "challenge_id": fifth["challenge_id"],
-                    "values": {"api_secret": SECRET},
+                    "values": {signing_field: signing_value},
                 }
             )
             wait(lambda: request({"method": "pending"})["adapters"][0]["state"] == "ready")
             zond.terminate()
             zond.wait(timeout=10)
-            env_file.write_text(f"BINANCE_API_KEY={KEY}\nBINANCE_API_SECRET={SECRET}\n")
+            env_file.write_text(
+                f"BINANCE_API_KEY={KEY}\nBINANCE_{signing_field.upper()}={signing_value}\n"
+            )
             zond = subprocess.Popen(
                 [ZONDD, "serve", "--config", str(zond_config)], stdout=log, stderr=log
             )
@@ -199,3 +248,6 @@ cwd = {json.dumps(str(tmp_path))}
             if file.is_file() and file != tmp_path / ".env.local":
                 content = file.read_bytes()
                 assert KEY.encode() not in content and SECRET.encode() not in content, file
+                assert signing_value.encode() not in content, file
+                assert encrypted_signing_value.encode() not in content, file
+                assert b"FixtureKeyPassphrase" not in content, file

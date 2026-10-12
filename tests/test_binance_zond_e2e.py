@@ -14,14 +14,15 @@ from binance_fixture import KEY, SECRET
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 
-from folio.broker import socket_path
+from folio.broker import identity_path
 from folio.config import Settings
+from folio.configure import recipient_config
 from folio.store import Store
 
 ZONDD = os.environ.get("FOLIO_TEST_ZONDD")
 
 
-@pytest.mark.skipif(not ZONDD, reason="set FOLIO_TEST_ZONDD for real API adapter E2E")
+@pytest.mark.skipif(not ZONDD, reason="set FOLIO_TEST_ZONDD for real public credential API E2E")
 @pytest.mark.parametrize("key_type", ["hmac", "ed25519", "rsa"])
 def test_real_cli_http_worker_and_zond_decline_retry_authentication_and_restart(tmp_path, key_type):
     signing_field = "api_secret" if key_type == "hmac" else "private_key"
@@ -64,6 +65,8 @@ def test_real_cli_http_worker_and_zond_decline_retry_authentication_and_restart(
 port = {port}
 [storage]
 path = {json.dumps(str(tmp_path / "state"))}
+[zond]
+socket = {json.dumps(str(tmp_path / "run/credential.sock"))}
 [connections.binance]
 provider = "binance"
 credential_adapter = true
@@ -77,19 +80,12 @@ coinm_symbols = ["BTCUSD_PERP"]
 history_days = 1
 """)
     zond_config = tmp_path / "zond.toml"
-    adapter_args = [
-        "--config",
-        str(config),
-        "credential-relay",
-        "binance",
-    ]
-    zond_config.write_text(f"""runtime_dir = {json.dumps(str(tmp_path / "run"))}
-[credential_adapters.binance]
-label = "Configured Binance API fixture"
-program = {json.dumps(str(Path(sys.executable).parent / "folio"))}
-args = {json.dumps(adapter_args)}
-cwd = {json.dumps(str(tmp_path))}
-""")
+    settings = Settings.load(config)
+    zond_config.write_text(
+        recipient_config(
+            f"runtime_dir = {json.dumps(str(tmp_path / 'run'))}\n", config, {}, settings
+        ).replace("Folio binance (binance)", "Configured Binance API fixture")
+    )
     zond_config.chmod(0o600)
     binaries = Path(sys.executable).parent
     cli = [str(binaries / "folio"), "--config", str(config)]
@@ -140,16 +136,33 @@ cwd = {json.dumps(str(tmp_path))}
                     return False
 
             wait(healthy)
-            settings = Settings.load(config)
-            relay_socket = socket_path(settings, settings.connection("binance"))
-            wait(relay_socket.exists)
-            assert relay_socket.stat().st_mode & 0o777 == 0o600
-            assert relay_socket.parent.stat().st_mode & 0o777 == 0o700
-            # An unrelated process with the same UID cannot impersonate foliod.
+            key_file = identity_path(settings, settings.connection("binance"))
+            assert key_file.stat().st_mode & 0o777 == 0o600
+            assert key_file.parent.stat().st_mode & 0o777 == 0o700
+            # A recipient name and matching UID alone do not authenticate a client.
             with socket.socket(socket.AF_UNIX) as intruder:
                 intruder.settimeout(5)
-                intruder.connect(str(relay_socket))
-                assert intruder.recv(1024) == b""
+                intruder.connect(str(tmp_path / "run/credential.sock"))
+                intruder.sendall(
+                    (
+                        json.dumps(
+                            {
+                                "version": 1,
+                                "id": 1,
+                                "body": {
+                                    "method": "authenticate",
+                                    "recipient": "folio-binance",
+                                    "key": "0" * 64,
+                                },
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                assert (
+                    json.loads(intruder.makefile("rb").readline())["body"]["code"]
+                    == "authentication_failed"
+                )
             job = call("sync", "binance", "--detach")
             first = wait(lambda: request({"method": "pending"})["interactions"])[0]
             assert first["recipient"]["label"] == "Configured Binance API fixture"

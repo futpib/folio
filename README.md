@@ -18,7 +18,7 @@ uv run folio setup
 ```
 
 It configures any supported provider, preserves existing connections, registers
-credential relays when Zond is configured, and starts the standalone user service.
+credential recipients when Zond is configured, and starts the standalone user service.
 For Binance with defaults:
 
 ```sh
@@ -154,6 +154,15 @@ all accounts available to this login). `XDG_CONFIG_HOME` is respected when set;
 it must match your systemd user manager's configuration directory.
 
 ### Include headless Gateway sign-in through zond
+
+Zondd's public credential API v1 requires Gateway to run under its own supervisor.
+Migrate an existing Gateway adapter with `zondctl credential-adapter`, a private
+connection identity and a `[credential_recipients]` registration as described in
+[Zond's migration guide](https://github.com/futpib/zondd/blob/master/adapters/readme.md#migrating-existing-pipe-adapters).
+Folio setup migrates its own Binance/BoG/Wolt relays. It preserves IBKR's account
+policy and refuses to remove an existing Gateway adapter; migrate that binding
+first. The `--gateway` installer and instructions below target earlier zondd
+releases with `[credential_adapters]` support.
 
 Install Gateway, the Java build tools, Xvfb, and a current zond release supporting
 credential adapters. On Arch/Manjaro:
@@ -359,6 +368,10 @@ CLI query inputs are arguments. No shell wrapper or forwarded HTTP port is
 needed.
 
 ## Gateway sign-in through zond
+
+With public API v1, supervise this adapter independently using Zond's
+`credential-adapter` bridge. The legacy supervision instructions above apply to
+earlier zondd releases.
 
 This repository's optional [IB Gateway adapter](adapters/ibgateway/readme.md)
 can run Gateway on a private Xvfb display and collect login credentials through

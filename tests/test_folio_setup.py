@@ -6,47 +6,42 @@ from pathlib import Path
 
 import pytest
 
+from folio.config import Settings
+
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("folio_setup", ROOT / "scripts/setup-folio.py")
 setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
 
 
-def test_setup_preserves_ibkr_config_and_builds_fixed_adapter_commands(tmp_path):
+def test_setup_preserves_ibkr_policy_and_registers_scoped_recipients(tmp_path):
     legacy = tmp_path / "ibkr-tws-http/config.toml"
     legacy.parent.mkdir()
     original = "[server]\nport=9812\n[tws]\nclient_id=82\n"
     legacy.write_text(original)
-    source = setup.config_source(tmp_path, zond=True, chromium="/usr/bin/chromium", port=None)
+    source = setup.config_source(tmp_path, zond=True, chromium="/usr/bin/true", port=None)
     parsed = tomllib.loads(source)
+    parsed["storage"] = {"path": str(tmp_path / "state")}
     assert parsed["server"]["port"] == 9812
     assert parsed["connections"]["ibkr"]["ibkr_config"] == str(legacy)
     assert legacy.read_text() == original
     config = tmp_path / "folio/config.toml"
+    settings = Settings.from_data(parsed, config)
     zond = '[principals.test]\npolicy="ask"\n'
-    result = setup.adapter_config(zond, config, parsed["connections"])
+    result = setup.recipient_config(zond, config, parsed["connections"], settings)
     assert result.startswith(zond)
-    adapters = tomllib.loads(result)["credential_adapters"]
-    assert set(adapters) == {"folio-bog", "folio-wolt"}
-    assert adapters["folio-bog"]["args"][-2:] == ["credential-relay", "bog"]
-    assert setup.adapter_config(result, config, parsed["connections"]) == result
+    recipients = tomllib.loads(result)["credential_recipients"]
+    assert set(recipients) == {"folio-bog", "folio-wolt"}
+    assert recipients["folio-bog"]["field_ids"] == ["otp", "password", "username"]
+    assert "program" not in recipients["folio-bog"]
+    assert setup.recipient_config(result, config, parsed["connections"], settings) == result
     with pytest.raises(ValueError, match="custom"):
-        setup.adapter_config(
-            result.replace("Folio bog", "Custom bank"), config, parsed["connections"]
+        setup.recipient_config(
+            result.replace("Folio bog", "Custom bank"), config, parsed["connections"], settings
         )
     unit = setup.render_unit(config)
     assert "UMask=0077" in unit and "Restart=on-failure" in unit
-    assert str(config) in unit
-
-
-def test_setup_selects_api_adapter_for_binance(tmp_path):
-    result = setup.adapter_config(
-        "",
-        tmp_path / "folio.toml",
-        {"binance": {"provider": "binance", "credential_adapter": True}},
-    )
-    item = tomllib.loads(result)["credential_adapters"]["folio-binance"]
-    assert item["args"][-2:] == ["credential-relay", "binance"]
+    assert "zondd.service" not in unit and str(config) in unit
 
 
 def test_missing_chromium_keeps_default_toml_valid(tmp_path):

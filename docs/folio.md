@@ -59,9 +59,10 @@ validates the result and installs/starts the user service. IBKR connections reus
 an existing Gateway/TWS configuration and its exposure policy. Gateway installation
 and its first login remain covered by the [IBKR setup guide](../README.md#include-headless-gateway-sign-in-through-zond).
 Browser connections need Chromium. If Zond is installed and configured, setup
-registers private credential relays and preserves its existing SSH policy and
-other adapters. Without Zond, setup still starts Folio; missing credentials then
-produce an actionable login error.
+registers credential recipients and preserves its existing SSH policy and
+other recipients. Existing Gateway or custom legacy adapters must first migrate
+to their own service using Zond's `credential-adapter` bridge. Without Zond, setup
+still starts Folio; missing credentials then produce an actionable login error.
 
 Give a name to edit one connection. Add `--yes` to use existing values or defaults
 without prompts; flags change only the selected settings:
@@ -111,11 +112,12 @@ uv run folio setup --yes
 `config set` accepts a TOML value; quote strings and arrays as in the examples.
 `config unset` can remove optional fields or a connection, provided the remaining
 configuration is valid. Use a new connection name when changing providers.
-Run `setup --yes` after individual edits to apply service and adapter changes.
-Setup restarts Folio to apply configuration and code changes, and refreshes its
-managed credential relays without restarting Gateway or unrelated Zond adapters.
-It migrates old managed `api-adapter`/`browser-adapter` workers to credential
-relays. Removed managed relays are retired during setup.
+Run `setup --yes` after individual edits to apply service and recipient changes.
+Setup restarts Folio to apply configuration and code changes. It replaces its old
+managed `api-adapter`/`browser-adapter`/`credential-relay` entries with public API
+registrations and removes registrations for retired Folio connections. Other
+recipients and SSH policy are preserved. Existing Gateway and custom legacy
+adapters need their own migration before setup can validate the new Zond config.
 
 Enter credentials with masked prompts instead of placing secrets in commands:
 
@@ -186,23 +188,23 @@ interactive login and background sync cannot use the same profile simultaneously
 The saved session is reused by later headless syncs.
 
 For login forms through zond, install using `--zond` (combine it with
-`--replace-ibkr-service` when migrating). Setup adds fixed `folio-bog` and
-`folio-wolt` credential adapters to the existing zond configuration. For an
+`--replace-ibkr-service` when migrating). Setup adds `folio-bog` and
+`folio-wolt` credential recipients to the existing zond configuration. For an
 existing Folio config, first set `credential_adapter = true` on each browser
-connection. Provider work always runs in Folio. The Zond adapter only relays
-credential challenges and answers. Both services are needed only when a login
-requires missing credentials or an interactive code.
+connection. Provider work always runs in Folio. Its lazy public API client
+connects directly to Zond for missing credentials. Both services are needed only
+when a login requires missing credentials or an interactive code.
 
 A sync that encounters a recognized password/email form first reads local
 credentials as described below. Missing values and one-time codes open
-an application-input request in zond. Answers use its private adapter channel,
+an application-input request in zond. Answers use its authenticated private socket,
 are filled only on the provider's allowed origin, and are never stored in the
 Folio database or logs. Each credential step is submitted at most once per sync.
 A decline or unsuccessful login does not automatically retry credentials.
 Run `folio sync CONNECTION` for a new attempt. CAPTCHA, QR, magic-link,
 or otherwise unfamiliar flows require `folio login` and a subsequent sync.
 The account session itself can have broader authority than Folio's public API;
-the configured adapter executable and its Chromium profile must be trusted.
+the Folio service, its connection identity and its Chromium profile must be trusted.
 
 ## Local credentials and Zond fallback
 
@@ -298,25 +300,36 @@ uv run folio read binance trades --since 2026-10-01
 uv run folio read binance income --since 2026-10-01
 ```
 
-With `--zond`, setup registers `folio-binance` using
-`folio credential-relay binance`, with fixed configuration and executable paths.
-This process only relays authentication; the Binance worker runs inside `foliod`.
-A Binance-only configuration needs no Chromium installation. Folio works without
-Zond when local credentials are complete; `credential_adapter = false` disables
-the optional fallback entirely. For manual fallback setup, register the relay
-command using Zond's credential-adapter mechanism and restart Folio after adding
-the connection.
+With Zond configured, `folio setup --yes` registers `folio-binance` as a public API
+recipient. All provider workers run inside `foliod`; systemd owns the standalone
+Folio service. A Binance-only configuration needs no Chromium installation.
+Complete local credentials work with Zond stopped or absent;
+`credential_adapter = false` disables the optional fallback entirely. This
+configuration name remains compatible with existing Folio connections.
 
-This integration uses Zond's credential-adapter protocol v1, which exposes private
-pipes to processes Zond launches. The relay provides a private Unix socket for
-Folio's missing-field requests.
-The socket is owner-only and checks the connecting UID and Folio daemon PID.
-It validates credential fields and provider origins. Zond's configured recipient
-is the relay; the relay verifies the receiving Folio process. It performs no
-provider requests and exits after Folio disconnects, withdrawing pending forms.
-Folio's current client requires that adapter API. A direct public credential API
-for registered standalone services would remove this extra hop and needs its own
-client integration.
+Folio uses Zond's public credential API v1 over `credential.sock`. Setup reads
+Zond's runtime directory and writes the absolute endpoint to `[zond].socket` in
+Folio's config. It provisions a distinct random identity in
+`STATE_DIR/zond/CONNECTION.key` (directory 0700, file 0600), puts only its SHA-256
+digest in Zond's `[credential_recipients.folio-CONNECTION]`, and registers the
+provider's allowed origins and field IDs. Names longer than 58 characters use a
+shortened recipient name with a hash suffix. Reruns reuse the identity. Provider
+credentials remain separate in `.env.local` or transient answer values.
+
+Setup authenticates a short test connection without requesting any provider
+values, then disconnects. During sync, Folio opens a connection only when a
+required field is missing. Challenge and response IDs are correlated, answers
+are kept in memory, and cancellation withdraws the form and discards an answer
+that was already in flight. Closing the connection invalidates pending input;
+a later sync reconnects with a fresh session. Restarting Zond never restarts
+Folio or discards Binance credentials already loaded into memory.
+
+The identity authenticates possession of a private connection key, together
+with the peer UID. It does not attest the Folio executable or systemd unit.
+Keep the key private; software able to read it can use that registration.
+No connection key or answer is placed in argv, exported environment values,
+Folio's database, or request logs. Setup retains generated identity files if a
+later service check fails, while restoring config and service changes.
 
 For a new key, choose **Self-generated** on Binance and use **Ed25519**.
 Binance [recommends Ed25519 and marks HMAC deprecated](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/api_key_types.md).
@@ -389,7 +402,7 @@ selects that legacy mode.
 Enable reading and use the minimum permissions necessary for the selected accounts;
 leave withdrawals and transfers disabled. Folio does not accept secrets in TOML,
 CLI arguments, process environment variables or its HTTP API.
-The Folio service and optional credential relay see the secrets and must be trusted.
+The Folio service receives credentials and must be trusted.
 Folio exposes only the fixed read endpoints listed below, even when a supplied
 key has broader account permissions.
 
@@ -507,8 +520,8 @@ interval is five minutes; pagination is paced at one page per second. A 429
 pauses subsequent jobs for at least Retry-After (up to a day). Failed jobs are
 not automatically resubmitted. A Folio restart marks an interrupted job failed
 and retains queued jobs. Authentication failures allow a fresh sync immediately
-after correcting credentials. Zond's adapter Retry action does not start Folio
-jobs or override provider cooldowns.
+after correcting credentials. Start a new Folio sync to retry; Zond only handles
+the credential form.
 
 Each successful sync is committed atomically. Account/balance/position snapshots
 replace previous current values. Histories merge by provider IDs and retain

@@ -7,7 +7,6 @@ import tomllib
 from pathlib import Path
 
 import pytest
-import tomlkit
 from cryptography.hazmat.primitives import serialization
 
 from folio import configure
@@ -252,46 +251,76 @@ def test_invalid_setup_leaves_existing_configuration_unchanged(tmp_path, monkeyp
     assert "--yes" in result.stderr
 
 
-def test_adapter_reconciliation_preserves_policy_and_retires_only_owned_workers(tmp_path):
-    original = (
-        "# Keep policy and Gateway\n[principals.default]\nallow_exec = false\n"
-        '[credential_adapters.ibkr]\nprogram = "/usr/bin/true"\n'
-    )
+def test_recipient_reconciliation_migrates_owned_relays_and_preserves_policy(tmp_path):
+    import json
+
+    from folio.broker import identity_path
+
     config = tmp_path / "folio.toml"
     connections = {
         "bank": {"provider": "bog", "credential_adapter": True},
         "binance": {"provider": "binance", "credential_adapter": True},
     }
-    source = configure.adapter_config(original, config, connections)
-    parsed = tomllib.loads(source)
-    assert not parsed["principals"]["default"]["allow_exec"]
-    assert parsed["credential_adapters"]["folio-binance"]["args"] == [
+    settings = Settings.from_data(
+        {"storage": {"path": str(tmp_path / "state")}, "connections": connections}, config
+    )
+    legacy_args = [
         "--config",
         str(config),
         "--watch-config",
         "--worker-revision",
-        parsed["credential_adapters"]["folio-binance"]["args"][4],
+        "0" * 64,
         "credential-relay",
         "binance",
     ]
-    old = tomllib.loads(source)
-    del old["credential_adapters"]["folio-binance"]["args"][3:5]
-    old["credential_adapters"]["folio-binance"]["args"][3] = "api-adapter"
-    old["credential_adapters"]["folio-bank"]["args"][5] = "browser-adapter"
-    assert (
-        tomllib.loads(configure.adapter_config(tomlkit.dumps(old), config, connections)) == parsed
+    original = (
+        "# Keep policy\n[principals.default]\nallow_exec = false\n"
+        '[credential_recipients.other]\nlabel = "Other"\nkey_sha256 = "'
+        + "0"
+        * 64
+        + '"\nfield_ids = ["password"]\norigins = ["https://example.test"]\n'
+        '[credential_adapters.folio-binance]\nlabel = "Folio binance (binance)"\n'
+        f"program = {json.dumps(str(configure.ROOT / '.venv/bin/folio'))}\n"
+        f"cwd = {json.dumps(str(configure.ROOT))}\n"
+        f"args = {json.dumps(legacy_args)}\n"
     )
-    assert configure.adapter_config(source, config, connections) == source
-    reduced = configure.adapter_config(
-        source, config, {"bank": {"provider": "bog", "credential_adapter": False}}
+    source = configure.recipient_config(original, config, connections, settings)
+    parsed = tomllib.loads(source)
+    assert "credential_adapters" not in parsed
+    assert not parsed["principals"]["default"]["allow_exec"]
+    assert set(parsed["credential_recipients"]) == {"folio-bank", "folio-binance", "other"}
+    assert parsed["credential_recipients"]["folio-bank"]["field_ids"] == [
+        "otp",
+        "password",
+        "username",
+    ]
+    key_file = identity_path(settings, settings.connection("binance"))
+    key = key_file.read_bytes()
+    assert key_file.stat().st_mode & 0o777 == 0o600
+    assert key_file.parent.stat().st_mode & 0o777 == 0o700
+    assert key.decode().strip() not in source
+    assert configure.recipient_config(source, config, connections, settings) == source
+    assert key_file.read_bytes() == key
+    reduced_settings = Settings.from_data(
+        {
+            "storage": {"path": str(tmp_path / "state")},
+            "connections": {"bank": {"provider": "bog"}},
+        },
+        config,
     )
-    assert set(tomllib.loads(reduced)["credential_adapters"]) == {"ibkr"}
-    assert "# Keep policy and Gateway" in reduced
+    reduced = configure.recipient_config(source, config, {}, reduced_settings)
+    assert set(tomllib.loads(reduced)["credential_recipients"]) == {"other"}
+    assert "# Keep policy" in reduced
     with pytest.raises(ValueError, match="custom"):
-        configure.adapter_config(
+        configure.recipient_config(
             source.replace('label = "Folio binance (binance)"', 'label = "Custom"'),
             config,
             connections,
+            settings,
+        )
+    with pytest.raises(ValueError, match="own service"):
+        configure.recipient_config(
+            '[credential_adapters.ibkr]\nprogram="/usr/bin/true"\n', config, connections, settings
         )
 
 

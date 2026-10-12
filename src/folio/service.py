@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated
@@ -106,29 +105,22 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
         with exclusive(settings.state_dir / "daemon.lock"):
-            pid_path = settings.state_dir / "daemon.pid"
-            fd = os.open(pid_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "w") as stream:
-                stream.write(str(os.getpid()))
-            try:
-                async with AsyncExitStack() as stack:
-                    for connector in connectors.values():
-                        if isinstance(connector, IbkrConnector):
-                            await stack.enter_async_context(
-                                connector.app.router.lifespan_context(connector.app)
-                            )
-                    async with asyncio.TaskGroup() as tasks:
-                        running = [
-                            tasks.create_task(worker(store, c, connectors[c.id], brokers.get(c.id)))
-                            for c in settings.connections
-                        ]
-                        try:
-                            yield
-                        finally:
-                            for task in running:
-                                task.cancel()
-            finally:
-                pid_path.unlink(missing_ok=True)
+            async with AsyncExitStack() as stack:
+                for connector in connectors.values():
+                    if isinstance(connector, IbkrConnector):
+                        await stack.enter_async_context(
+                            connector.app.router.lifespan_context(connector.app)
+                        )
+                async with asyncio.TaskGroup() as tasks:
+                    running = [
+                        tasks.create_task(worker(store, c, connectors[c.id], brokers.get(c.id)))
+                        for c in settings.connections
+                    ]
+                    try:
+                        yield
+                    finally:
+                        for task in running:
+                            task.cancel()
 
     app = FastAPI(
         title="Folio",

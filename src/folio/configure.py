@@ -302,46 +302,45 @@ def installer():
     return module
 
 
-def adapter_config(source, config, connections):
+def recipient_config(source, config, connections, settings=None):
+    from .binance import ORIGINS
+    from .broker import provision_identity, read_identity, recipient_name
+    from .providers import LOGIN_ORIGINS
+
+    settings = settings or Settings.from_data({"connections": connections}, config)
     doc = tomlkit.parse(source)
-    adapters = table(doc, "credential_adapters")
     desired = {}
-    revision = hashlib.sha256()
-    for path in [*sorted((ROOT / "src/folio").glob("*.py")), ROOT / "uv.lock"]:
-        revision.update(path.name.encode())
-        revision.update(path.read_bytes())
-    for ident, connection in connections.items():
-        if connection.get("credential_adapter"):
-            desired["folio-" + ident] = {
-                "label": f"Folio {connection['provider']} ({ident})",
-                "program": str(ROOT / ".venv/bin/folio"),
-                "args": [
-                    "--config",
-                    str(config),
-                    "--watch-config",
-                    "--worker-revision",
-                    revision.hexdigest(),
-                    "credential-relay",
-                    ident,
-                ],
-                "cwd": str(ROOT),
+    for connection in settings.connections:
+        if connection.credential_adapter:
+            key = provision_identity(settings, connection)
+            desired[recipient_name(connection.id)] = {
+                "label": f"Folio {connection.provider} ({connection.id})",
+                "key_sha256": hashlib.sha256(key.encode()).hexdigest(),
+                "field_ids": sorted(
+                    (set(FIELDS[connection.provider]) - {"private_key_file"})
+                    | ({"otp"} if connection.provider != "binance" else set())
+                ),
+                "origins": sorted(
+                    {ORIGINS[market] for market in ("spot", *connection.binance.markets)}
+                    if connection.provider == "binance"
+                    else LOGIN_ORIGINS[connection.provider]
+                ),
             }
+    adapters = doc.get("credential_adapters", {})
     for name, item in list(adapters.items()):
-        if not name.startswith("folio-"):
-            continue
         ident = name.removeprefix("folio-")
         command = list(item.get("args", []))
         if (
             len(command) == 7
             and command[3] == "--worker-revision"
-            and isinstance(command[4], str)
-            and re.fullmatch(r"[a-f0-9]{64}", command[4])
+            and re.fullmatch(r"[a-f0-9]{64}", str(command[4]))
         ):
             del command[3:5]
         if len(command) == 5 and command[2] == "--watch-config":
             del command[2]
         owned = (
-            set(item) == {"label", "program", "args", "cwd"}
+            name.startswith("folio-")
+            and set(item) == {"label", "program", "args", "cwd"}
             and item.get("program") == str(ROOT / ".venv/bin/folio")
             and item.get("cwd") == str(ROOT)
             and item.get("label") in {f"Folio {provider} ({ident})" for provider in RESOURCES}
@@ -350,13 +349,37 @@ def adapter_config(source, config, connections):
             and command[2] in {"api-adapter", "browser-adapter", "credential-relay"}
             and command[3] == ident
         )
+        if not owned:
+            raise ValueError(
+                f"Zond's legacy adapter {name} needs its own service and recipient registration. "
+                "Follow zondd adapters/readme.md migration instructions, then rerun setup."
+            )
+        del adapters[name]
+    doc.pop("credential_adapters", None)
+    recipients = table(doc, "credential_recipients")
+    for name, item in list(recipients.items()):
+        if not name.startswith("folio-"):
+            continue
+        label = re.fullmatch(
+            r"Folio (binance|bog|wolt) \(([a-z][a-z0-9_-]{0,63})\)", item.get("label", "")
+        )
+        ident = label[2] if label else ""
+        key_file = settings.state_dir / "zond" / f"{ident}.key"
+        owned = False
+        if label and recipient_name(ident) == name and key_file.exists():
+            key = read_identity(key_file)
+            owned = (
+                set(item) == {"label", "key_sha256", "field_ids", "origins"}
+                and item.get("key_sha256") == hashlib.sha256(key.encode()).hexdigest()
+                and item.get("label") in {f"Folio {provider} ({ident})" for provider in RESOURCES}
+            )
         if name in desired and item != desired[name] and not owned:
-            raise ValueError(f"Existing zond adapter {name} is custom; it was not replaced.")
+            raise ValueError(f"Existing Zond recipient {name} is custom; it was not replaced.")
         if owned and name not in desired:
-            del adapters[name]
+            del recipients[name]
     for name, item in desired.items():
-        if name not in adapters or adapters[name] != item:
-            adapters[name] = item
+        if name not in recipients or recipients[name] != item:
+            recipients[name] = item
     return tomlkit.dumps(doc)
 
 
@@ -502,7 +525,7 @@ def run(args):
                     command,
                     source=source,
                     expected_original=original,
-                    adapter_builder=adapter_config,
+                    recipient_builder=recipient_config,
                 )
             except module.legacy.SetupError as error:
                 raise ValueError(str(error)) from None

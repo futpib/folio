@@ -56,14 +56,14 @@ def render_unit(config: Path) -> str:
     )
 
 
-def adapter_config(source: str, config: Path, connections: dict) -> str:
+def recipient_config(source: str, config: Path, connections: dict, settings=None) -> str:
     sys.path.insert(0, str(ROOT / "src"))
-    from folio.configure import adapter_config as reconcile
+    from folio.configure import recipient_config as reconcile
 
-    return reconcile(source, config, connections)
+    return reconcile(source, config, connections, settings)
 
 
-def main(argv=None, *, source=None, expected_original=..., adapter_builder=None):
+def main(argv=None, *, source=None, expected_original=..., recipient_builder=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--replace-ibkr-service",
@@ -154,8 +154,29 @@ def main(argv=None, *, source=None, expected_original=..., adapter_builder=None)
     previous_zond = zond.read_text() if zond.exists() else ""
     if args.zond and not previous_zond:
         parser.error("configure zond first; its existing configuration is required")
+    sys.path.insert(0, str(ROOT / "src"))
+    import tomlkit
+
+    from folio.broker import default_socket
+    from folio.config import Settings
+    from folio.models import LoginRequired
+
+    if args.zond:
+        doc = tomlkit.parse(source)
+        socket_path = (
+            Path(tomllib.loads(previous_zond).get("runtime_dir", default_socket().parent))
+            / "credential.sock"
+        )
+        if "zond" not in doc:
+            doc["zond"] = tomlkit.table()
+        doc["zond"]["socket"] = str(socket_path)
+        source = tomlkit.dumps(doc)
+        data = tomllib.loads(source)
+    settings = Settings.from_data(data, config)
     candidate = (
-        (adapter_builder or adapter_config)(previous_zond, config, data["connections"])
+        (recipient_builder or recipient_config)(
+            previous_zond, config, data["connections"], settings
+        )
         if args.zond
         else None
     )
@@ -223,33 +244,34 @@ def main(argv=None, *, source=None, expected_original=..., adapter_builder=None)
             legacy.run("systemctl", "--user", "enable", "--now", ZOND_UNIT)
             if prior[ZOND_UNIT]["active"]:
                 legacy.run(*ctl, "reload")
-            expected = {
-                name: value
-                for name, value in tomllib.loads(candidate).get("credential_adapters", {}).items()
-                if name.startswith("folio-")
-                and value.get("program") == str(ROOT / ".venv/bin/folio")
-            }
+            import asyncio
+
+            from folio.broker import CredentialAPIError, ServiceBroker
+
+            async def check_recipients():
+                for connection in settings.connections:
+                    if not connection.credential_adapter:
+                        continue
+                    broker = ServiceBroker(settings, connection)
+                    try:
+                        await broker.connect()
+                    except CredentialAPIError as error:
+                        # Zond validates the identity before reporting an occupied recipient.
+                        if error.reason != "busy":
+                            raise
+                    finally:
+                        broker.close()
+
+            # Test the authenticated endpoint without opening a form or requesting provider values.
             deadline = time.monotonic() + 15
-            while expected:
-                response = subprocess.run(
-                    [*ctl, "--json", "pending"], capture_output=True, check=False, timeout=5
-                )
-                queue = json.loads(response.stdout) if response.returncode == 0 else {}
-                running = {item["recipient"]["adapter"]: item for item in queue.get("adapters", [])}
-                if all(
-                    name in running
-                    and running[name]["state"] in {"ready", "working", "waiting", "unavailable"}
-                    and running[name]["recipient"]["command"]
-                    == {"program": value["program"], "args": value["args"]}
-                    for name, value in expected.items()
-                ):
+            while True:
+                try:
+                    asyncio.run(check_recipients())
                     break
-                if time.monotonic() >= deadline:
-                    raise ValueError(
-                        "Zond did not start the configured Folio credential relays; "
-                        "inspect journalctl --user -u zondd"
-                    )
-                time.sleep(0.25)
+                except LoginRequired as error:
+                    if time.monotonic() >= deadline:
+                        raise ValueError(str(error)) from None
+                    time.sleep(0.25)
         legacy.run("systemctl", "--user", "enable", unit)
         legacy.run("systemctl", "--user", "restart", UNIT)
         endpoint = f"http://127.0.0.1:{data.get('server', {}).get('port', 8080)}"

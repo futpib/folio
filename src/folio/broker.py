@@ -3,296 +3,380 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import secrets
 import socket
+import stat
 import struct
-import sys
-import time
 from contextlib import suppress
 from hashlib import sha256
 from pathlib import Path
 
 from .models import LoginRequired
 from .observability import emit
-from .store import exclusive, private_directory
+from .store import private_directory
+
+ERROR_CODES = {
+    "authentication_failed",
+    "unsupported_version",
+    "busy",
+    "origin_not_allowed",
+    "field_not_allowed",
+    "invalid_challenge",
+    "result_required",
+    "unknown_challenge",
+    "answer_delivered",
+    "invalid_outcome",
+    "already_authenticated",
+    "invalid_frame",
+    "session_closed",
+    "queue_full",
+    "unavailable",
+}
 
 
-class Broker:
-    """Private zond adapter protocol. Answers must never enter logs or persistent state."""
+class CredentialAPIError(LoginRequired):
+    def __init__(self, message, reason=None):
+        super().__init__(message)
+        self.reason = reason
 
-    async def start(self, reader=None, writer=None):
-        self.writer = writer
-        if reader is None:
-            self.reader = asyncio.StreamReader(limit=128 * 1024)
-            protocol = asyncio.StreamReaderProtocol(self.reader)
-            self.transport, _ = await asyncio.get_running_loop().connect_read_pipe(
-                lambda: protocol, sys.stdin
-            )
-        else:
-            self.reader = reader
-            self.transport = writer
-        ready = json.loads(await self.reader.readline())
-        if ready.get("type") != "ready" or ready.get("version") != 1:
-            raise RuntimeError("unsupported zond adapter protocol")
-        self.ready = ready
-        self.replies = asyncio.Queue()
-        self.retry = asyncio.Event()
-        self.closed = False
-        self.pump_task = asyncio.create_task(self.pump())
 
-    def close(self):
-        self.pump_task.cancel()
-        self.transport.close()
-        while not self.replies.empty():
-            reply = self.replies.get_nowait()
-            values = reply.pop("values", None)
-            if values:
-                values.clear()
+def default_socket():
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        root = Path(runtime) / "zondd"
+    elif Path(f"/run/user/{os.getuid()}").is_dir():
+        root = Path(f"/run/user/{os.getuid()}/zondd")
+    else:
+        root = Path(f"/tmp/zondd-{os.getuid()}")
+    return root / "credential.sock"
 
-    async def pump(self):
-        try:
-            while line := await self.reader.readline():
-                message = json.loads(line)
-                if message.get("type") == "retry":
-                    self.retry.set()
-                else:
-                    await self.replies.put(message)
-        finally:
-            self.closed = True
-            await self.replies.put({"type": "error"})
 
-    async def receive(self):
-        message = await self.replies.get()
-        if message.get("type") == "error":
-            raise RuntimeError("zond adapter channel closed or request rejected")
-        return message
+def identity_path(settings, connection):
+    return settings.state_dir / "zond" / f"{connection.id}.key"
 
-    def send(self, method, **body):
-        frame = json.dumps({"method": method, **body})
-        if self.writer is None:
-            print(frame, flush=True)
-        else:
-            self.writer.write((frame + "\n").encode())
 
-    async def status(self, state):
-        self.send("status", state=state)
-        await self.recorded()
+def recipient_name(ident):
+    suffix = (
+        ident if len(ident) <= 58 else ident[:45] + "-" + sha256(ident.encode()).hexdigest()[:12]
+    )
+    return "folio-" + suffix
 
-    async def recorded(self):
-        if (await self.receive()).get("type") != "recorded":
-            raise RuntimeError("unexpected zond response")
 
-    async def challenge(self, provider, fields, page_origin):
-        emit("credentials_requested", source="zond")
-        self.send(
-            "challenge",
-            prompt=f"Sign in to {provider} for Folio read access.",
-            fields=fields,
-            context={
-                "provider": provider,
-                "origin": page_origin,
-                "purpose": "Read account history",
-            },
-            timeout_secs=300,
+def trusted_path(path):
+    if not path.is_absolute():
+        raise ValueError("credential paths must be absolute")
+    for ancestor in (path, *path.parents):
+        meta = ancestor.lstat()
+        sticky = (
+            ancestor != path
+            and stat.S_ISDIR(meta.st_mode)
+            and meta.st_uid == 0
+            and meta.st_mode & stat.S_ISVTX
         )
-        opened = await self.receive()
-        if opened.get("type") != "opened":
-            raise RuntimeError("expected zond challenge")
-        return opened["challenge_id"]
-
-    async def result(self, ident, outcome):
-        emit("credentials_completed", outcome=outcome)
-        self.send("result", challenge_id=ident, outcome=outcome)
-        await self.recorded()
-
-    async def withdraw(self, ident):
-        self.send("withdraw", challenge_id=ident)
-        # An answer may already be in flight. Discard its values on withdrawal.
-        recorded = False
-        answered = False
-        while not (recorded and answered):
-            reply = await self.receive()
-            recorded |= reply.get("type") == "recorded"
-            answered |= reply.get("type") == "answered" and reply.get("challenge_id") == ident
-            values = reply.pop("values", None)
-            if values:
-                values.clear()
+        if (
+            stat.S_ISLNK(meta.st_mode)
+            or meta.st_uid not in {0, os.getuid()}
+            or (meta.st_mode & 0o022 and not sticky)
+        ):
+            raise ValueError("credential paths must have trusted owners and permissions")
 
 
-def socket_path(settings, connection):
-    root = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/folio-{os.getuid()}")) / "folio-auth"
-    ident = sha256(f"{settings.state_dir.resolve()}:{connection.id}".encode()).hexdigest()[:24]
-    return root / f"{ident}.sock"
+def read_identity(path):
+    trusted_path(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        meta = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(meta.st_mode)
+            or meta.st_uid != os.getuid()
+            or meta.st_mode & 0o077
+            or meta.st_size > 128
+        ):
+            raise ValueError("Zond identity must be a private, bounded file owned by this user")
+        key = stream.read(129).decode("ascii").strip()
+    if not re.fullmatch(r"[a-f0-9]{64}", key):
+        raise ValueError("invalid Zond identity file")
+    return key
+
+
+def provision_identity(settings, connection):
+    path = identity_path(settings, connection)
+    parent = path.parent
+    existing = parent
+    while not existing.exists():
+        if existing.is_symlink():
+            raise ValueError("unsafe Zond identity directory")
+        existing = existing.parent
+    trusted_path(existing)
+    private_directory(parent)
+    trusted_path(parent)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(secrets.token_hex(32) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    return read_identity(path)
 
 
 class ServiceBroker:
-    """Connect to Zond only when the standalone service needs a missing field."""
+    """Lazy client of Zond's public credential API v1; provider jobs belong to Folio."""
 
     def __init__(self, settings, connection):
-        self.path = socket_path(settings, connection)
+        self.path = settings.zond_socket or default_socket()
+        self.key_path = identity_path(settings, connection)
+        self.recipient = recipient_name(connection.id)
         self.provider = connection.provider
-        self.channel = None
+        self.writer = None
+        self.pump_task = None
+        self.replies = asyncio.Queue(maxsize=8)
+        self.closed = True
+        self.next_id = 0
+        self.pending = None
 
-    async def challenge(self, provider, fields, page_origin):
-        if self.channel is None or self.channel.closed:
-            deadline = time.monotonic() + 6
-            while True:
-                try:
-                    reader, writer = await asyncio.open_unix_connection(self.path, limit=128 * 1024)
-                    break
-                except (FileNotFoundError, ConnectionRefusedError):
-                    if time.monotonic() >= deadline:
-                        raise LoginRequired(
-                            "Required credentials are missing from .env.local and Zond's "
-                            "credential relay is unavailable. Configure Zond, run "
-                            f"'folio setup --yes', or use 'folio credentials {self.provider}'."
-                        ) from None
-                    await asyncio.sleep(0.1)
-            self.channel = Broker()
-            try:
-                await asyncio.wait_for(self.channel.start(reader, writer), 5)
-            except asyncio.CancelledError:
-                writer.close()
-                self.channel = None
-                raise
-            except (OSError, ValueError, RuntimeError, TimeoutError):
-                writer.close()
-                self.channel = None
-                raise LoginRequired(
-                    "Could not connect to the configured Zond credential relay."
-                ) from None
+    def failure(self, code=None):
+        reason = code if isinstance(code, str) and code in ERROR_CODES else None
+        detail = f" ({reason})" if reason else ""
+        return CredentialAPIError(
+            f"Zond credential API unavailable or rejected the request{detail}. "
+            "Local credentials are missing; run 'folio setup --yes' to register Folio, "
+            f"or 'folio credentials {self.provider}', then retry the sync.",
+            reason=reason,
+        )
+
+    async def connect(self):
+        if not self.closed:
+            return
+        self.close()
+        self.replies = asyncio.Queue(maxsize=8)
         try:
-            return await self.channel.challenge(provider, fields, page_origin)
-        except RuntimeError:
-            raise LoginRequired(
-                "Zond disconnected during authentication; retry the sync."
-            ) from None
-
-    async def receive(self):
-        try:
-            return await self.channel.receive()
-        except RuntimeError:
-            raise LoginRequired(
-                "Zond disconnected during authentication; retry the sync."
-            ) from None
-
-    async def result(self, ident, outcome):
-        with suppress(RuntimeError, OSError):
-            await self.channel.result(ident, outcome)
-
-    async def withdraw(self, ident):
-        with suppress(RuntimeError, OSError):
-            await self.channel.withdraw(ident)
-
-    def close(self):
-        if self.channel is not None:
-            self.channel.close()
-            self.channel = None
-
-
-async def credential_relay(settings, connection):
-    """Private credential pipes only. Provider workers run inside foliod."""
-    path = socket_path(settings, connection)
-    private_directory(path.parent)
-    broker = Broker()
-    await broker.start()
-    await broker.status("ready")
-    finished = asyncio.Event()
-    connected = False
-
-    async def accept(reader, writer):
-        nonlocal connected
-        accepted = False
-        try:
-            peer_pid, uid, _ = struct.unpack(
+            key = read_identity(self.key_path)
+            trusted_path(self.path)
+            metadata = self.path.lstat()
+            if (
+                not stat.S_ISSOCK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077
+            ):
+                raise ValueError("Zond credential endpoint must be an owner-only socket")
+            reader, self.writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(self.path, limit=128 * 1024), 5
+            )
+            _, uid, _ = struct.unpack(
                 "3i",
-                writer.get_extra_info("socket").getsockopt(
+                self.writer.get_extra_info("socket").getsockopt(
                     socket.SOL_SOCKET, socket.SO_PEERCRED, 12
                 ),
             )
-            daemon_pid = int((settings.state_dir / "daemon.pid").read_text())
-            if connected or uid != os.getuid() or peer_pid != daemon_pid:
-                return
-            connected = True
-            accepted = True
-            writer.write((json.dumps(broker.ready) + "\n").encode())
-            await writer.drain()
+            if uid != os.getuid():
+                raise ValueError("unexpected credential broker owner")
+            self.closed = False
+            request = await self.send("authenticate", recipient=self.recipient, key=key)
+            key = None
+            reply = await asyncio.wait_for(self.read_frame(reader), 5)
+            if reply["id"] != request or reply["body"].get("type") != "ready":
+                raise self.failure(reply["body"].get("code"))
+            self.pump_task = asyncio.create_task(self.pump(reader, self.replies))
+        except asyncio.CancelledError:
+            self.close()
+            raise
+        except LoginRequired:
+            self.close()
+            raise
+        except (OSError, ValueError, RuntimeError, TimeoutError):
+            self.close()
+            raise self.failure() from None
 
-            async def requests():
-                while line := await reader.readline():
-                    if len(line) > 65536:
-                        raise ValueError("credential frame exceeds limit")
-                    message = json.loads(line)
-                    method = message.pop("method", None)
-                    if method not in {"challenge", "result", "withdraw"}:
-                        raise ValueError("unsupported credential request")
-                    if method == "challenge":
-                        from .credentials import FIELDS
+    async def send(self, method, **body):
+        self.next_id += 1
+        frame = (
+            json.dumps({"version": 1, "id": self.next_id, "body": {"method": method, **body}})
+            + "\n"
+        ).encode()
+        try:
+            if len(frame) > 64 * 1024 or self.closed or self.writer is None:
+                raise ValueError("invalid credential request")
+            self.writer.write(frame)
+            await asyncio.wait_for(self.writer.drain(), 5)
+            return self.next_id
+        except asyncio.CancelledError:
+            self.close()
+            raise
+        except (OSError, ValueError, TimeoutError):
+            self.close()
+            raise self.failure() from None
 
-                        allowed = set(FIELDS[connection.provider]) | {"otp"}
-                        fields = message.get("fields", [])
-                        if not fields or any(field.get("id") not in allowed for field in fields):
-                            raise ValueError("unexpected credential field")
-                        if connection.provider == "binance":
-                            from .binance import ORIGINS as sites
+    async def read_frame(self, reader):
+        line = await reader.readline()
+        if not line.endswith(b"\n") or len(line) > 128 * 1024:
+            raise ValueError("credential channel closed or frame too large")
+        message = json.loads(line)
+        if (
+            not isinstance(message, dict)
+            or set(message) != {"version", "id", "body"}
+            or type(message["version"]) is not int
+            or message["version"] != 1
+            or type(message["id"]) is not int
+            or not 1 <= message["id"] <= self.next_id
+            or not isinstance(message["body"], dict)
+        ):
+            raise ValueError("invalid credential envelope")
+        body = message["body"]
+        shapes = {
+            "ready": {"type", "session_id"},
+            "opened": {"type", "challenge_id"},
+            "answered": {"type", "challenge_id", "status", "values"},
+            "recorded": {"type", "challenge_id"},
+            "error": {"type", "code"},
+        }
+        kind = body.get("type")
+        if not isinstance(kind, str) or set(body) != shapes.get(kind):
+            raise ValueError("invalid credential event")
+        for key in body.keys() - {"values"}:
+            if not isinstance(body[key], str) or not body[key]:
+                raise ValueError("invalid credential metadata")
+        if kind == "answered":
+            values = body["values"]
+            if (
+                body["status"] not in {"answered", "rejected", "expired", "withdrawn"}
+                or (body["status"] != "answered" and values is not None)
+                or (
+                    values is not None
+                    and (
+                        not isinstance(values, dict)
+                        or not all(isinstance(value, str) for value in values.values())
+                    )
+                )
+            ):
+                raise ValueError("invalid credential answer")
+        return message
 
-                            allowed_origins = set(sites.values())
-                            expected_provider = "Binance API"
-                        else:
-                            from .providers import LOGIN_ORIGINS
-
-                            allowed_origins = LOGIN_ORIGINS[connection.provider]
-                            expected_provider = connection.provider
-                        context = message.get("context", {})
-                        if (
-                            context.get("provider") != expected_provider
-                            or not set(context.get("origin", "").split(", ")) <= allowed_origins
-                        ):
-                            raise ValueError("unexpected credential origin")
-                    broker.send(method, **message)
-                raise EOFError
-
-            async def answers():
-                while True:
-                    reply = await broker.receive()
-                    writer.write((json.dumps(reply) + "\n").encode())
-                    await writer.drain()
-                    values = reply.pop("values", None)
-                    if values:
-                        values.clear()
-
-            tasks = [asyncio.create_task(requests()), asyncio.create_task(answers())]
-            try:
-                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    task.result()
-            finally:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-        except (OSError, ValueError, RuntimeError, EOFError, TypeError, KeyError):
+    async def pump(self, reader, replies):
+        try:
+            while True:
+                await replies.put(await self.read_frame(reader))
+        except (OSError, ValueError):
             pass
         finally:
-            writer.close()
-            if accepted:
-                finished.set()
-            with suppress(OSError):
-                await writer.wait_closed()
+            if self.replies is replies:
+                self.closed = True
+            with suppress(asyncio.QueueFull):
+                replies.put_nowait(None)
 
-    owns_socket = False
-    try:
-        with exclusive(path.with_suffix(".lock")):
-            if path.exists() or path.is_symlink():
-                if path.is_symlink() or not path.is_socket() or path.stat().st_uid != os.getuid():
-                    raise ValueError("refused unsafe credential socket")
-                path.unlink()
-            server = await asyncio.start_unix_server(accept, path, limit=65537)
-            owns_socket = True
-            path.chmod(0o600)
-            async with server:
-                while not finished.is_set() and not broker.closed:
-                    with suppress(TimeoutError):
-                        await asyncio.wait_for(finished.wait(), 0.25)
-    finally:
-        if owns_socket:
-            path.unlink(missing_ok=True)
-        broker.close()
+    async def receive_frame(self):
+        if self.closed and self.replies.empty():
+            raise self.failure()
+        frame = await self.replies.get()
+        if frame is None:
+            raise self.failure()
+        return frame
+
+    async def expect(self, request, kind, ident=None):
+        frame = await self.receive_frame()
+        body = frame["body"]
+        if frame["id"] == request and body.get("type") == "error":
+            raise self.failure(body.get("code"))
+        if (
+            frame["id"] != request
+            or body.get("type") != kind
+            or (ident is not None and body.get("challenge_id") != ident)
+        ):
+            self.close()
+            raise self.failure()
+        return body
+
+    async def challenge(self, provider, fields, page_origin):
+        await self.connect()
+        emit("credentials_requested", source="zond")
+        request = await self.send(
+            "challenge",
+            origin=page_origin,
+            prompt=f"Sign in to {provider} for Folio read access.",
+            fields=fields,
+            context={"provider": provider, "purpose": "Read account history"},
+            timeout_secs=300,
+        )
+        try:
+            opened = await asyncio.wait_for(self.expect(request, "opened"), 5)
+        except TimeoutError:
+            self.close()
+            raise self.failure() from None
+        ident = opened.get("challenge_id")
+        if not isinstance(ident, str) or not ident:
+            self.close()
+            raise self.failure()
+        self.pending = request, ident
+        return ident
+
+    async def receive(self):
+        request, ident = self.pending
+        return await self.expect(request, "answered", ident)
+
+    async def result(self, ident, outcome):
+        emit("credentials_completed", outcome=outcome)
+        try:
+            request = await self.send("result", challenge_id=ident, outcome=outcome)
+            await asyncio.wait_for(self.expect(request, "recorded", ident), 5)
+        except (LoginRequired, TimeoutError):
+            self.close()
+        finally:
+            self.pending = None
+
+    async def withdraw(self, ident):
+        async def discard():
+            challenge_request, _ = self.pending
+            request = await self.send("withdraw", challenge_id=ident)
+            terminal = acknowledged = delivered = False
+            while not (terminal and acknowledged):
+                frame = await self.receive_frame()
+                body = frame["body"]
+                if (
+                    frame["id"] == challenge_request
+                    and body.get("type") == "answered"
+                    and body.get("challenge_id") == ident
+                ):
+                    values = body.pop("values", None)
+                    delivered = values is not None
+                    if isinstance(values, dict):
+                        values.clear()
+                    terminal = True
+                elif frame["id"] == request and (
+                    (body.get("type") == "recorded" and body.get("challenge_id") == ident)
+                    or (
+                        body.get("type") == "error"
+                        and body.get("code") in {"answer_delivered", "unknown_challenge"}
+                    )
+                ):
+                    acknowledged = True
+                else:
+                    raise self.failure()
+            if delivered:
+                await self.result(ident, "cancelled")
+
+        try:
+            await asyncio.wait_for(discard(), 5)
+        except (LoginRequired, TimeoutError):
+            self.close()
+        finally:
+            self.pending = None
+
+    def close(self):
+        if self.pump_task is not None:
+            self.pump_task.cancel()
+            self.pump_task = None
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+        self.closed = True
+        self.next_id = 0
+        self.pending = None
+        while not self.replies.empty():
+            frame = self.replies.get_nowait()
+            if isinstance(frame, dict):
+                values = frame.get("body", {}).pop("values", None)
+                if isinstance(values, dict):
+                    values.clear()

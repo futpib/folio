@@ -99,6 +99,7 @@ class Settings:
     connections: tuple[Connection, ...]
     port: int = 8080
     chromium: str | None = None
+    zond_socket: Path | None = None
 
     @classmethod
     def load(cls, path: Path) -> Settings:
@@ -110,16 +111,17 @@ class Settings:
     @classmethod
     def from_data(cls, data: dict, path: Path) -> Settings:
         path = path.expanduser().resolve()
-        unknown = data.keys() - {"server", "storage", "browser", "connections"}
+        unknown = data.keys() - {"server", "storage", "browser", "connections", "zond"}
         if unknown:
             raise ConfigError(f"unknown Folio configuration sections: {', '.join(sorted(unknown))}")
-        for section in ("server", "storage", "browser", "connections"):
+        for section in ("server", "storage", "browser", "connections", "zond"):
             if not isinstance(data.get(section, {}), dict):
                 raise ConfigError(f"{section} must be a table")
         for section, allowed in (
             ("server", {"port", "host"}),
             ("storage", {"path"}),
             ("browser", {"executable"}),
+            ("zond", {"socket"}),
         ):
             if data.get(section, {}).keys() - allowed:
                 raise ConfigError(f"unknown settings in {section}")
@@ -189,7 +191,12 @@ class Settings:
         chromium = data.get("browser", {}).get("executable")
         if chromium is not None and (not isinstance(chromium, str) or not Path(chromium).is_file()):
             raise ConfigError("browser.executable must name an installed Chromium executable")
-        return cls(state.resolve(), tuple(connections), port, chromium)
+        zond_socket = data.get("zond", {}).get("socket")
+        if zond_socket is not None:
+            if not isinstance(zond_socket, str) or not Path(zond_socket).is_absolute():
+                raise ConfigError("zond.socket must be an absolute credential socket path")
+            zond_socket = Path(zond_socket)
+        return cls(state.resolve(), tuple(connections), port, chromium, zond_socket)
 
     def connection(self, name: str) -> Connection:
         for connection in self.connections:

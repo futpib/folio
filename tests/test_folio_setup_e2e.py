@@ -14,9 +14,10 @@ from pathlib import Path
 
 import httpx
 import pytest
-import tomlkit
 
 from folio import cli, configure
+from folio.broker import identity_path
+from folio.config import Settings
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("FOLIO_SETUP_E2E") != "1",
@@ -24,7 +25,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_setup_starts_services_reloads_worker_and_rolls_back_failed_restart(tmp_path, monkeypatch):
+def test_setup_registers_identity_restarts_standalone_service_and_rolls_back_failure(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr("folio.credentials.DEFAULT_ENV_FILE", tmp_path / ".env.local")
     zondd = Path(os.environ["FOLIO_TEST_ZONDD"])
     zondctl = zondd.with_name("zondctl")
@@ -84,7 +87,7 @@ def test_setup_starts_services_reloads_worker_and_rolls_back_failed_restart(tmp_
             check=True,
             capture_output=True,
         )
-        return json.loads(result.stdout)["adapters"]
+        return json.loads(result.stdout)["recipients"]
 
     try:
         subprocess.run(["systemctl", "--user", "link", str(unit)], check=True, capture_output=True)
@@ -110,50 +113,58 @@ def test_setup_starts_services_reloads_worker_and_rolls_back_failed_restart(tmp_
         with httpx.Client(trust_env=False) as client:
             result = client.get(f"http://127.0.0.1:{port}/v1/connections").json()
             assert result[0]["id"] == "binance" and result[0]["worker"] == "foliod"
-        original_session = sessions()[0]["recipient"]["session_id"]
-        call([*arguments, "--history-days", "30"])
-        for _ in range(100):
-            current = sessions()[0]
-            if (
-                current["state"] == "ready"
-                and current["recipient"]["session_id"] != original_session
-            ):
-                break
-            time.sleep(0.1)
-        else:
-            raise AssertionError("updated configuration did not restart the managed worker")
-        doc = tomlkit.parse(zond_config.read_text())
-        command = doc["credential_adapters"]["folio-binance"]["args"]
-        revision_index = list(command).index("--worker-revision") + 1
-        revision = command[revision_index]
-        command[revision_index] = "0" * 64
-        zond_config.write_text(tomlkit.dumps(doc))
-        subprocess.run([str(zondctl), "--runtime-dir", str(run_dir), "reload"], check=True)
-        for _ in range(100):
-            current = sessions()[0]
-            if (
-                current["state"] == "ready"
-                and current["recipient"]["command"]["args"][revision_index] == "0" * 64
-            ):
-                break
-            time.sleep(0.1)
-        else:
-            raise AssertionError("could not simulate a worker from an older checkout")
-        older_session = current["recipient"]["session_id"]
+        assert not sessions(), "Setup authenticates its test session then disconnects"
+        settings = Settings.load(config)
+        assert settings.zond_socket == run_dir / "credential.sock"
+        key_file = identity_path(settings, settings.connection("binance"))
+        identity = key_file.read_bytes()
+        registered = zond_config.read_bytes()
+        assert b"credential_adapters" not in registered and b"key_sha256" in registered
+        assert identity.strip() not in registered
+        assert key_file.stat().st_mode & 0o777 == 0o600
+        assert key_file.parent.stat().st_mode & 0o777 == 0o700
+
+        def folio_pid():
+            return subprocess.run(
+                ["systemctl", "--user", "show", folio_unit, "--property=MainPID", "--value"],
+                check=True,
+                capture_output=True,
+            ).stdout
+
+        initial_pid = folio_pid()
+        with socket.socket(socket.AF_UNIX) as active_recipient:
+            active_recipient.settimeout(5)
+            active_recipient.connect(str(run_dir / "credential.sock"))
+            active_recipient.sendall(
+                (
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "id": 1,
+                            "body": {
+                                "method": "authenticate",
+                                "recipient": "folio-binance",
+                                "key": identity.decode().strip(),
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            assert json.loads(active_recipient.makefile("rb").readline())["body"]["type"] == "ready"
+            # The setup probe can verify identity while another credential session is active.
+            call([*arguments, "--history-days", "30"])
+        assert folio_pid() != initial_pid
+        assert key_file.read_bytes() == identity and zond_config.read_bytes() == registered
+        assert not sessions(), "Idle Folio does not connect to Zond"
+        assert Settings.load(config).connection("binance").binance.history_days == 30
+        pid_before_zond_restart = folio_pid()
+        subprocess.run(["systemctl", "--user", "restart", zond_unit], check=True)
+        assert folio_pid() == pid_before_zond_restart
         unchanged_config = config.read_bytes()
         call([*arguments, "--history-days", "30"])
-        for _ in range(100):
-            current = sessions()[0]
-            if (
-                current["state"] == "ready"
-                and current["recipient"]["session_id"] != older_session
-                and current["recipient"]["command"]["args"][revision_index] == revision
-            ):
-                break
-            time.sleep(0.1)
-        else:
-            raise AssertionError("setup did not refresh the worker after a code update")
         assert config.read_bytes() == unchanged_config
+        assert key_file.read_bytes() == identity and zond_config.read_bytes() == registered
         original = config.read_bytes()
         previous_unit = (config_home / "systemd/user" / folio_unit).read_bytes()
         with socket.socket() as occupied:

@@ -12,6 +12,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from folio.config import Settings
+from folio.configure import recipient_config
+
 ZONDD = os.environ.get("FOLIO_TEST_ZONDD")
 
 
@@ -36,6 +39,8 @@ def test_real_zond_chromium_decline_retry_password_and_otp(tmp_path, present):
 port = {port}
 [storage]
 path = {json.dumps(str(tmp_path / "state"))}
+[zond]
+socket = {json.dumps(str(tmp_path / "run/credential.sock"))}
 [browser]
 executable = {json.dumps(shutil.which("chromium"))}
 [connections.bog]
@@ -45,13 +50,14 @@ min_sync_seconds = 1
 """)
     cli = [str(Path(sys.executable).parent / "folio"), "--config", str(folio_config)]
     config = tmp_path / "zond.toml"
-    config.write_text(f"""runtime_dir = {json.dumps(str(tmp_path / "run"))}
-[credential_adapters.folio]
-label = "Configured Folio fixture"
-program = {json.dumps(cli[0])}
-args = {json.dumps([*cli[1:], "credential-relay", "bog"])}
-cwd = {json.dumps(str(tmp_path))}
-""")
+    config.write_text(
+        recipient_config(
+            f"runtime_dir = {json.dumps(str(tmp_path / 'run'))}\n",
+            folio_config,
+            {},
+            Settings.load(folio_config),
+        ).replace("Folio bog (bog)", "Configured Folio fixture")
+    )
     config.chmod(0o600)
 
     def request(body):

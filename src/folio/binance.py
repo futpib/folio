@@ -498,10 +498,7 @@ class BinanceConnector:
                             challenge = await self.broker.challenge(
                                 "Binance API",
                                 missing,
-                                ", ".join(
-                                    ORIGINS[m]
-                                    for m in dict.fromkeys(("spot", *self.options.markets))
-                                ),
+                                ORIGINS["spot"],
                             )
                             answer = await self.broker.receive()
                             if (

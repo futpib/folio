@@ -23,7 +23,9 @@ min_sync_seconds = 300
 max_pages = 100
 
 # All provider workers run in foliod. For missing credentials through Zond,
-# set credential_adapter = true and run scripts/setup-folio.py --zond.
+# set credential_adapter = true and run uv run folio setup --yes.
+# Setup registers public API recipients and private connection identities.
+# It saves [zond].socket when Zond uses a custom runtime directory.
 # Complete local credentials and saved browser sessions work without Zond.
 
 # Binance uses its REST API, with local keys and Zond for missing values.

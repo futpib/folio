@@ -21,8 +21,6 @@ from .store import Store
 
 def common(parser):
     parser.add_argument("--config", type=Path, default=default_config())
-    parser.add_argument("--watch-config", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--worker-revision", help=argparse.SUPPRESS)
 
 
 def daemon():
@@ -41,34 +39,6 @@ def daemon():
         uvicorn.run(create_app(settings), host="127.0.0.1", port=settings.port, access_log=False)
     except (OSError, ValueError) as error:
         parser.exit(1, f"foliod: {error}\n")
-
-
-async def adapter(settings, connection, *, watch_config=None):
-    from .broker import credential_relay
-
-    if watch_config is None:
-        await credential_relay(settings, connection)
-    else:
-        original = watch_config.read_bytes()
-
-        async def changed():
-            while True:
-                await asyncio.sleep(0.5)
-                if watch_config.read_bytes() != original:
-                    return
-
-        tasks = [
-            asyncio.create_task(credential_relay(settings, connection)),
-            asyncio.create_task(changed()),
-        ]
-        try:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                task.result()
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def main():
@@ -99,14 +69,6 @@ def main():
     logs.add_argument("--follow", action="store_true")
     signin = sub.add_parser("login", help="sign in using a dedicated visible Chromium profile")
     signin.add_argument("connection")
-    broker = sub.add_parser("browser-adapter", help="compatibility alias for credential-relay")
-    broker.add_argument("connection")
-    api = sub.add_parser("api-adapter", help="Binance compatibility alias for credential-relay")
-    api.add_argument("connection")
-    relay = sub.add_parser(
-        "credential-relay", help="connect Zond authentication to standalone Folio"
-    )
-    relay.add_argument("connection")
     keygen = sub.add_parser(
         "binance-keygen", help="store a signing key locally and print its public key"
     )
@@ -128,33 +90,12 @@ def main():
             print(generate_key(args.type, env_file=args.env_file), end="")
             return
         settings = Settings.load(args.config)
-        if args.command in {"login", "browser-adapter", "api-adapter", "credential-relay"}:
+        if args.command == "login":
             connection = settings.connection(args.connection)
-            if connection.provider == "ibkr":
-                parser.error("IBKR uses the existing Gateway credential adapter")
-            if connection.provider == "binance" and args.command == "login":
-                parser.error(
-                    "Binance uses local API keys with optional Zond fallback; run 'folio sync NAME'"
-                )
-            if args.command == "api-adapter" and connection.provider != "binance":
-                parser.error("api-adapter requires a Binance connection")
+            if connection.provider not in {"bog", "wolt"}:
+                parser.error("login requires a browser connection; use 'folio sync NAME' for APIs")
             Store(settings.state_dir)
-            if args.command == "login":
-                asyncio.run(login(settings, connection))
-            else:
-                if os.environ.get("ZOND_ADAPTER_PROTOCOL") != "1":
-                    parser.error("credential adapters must be launched by zond")
-                if not connection.credential_adapter:
-                    parser.error("set credential_adapter = true for this connection first")
-                asyncio.run(
-                    adapter(
-                        settings,
-                        connection,
-                        watch_config=args.config.expanduser().resolve()
-                        if args.watch_config
-                        else None,
-                    )
-                )
+            asyncio.run(login(settings, connection))
             return
         with httpx.Client(
             base_url=f"http://127.0.0.1:{settings.port}",

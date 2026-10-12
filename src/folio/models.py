@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -19,12 +19,22 @@ class Record(BaseModel):
     data: dict[str, Any]
 
 
+class SnapshotScope(BaseModel):
+    resource: str
+    market: str
+    refreshed: bool
+    status: Literal["complete", "incomplete", "denied"]
+
+
 class Snapshot(BaseModel):
     records: list[Record]
     resources: list[str]
     complete: bool
     coverage: str
     account_identity: str | None = None
+    credential_identity: str | None = None
+    scopes: list[SnapshotScope] | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ConnectorError(Exception):

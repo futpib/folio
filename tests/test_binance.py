@@ -130,7 +130,7 @@ def test_errors_are_safe_and_auth_rejection_discards_credentials(status, code, e
         assert worker.credentials is None
 
 
-@pytest.mark.parametrize("code", [-2014, -2015, -1022])
+@pytest.mark.parametrize("code", [-2014, -1022])
 def test_futures_auth_error_identifies_failing_market_and_remedy(code):
     api = Api()
     api.failure = lambda request: (
@@ -144,10 +144,250 @@ def test_futures_auth_error_identifies_failing_market_and_remedy(code):
     assert f"usdm account (/fapi/v3/account, HTTP 401, code {code})" in message
     assert {
         -2014: "BAD_API_KEY_FMT",
-        -2015: "IP allowlist",
         -1022: "matches the public key",
     }[code] in message
     assert KEY not in message and SECRET not in message
+
+
+@pytest.mark.parametrize("status,code", [(401, -2015), (400, -2015), (403, -1002), (401, None)])
+def test_denied_market_is_partial_and_valid_credentials_stay_cached(status, code):
+    api = Api()
+    api.failure = lambda request: (
+        httpx.Response(status, json={"code": code, "msg": KEY + SECRET})
+        if request.url.path.startswith("/fapi/")
+        else None
+    )
+    worker = connector(api)
+    result = asyncio.run(worker.sync(None))
+    assert not result.complete and len(result.warnings) == 4
+    assert worker.credentials is not None
+    assert {r.data["market"] for r in result.records} == {"spot", "coinm"}
+    assert {s.status for s in result.scopes if s.market == "usdm"} == {"denied"}
+    assert all(not s.refreshed for s in result.scopes if s.market == "usdm")
+    assert "/fapi/v3/account" in result.warnings[0]
+    assert "incomplete" in result.coverage
+    assert KEY not in result.model_dump_json() and SECRET not in result.model_dump_json()
+    api.failure = None
+    assert asyncio.run(worker.sync(None)).complete
+
+
+def test_denied_endpoint_does_not_skip_other_reads_in_the_same_market():
+    api = Api()
+    api.failure = lambda request: (
+        httpx.Response(401, json={"code": -2015})
+        if request.url.path == "/fapi/v3/positionRisk"
+        else None
+    )
+    result = asyncio.run(connector(api).sync(None))
+    assert not result.complete and len(result.warnings) == 1
+    assert {r.resource for r in result.records if r.data["market"] == "usdm"} == {
+        "accounts",
+        "balances",
+        "trades",
+        "income",
+    }
+    assert (
+        next(s for s in result.scopes if s.market == "usdm" and s.resource == "positions").status
+        == "denied"
+    )
+
+
+def test_permission_loss_retains_stale_data_and_empty_success_clears_only_its_market(tmp_path):
+    api = Api()
+    configured = connection()
+    store = Store(tmp_path)
+    store.register(configured)
+
+    def save():
+        job = store.queue(configured.id, None)
+        store.finish(job, asyncio.run(connector(api).sync(None)), 0)
+        return store.job(job["id"])
+
+    assert save()["complete"]
+    before = {
+        r: store.read(configured.id, r, None, 100, 0) for r in ("balances", "positions", "trades")
+    }
+    api.failure = lambda request: (
+        httpx.Response(401, json={"code": -2015})
+        if request.url.path.startswith("/fapi/")
+        else httpx.Response(200, json=[])
+        if request.url.path == "/dapi/v1/positionRisk"
+        else None
+    )
+    partial = save()
+    assert partial["state"] == "completed" and partial["complete"] is False
+    assert len(partial["warnings"]) == 4
+    for resource in before:
+        after = store.read(configured.id, resource, None, 100, 0)
+        assert [r for r in after["items"] if r["market"] == "usdm"] == [
+            r for r in before[resource]["items"] if r["market"] == "usdm"
+        ]
+        old = next(s for s in before[resource]["scopes"] if s["market"] == "usdm")
+        stale = next(s for s in after["scopes"] if s["market"] == "usdm")
+        assert stale["synced"] == old["synced"] and stale["status"] == "denied"
+    positions = store.read(configured.id, "positions", None, 100, 0)
+    assert all(r["market"] == "usdm" for r in positions["items"])
+    assert not positions["snapshot"]["complete"]
+    api.failure = None
+    assert save()["complete"]
+    assert {r["market"] for r in store.read(configured.id, "positions", None, 100, 0)["items"]} == {
+        "usdm",
+        "coinm",
+    }
+
+
+@pytest.mark.parametrize("seed", [False, True])
+def test_fully_denied_resource_keeps_its_old_snapshot_time(tmp_path, seed):
+    api = Api()
+    configured = connection(markets=("spot", "usdm"))
+    store = Store(tmp_path)
+    store.register(configured)
+    if seed:
+        store.finish(
+            store.queue(configured.id, None), asyncio.run(connector(api, configured).sync(None)), 0
+        )
+    before = store.read(configured.id, "positions", None, 100, 0)
+    api.failure = lambda request: (
+        httpx.Response(401, json={"code": -2015}) if request.url.path.startswith("/fapi/") else None
+    )
+    result = asyncio.run(connector(api, configured).sync(None))
+    store.finish(store.queue(configured.id, None), result, 0)
+    after = store.read(configured.id, "positions", None, 100, 0)
+    assert after["items"] == before["items"]
+    if seed:
+        assert after["snapshot"]["synced"] == before["snapshot"]["synced"]
+        assert not after["snapshot"]["complete"]
+    else:
+        assert after["snapshot"] is None and after["scopes"][0]["synced"] is None
+    assert after["scopes"][0]["status"] == "denied"
+
+
+def test_one_denied_symbol_does_not_block_other_symbols():
+    api = Api()
+    api.failure = lambda request: (
+        httpx.Response(401, json={"code": -2015})
+        if request.url.path.endswith("myTrades") and request.url.params["symbol"] == "BTCUSDT"
+        else None
+    )
+    result = asyncio.run(connector(api, connection(spot_symbols=("BTCUSDT", "ETHUSDT"))).sync(None))
+    assert not result.complete and len(result.warnings) == 1
+    assert "Symbol: BTCUSDT" in result.warnings[0]
+    assert {
+        r.data["symbol"]
+        for r in result.records
+        if r.resource == "trades" and r.data["market"] == "spot"
+    } == {"ETHUSDT"}
+    section = next(s for s in result.scopes if s.resource == "trades" and s.market == "spot")
+    assert section.refreshed and section.status == "incomplete"
+
+
+def test_denied_later_history_page_keeps_successful_pages(monkeypatch):
+    monkeypatch.setattr("folio.binance.PAGE_SIZE", 2)
+    api = Api()
+
+    def paginated(request):
+        if request.url.path.endswith("income"):
+            if request.url.params["page"] == "1":
+                return httpx.Response(200, json=[income(1), income(2)])
+            return httpx.Response(401, json={"code": -2015})
+        return None
+
+    api.failure = paginated
+    configured = connection(markets=("usdm",), usdm_symbols=())
+    result = asyncio.run(connector(api, configured).sync(None))
+    assert not result.complete and len(result.warnings) == 1
+    assert len([r for r in result.records if r.resource == "income"]) == 2
+    section = next(s for s in result.scopes if s.resource == "income")
+    assert section.refreshed and section.status == "incomplete"
+
+
+def test_denied_spot_identity_binds_futures_to_key_and_recovers_without_mixing_accounts(tmp_path):
+    api = Api()
+    configured = connection()
+    worker = connector(api)
+    store = Store(tmp_path)
+    store.register(configured)
+
+    def save():
+        result = asyncio.run(worker.sync(None))
+        store.finish(store.queue(configured.id, None), result, 0)
+        return result
+
+    save()
+    before = store.read(configured.id, "balances", None, 100, 0)
+    api.failure = lambda request: (
+        httpx.Response(401, json={"code": -2015}) if request.url.path.startswith("/api/") else None
+    )
+    partial = save()
+    assert partial.account_identity is None and not partial.complete
+    assert [
+        r
+        for r in store.read(configured.id, "balances", None, 100, 0)["items"]
+        if r["market"] == "spot"
+    ] == [r for r in before["items"] if r["market"] == "spot"]
+    # A key whose account cannot be verified must not inherit another key's history.
+    replacement = partial.model_copy(update={"credential_identity": "different-key"})
+    store.finish(store.queue(configured.id, None), replacement, 0)
+    assert all(
+        r["market"] != "spot" for r in store.read(configured.id, "balances", None, 100, 0)["items"]
+    )
+    api.failure = None
+    api.uid = 43
+    worker.options = BinanceSettings()
+    save()
+    assert store.read(configured.id, "trades", None, 100, 0)["items"] == []
+
+
+def test_successful_identity_probe_alone_cannot_complete_a_futures_sync():
+    api = Api()
+    api.failure = lambda request: (
+        httpx.Response(401, json={"code": -2015}) if request.url.path.startswith("/fapi/") else None
+    )
+    worker = connector(api, connection(markets=("usdm",)))
+    with pytest.raises(LoginRequired, match="usdm account"):
+        asyncio.run(worker.sync(None))
+    assert worker.credentials is None
+
+
+def test_a_transient_error_still_aborts_a_partial_sync():
+    api = Api()
+    api.failure = lambda request: (
+        httpx.Response(401, json={"code": -2015})
+        if request.url.path.startswith("/fapi/")
+        else httpx.Response(500, json={"code": -1000})
+        if request.url.path.startswith("/dapi/")
+        else None
+    )
+    with pytest.raises(ConnectorError, match="HTTP 500"):
+        asyncio.run(connector(api).sync(None))
+
+
+def test_existing_database_upgrades_and_retains_denied_market_freshness(tmp_path):
+    api = Api()
+    configured = connection()
+    original = Store(tmp_path)
+    original.register(configured)
+    job = original.queue(configured.id, None)
+    original.finish(job, asyncio.run(connector(api).sync(None)), 0)
+    before = original.read(configured.id, "positions", None, 100, 0)
+    with original.db() as db:
+        db.execute("ALTER TABLE jobs DROP COLUMN complete")
+        db.execute("ALTER TABLE jobs DROP COLUMN warnings")
+        db.execute("DROP TABLE snapshot_scopes")
+        db.execute("DROP TABLE connection_credentials")
+    store = Store(tmp_path)
+    assert store.job(job["id"])["warnings"] == []
+    assert store.job(job["id"])["complete"] is None
+    api.failure = lambda request: (
+        httpx.Response(401, json={"code": -2015}) if request.url.path.startswith("/fapi/") else None
+    )
+    store.finish(store.queue(configured.id, None), asyncio.run(connector(api).sync(None)), 0)
+    after = store.read(configured.id, "positions", None, 100, 0)
+    assert [r for r in after["items"] if r["market"] == "usdm"] == [
+        r for r in before["items"] if r["market"] == "usdm"
+    ]
+    stale = next(s for s in after["scopes"] if s["market"] == "usdm")
+    assert stale["synced"] == before["snapshot"]["synced"] and stale["status"] == "denied"
 
 
 @pytest.mark.parametrize("code", [[-2015], {"secret": KEY}, KEY, True, 10**30, None])

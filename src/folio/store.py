@@ -53,6 +53,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS connection_accounts (
                     id TEXT PRIMARY KEY, account_identity TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS connection_credentials (
+                    id TEXT PRIMARY KEY, credential_identity TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, connection TEXT NOT NULL, state TEXT NOT NULL,
                     created REAL NOT NULL, started REAL, finished REAL, since TEXT,
@@ -71,12 +74,22 @@ class Store:
                     complete INTEGER NOT NULL, coverage TEXT NOT NULL,
                     PRIMARY KEY (connection, resource)
                 );
+                CREATE TABLE IF NOT EXISTS snapshot_scopes (
+                    connection TEXT NOT NULL, resource TEXT NOT NULL, market TEXT NOT NULL,
+                    synced REAL, status TEXT NOT NULL,
+                    PRIMARY KEY (connection, resource, market)
+                );
                 CREATE TABLE IF NOT EXISTS records (
                     connection TEXT NOT NULL, resource TEXT NOT NULL, id TEXT NOT NULL,
                     occurred_at TEXT, data TEXT NOT NULL, observed REAL NOT NULL,
                     PRIMARY KEY (connection, resource, id)
                 );
             """)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
+            if "complete" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN complete INTEGER")
+            if "warnings" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]'")
 
     @contextmanager
     def db(self):
@@ -126,6 +139,13 @@ class Store:
                     "SELECT * FROM snapshots WHERE connection=? ORDER BY resource", (connection,)
                 )
             ]
+            row["scopes"] = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM snapshot_scopes WHERE connection=? ORDER BY resource,market",
+                    (connection,),
+                )
+            ]
             return row
 
     def append_log(self, connection, job, event, fields):
@@ -171,18 +191,26 @@ class Store:
                 (connection,),
             ).fetchone()
             if row:
-                return dict(row)
+                return self.job_value(row)
             ident = str(uuid.uuid4())
             db.execute(
                 "INSERT INTO jobs(id,connection,state,created,since) VALUES (?,?,'queued',?,?)",
                 (ident, connection, time.time(), since),
             )
-            return dict(db.execute("SELECT * FROM jobs WHERE id=?", (ident,)).fetchone())
+            return self.job_value(db.execute("SELECT * FROM jobs WHERE id=?", (ident,)).fetchone())
+
+    @staticmethod
+    def job_value(row):
+        return {
+            **dict(row),
+            "complete": bool(row["complete"]) if row["complete"] is not None else None,
+            "warnings": json.loads(row["warnings"]),
+        }
 
     def job(self, ident: str) -> dict[str, Any] | None:
         with self.db() as db:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (ident,)).fetchone()
-            return dict(row) if row else None
+            return self.job_value(row) if row else None
 
     def retry(self, connection: str) -> None:
         with self.db() as db:
@@ -217,30 +245,107 @@ class Store:
     def finish(self, job: dict, snapshot: Snapshot, cooldown: int) -> None:
         now = time.time()
         with self.db() as db:
-            if snapshot.account_identity is not None:
-                previous = db.execute(
+            if snapshot.account_identity is not None or snapshot.credential_identity is not None:
+                account = db.execute(
                     "SELECT account_identity FROM connection_accounts WHERE id=?",
                     (job["connection"],),
                 ).fetchone()
-                if previous is None or previous[0] != snapshot.account_identity:
+                credential = db.execute(
+                    "SELECT credential_identity FROM connection_credentials WHERE id=?",
+                    (job["connection"],),
+                ).fetchone()
+                same_key = (
+                    snapshot.credential_identity is not None
+                    and credential is not None
+                    and credential[0] == snapshot.credential_identity
+                )
+                same_account = (
+                    snapshot.account_identity is not None
+                    and account is not None
+                    and account[0] == snapshot.account_identity
+                )
+                account_changed = (
+                    snapshot.account_identity is not None
+                    and account is not None
+                    and not same_account
+                )
+                if account_changed or (not same_account and not same_key):
                     # A replacement API key may belong to a different account.
                     db.execute("DELETE FROM records WHERE connection=?", (job["connection"],))
                     db.execute("DELETE FROM snapshots WHERE connection=?", (job["connection"],))
+                    db.execute(
+                        "DELETE FROM snapshot_scopes WHERE connection=?", (job["connection"],)
+                    )
+                    db.execute("DELETE FROM connection_accounts WHERE id=?", (job["connection"],))
+                if snapshot.account_identity is not None:
+                    db.execute(
+                        "INSERT OR REPLACE INTO connection_accounts VALUES (?,?)",
+                        (job["connection"], snapshot.account_identity),
+                    )
+                if snapshot.credential_identity is not None:
+                    db.execute(
+                        "INSERT OR REPLACE INTO connection_credentials VALUES (?,?)",
+                        (job["connection"], snapshot.credential_identity),
+                    )
+            if snapshot.scopes is not None:
+                markets = sorted({scope.market for scope in snapshot.scopes})
+                placeholders = ",".join("?" for _ in markets)
+                # Removed markets cease to be exposed; denied configured markets stay cached.
                 db.execute(
-                    "INSERT OR REPLACE INTO connection_accounts VALUES (?,?)",
-                    (job["connection"], snapshot.account_identity),
+                    f"DELETE FROM records WHERE connection=? "
+                    f"AND json_extract(data,'$.market') NOT IN ({placeholders})",
+                    (job["connection"], *markets),
                 )
+                db.execute(
+                    f"DELETE FROM snapshot_scopes WHERE connection=? "
+                    f"AND market NOT IN ({placeholders})",
+                    (job["connection"], *markets),
+                )
+                for scope in snapshot.scopes:
+                    if scope.refreshed and scope.resource in {"accounts", "balances", "positions"}:
+                        db.execute(
+                            "DELETE FROM records WHERE connection=? AND resource=? "
+                            "AND json_extract(data,'$.market')=?",
+                            (job["connection"], scope.resource, scope.market),
+                        )
+                    db.execute(
+                        "INSERT INTO snapshot_scopes VALUES (?,?,?,COALESCE(?,"
+                        "(SELECT MAX(observed) FROM records WHERE connection=? AND resource=? "
+                        "AND json_extract(data,'$.market')=?)),?) "
+                        "ON CONFLICT(connection,resource,market) DO UPDATE SET "
+                        "synced=COALESCE(?,snapshot_scopes.synced),status=excluded.status",
+                        (
+                            job["connection"],
+                            scope.resource,
+                            scope.market,
+                            now if scope.refreshed else None,
+                            job["connection"],
+                            scope.resource,
+                            scope.market,
+                            scope.status,
+                            now if scope.refreshed else None,
+                        ),
+                    )
             for resource in snapshot.resources:
                 # Current holdings and balances are snapshots; histories accumulate by source ID.
-                if resource in {"accounts", "balances", "positions"}:
+                if snapshot.scopes is None and resource in {"accounts", "balances", "positions"}:
                     db.execute(
                         "DELETE FROM records WHERE connection=? AND resource=?",
                         (job["connection"], resource),
                     )
-                db.execute(
-                    "INSERT OR REPLACE INTO snapshots VALUES (?,?,?,?,?)",
-                    (job["connection"], resource, now, snapshot.complete, snapshot.coverage),
-                )
+                synced = now
+                sections = [s for s in snapshot.scopes or () if s.resource == resource]
+                if sections and not any(section.refreshed for section in sections):
+                    previous = db.execute(
+                        "SELECT synced FROM snapshots WHERE connection=? AND resource=?",
+                        (job["connection"], resource),
+                    ).fetchone()
+                    synced = previous[0] if previous else None
+                if synced is not None:
+                    db.execute(
+                        "INSERT OR REPLACE INTO snapshots VALUES (?,?,?,?,?)",
+                        (job["connection"], resource, synced, snapshot.complete, snapshot.coverage),
+                    )
             for record in snapshot.records:
                 db.execute(
                     "INSERT OR REPLACE INTO records VALUES (?,?,?,?,?,?)",
@@ -258,8 +363,15 @@ class Store:
                 (now + cooldown, job["connection"]),
             )
             db.execute(
-                "UPDATE jobs SET state='completed',finished=?,records=? WHERE id=?",
-                (now, len(snapshot.records), job["id"]),
+                "UPDATE jobs SET state='completed',finished=?,records=?,complete=?,warnings=? "
+                "WHERE id=?",
+                (
+                    now,
+                    len(snapshot.records),
+                    snapshot.complete,
+                    json.dumps(snapshot.warnings),
+                    job["id"],
+                ),
             )
 
     def fail(self, job: dict, code: str, message: str, cooldown: int) -> None:
@@ -289,6 +401,14 @@ class Store:
                 "connection": connection,
                 "resource": resource,
                 "snapshot": dict(meta) if meta else None,
+                "scopes": [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT * FROM snapshot_scopes WHERE connection=? AND resource=? "
+                        "ORDER BY market",
+                        (connection, resource),
+                    )
+                ],
                 "items": [
                     {
                         "id": r["id"],

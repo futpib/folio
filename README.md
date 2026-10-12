@@ -44,6 +44,11 @@ Use `folio logs NAME --follow` to watch retained logs, or
 endpoints, timing, HTTP status and safe error codes; credentials, query strings,
 headers and response bodies are excluded.
 
+Binance sync keeps the sections the API key can read. Denied sections produce
+warnings and `complete: false`; cached data from those sections retains its
+previous timestamps. A key that cannot read any configured section still fails
+authentication. See [partial Binance access](docs/folio.md#partial-binance-access).
+
 ## Existing IBKR interface
 
 `ibkr-tws-http` exposes a deliberately small, read-only HTTP API backed by a

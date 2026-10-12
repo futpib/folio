@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +23,9 @@ class Handler(BaseHTTPRequestHandler):
         response = api.handle(
             httpx.Request("GET", "http://localhost" + self.path, headers=dict(self.headers))
         )
+        denied = Path.cwd() / "denied-endpoints.json"
+        if denied.exists() and httpx.URL(self.path).path in json.loads(denied.read_text()):
+            response = httpx.Response(401, json={"code": -2015, "msg": "Missing fixture access"})
         body = response.content
         self.send_response(response.status_code)
         self.send_header("Content-Type", "application/json")

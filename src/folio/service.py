@@ -45,7 +45,12 @@ async def run_job(store, connection, connector, broker, job, log):
     try:
         result = await connector.sync(job["since"])
         store.finish(job, result, connection.min_sync_seconds)
-        log.emit("job_completed", records=len(result.records))
+        log.emit(
+            "job_completed",
+            records=len(result.records),
+            complete=result.complete,
+            warnings=len(result.warnings),
+        )
     except ConnectorError as error:
         cooldown = (
             0

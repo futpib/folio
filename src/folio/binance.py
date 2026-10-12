@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from datetime import UTC, datetime
@@ -15,8 +16,16 @@ from .binance_keys import Credentials as Credentials
 from .binance_keys import PassphraseRequired, private_pem, read_binance_credentials
 from .config import BinanceSettings, Connection
 from .credentials import CredentialFileError
-from .models import ConnectorError, LoginRequired, RateLimited, Record, SchemaChanged, Snapshot
-from .observability import RequestLog
+from .models import (
+    ConnectorError,
+    LoginRequired,
+    RateLimited,
+    Record,
+    SchemaChanged,
+    Snapshot,
+    SnapshotScope,
+)
+from .observability import RequestLog, emit
 
 DAY = 86_400_000
 PAGE_SIZE = 1000
@@ -46,6 +55,10 @@ ENDPOINTS = {
         "income": "/dapi/v1/income",
     },
 }
+
+
+class AccessDenied(LoginRequired):
+    """An endpoint rejection that may reflect a missing permission."""
 
 
 def decimal(value) -> str:
@@ -295,8 +308,7 @@ class BinanceConnector:
                     + (f", code {code}" if code is not None else "")
                     + "): "
                 )
-                if response.status_code == 401 or code in {-2014, -2015, -1022}:
-                    self.credentials = None
+                if response.status_code == 401 or code in {-2014, -2015, -1022, -1002}:
                     reason = {
                         -2014: (
                             "BAD_API_KEY_FMT: API-key format invalid. "
@@ -312,13 +324,15 @@ class BinanceConnector:
                             "Check that the configured private key matches the public key "
                             "registered for this API key (or the matching secret for HMAC)."
                         ),
+                        -1002: "UNAUTHORIZED: API key is not authorized to read this section.",
                     }.get(code, "Unauthorized request. Check API key access on Binance.")
-                    raise LoginRequired(
+                    error_type = LoginRequired if code in {-2014, -1022} else AccessDenied
+                    raise error_type(
                         context
                         + reason
                         + " After correcting it, retry 'folio sync "
                         + self.connection.id
-                        + "'. Local credentials are reread; "
+                        + "'. If all reads are rejected, local credentials are reread on retry; "
                         "Zond asks only for missing values."
                     )
                 if code == -1021:
@@ -350,19 +364,66 @@ class BinanceConnector:
 
     async def collect(self, client):
         # Spot's UID binds the collected history to one account even after a key rotation.
+        # When Spot is denied, a key fingerprint prevents histories from crossing accounts.
+        binding = hashlib.sha256(self.credentials.key.encode()).hexdigest()
+        scopes, warnings, denials = {}, [], []
+
+        def scope(market, resource):
+            return scopes.setdefault(
+                (market, resource),
+                SnapshotScope(market=market, resource=resource, refreshed=False, status="complete"),
+            )
+
+        async def fetch(market, operation, resources, **params):
+            sections = [scope(market, resource) for resource in resources]
+            try:
+                payload = await self.request(client, market, operation, **params)
+            except AccessDenied as error:
+                denials.append(error)
+                warning = str(error)
+                if params.get("symbol"):
+                    warning += f" Symbol: {params['symbol']}."
+                warnings.append(warning)
+                for section in sections:
+                    section.status = "incomplete" if section.refreshed else "denied"
+                emit(
+                    "section_skipped",
+                    market=market,
+                    operation=operation,
+                    endpoint=ORIGINS[market] + ENDPOINTS[market][operation],
+                    error_code="permission_denied",
+                )
+                return None
+            if payload is None:
+                raise SchemaChanged("Binance response format changed.")
+            for section in sections:
+                section.refreshed = True
+                if section.status == "denied":
+                    section.status = "incomplete"
+            return payload
+
         await self.time(client, "spot")
-        spot = await self.request(client, "spot", "account")
-        owner = ident(spot["uid"])
-        result = account_records("spot", spot) if "spot" in self.options.markets else []
+        spot = await fetch(
+            "spot", "account", ("accounts", "balances") if "spot" in self.options.markets else ()
+        )
+        owner = ident(spot["uid"]) if spot is not None else None
+        result = (
+            account_records("spot", spot)
+            if spot is not None and "spot" in self.options.markets
+            else []
+        )
         ends = {"spot": self.clocks["spot"][0]}
         for market in self.options.markets:
             if market == "spot":
                 continue
             ends[market] = await self.time(client, market)
-            result.extend(account_records(market, await self.request(client, market, "account")))
-            result.extend(position_records(market, await self.request(client, market, "positions")))
+            account = await fetch(market, "account", ("accounts", "balances"))
+            if account is not None:
+                result.extend(account_records(market, account))
+            positions = await fetch(market, "positions", ("positions",))
+            if positions is not None:
+                result.extend(position_records(market, positions))
         budget = self.connection.max_pages
-        complete = True
         coverage = []
         for market in self.options.markets:
             end = ends[market]
@@ -371,6 +432,7 @@ class BinanceConnector:
             coverage.append(
                 f"{market}: {iso(start)} through {iso(end)}; trade symbols={list(symbols)}"
             )
+            trades = scope(market, "trades")
             for symbol in symbols:
                 # Time windows work for all three APIs and do not mix fromId with time filters.
                 # Split full windows to avoid skipping trades sharing the same millisecond.
@@ -378,18 +440,19 @@ class BinanceConnector:
                 windows = [(a, min(a + step - 1, end)) for a in range(start, end + 1, step)]
                 while windows and budget:
                     low, high = windows.pop()
-                    page = rows(
-                        await self.request(
-                            client,
-                            market,
-                            "trades",
-                            symbol=symbol,
-                            startTime=low,
-                            endTime=high,
-                            limit=PAGE_SIZE,
-                        )
-                    )
                     budget -= 1
+                    payload = await fetch(
+                        market,
+                        "trades",
+                        ("trades",),
+                        symbol=symbol,
+                        startTime=low,
+                        endTime=high,
+                        limit=PAGE_SIZE,
+                    )
+                    if payload is None:
+                        break
+                    page = rows(payload)
                     for row in page:
                         if not low <= millis(row["time"]) <= high:
                             raise SchemaChanged(
@@ -398,26 +461,29 @@ class BinanceConnector:
                         result.append(trade_record(market, symbol, row))
                     if len(page) >= PAGE_SIZE:
                         if low == high:
-                            complete = False
+                            trades.status = "incomplete"
                         else:
                             middle = (low + high) // 2
                             windows.extend([(low, middle), (middle + 1, high)])
-                complete &= not windows
+                if windows and trades.status == "complete":
+                    trades.status = "incomplete"
             if market != "spot":
+                incomes = scope(market, "income")
                 page_number, seen = 1, set()
                 while budget:
-                    page = rows(
-                        await self.request(
-                            client,
-                            market,
-                            "income",
-                            startTime=start,
-                            endTime=end,
-                            page=page_number,
-                            limit=PAGE_SIZE,
-                        )
-                    )
                     budget -= 1
+                    payload = await fetch(
+                        market,
+                        "income",
+                        ("income",),
+                        startTime=start,
+                        endTime=end,
+                        page=page_number,
+                        limit=PAGE_SIZE,
+                    )
+                    if payload is None:
+                        break
+                    page = rows(payload)
                     added = []
                     for row in page:
                         if not start <= millis(row["time"]) <= end:
@@ -434,7 +500,10 @@ class BinanceConnector:
                         break
                     page_number += 1
                 else:
-                    complete = False
+                    incomes.status = "incomplete"
+        if not any(section.refreshed for section in scopes.values()) and denials:
+            raise denials[0]
+        complete = not warnings and all(section.status == "complete" for section in scopes.values())
         unique = {(r.resource, r.id): r for r in result}
         return Snapshot(
             records=list(unique.values()),
@@ -443,8 +512,16 @@ class BinanceConnector:
             coverage=" | ".join(coverage)
             + "; current balances/positions; configured markets only; "
             "empty symbol lists skip trades; "
-            + ("range finished" if complete else "page limit or dense timestamp: incomplete"),
-            account_identity=f"binance:{owner}",
+            + (
+                "range finished"
+                if complete
+                else "incomplete: denied sections or page limit/dense timestamp"
+            )
+            + (" | Skipped: " + " | ".join(warnings) if warnings else ""),
+            account_identity=f"binance:{owner}" if owner is not None else None,
+            credential_identity=binding,
+            scopes=list(scopes.values()),
+            warnings=warnings,
         )
 
     async def sync(self, since):
@@ -550,6 +627,9 @@ class BinanceConnector:
             return result
         except asyncio.CancelledError:
             outcome = "cancelled"
+            raise
+        except LoginRequired:
+            self.credentials = None
             raise
         except (KeyError, TypeError, ValueError, OverflowError):
             raise SchemaChanged(

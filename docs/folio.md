@@ -406,13 +406,16 @@ The Folio service receives credentials and must be trusted.
 Folio exposes only the fixed read endpoints listed below, even when a supplied
 key has broader account permissions.
 
-Keys are held in Folio's memory and reused until it stops or Binance
-rejects authentication. They are never copied into SQLite or written to a file.
+Keys are held in Folio's memory and reused until it stops, all configured reads
+are rejected, or Binance reports an invalid key format or signature. They are
+never copied into SQLite or written to a file.
 After restart, the next sync rereads `.env.local` and asks through Zond for any
 missing values. Decline, expiry or failure ends the job;
 run `folio sync CONNECTION` for a fresh attempt. Network failures retain valid
-in-memory keys. The Spot account endpoint is read even for Futures-only connections so its
-UID can bind the snapshot to an account; Spot account reading must be permitted.
+in-memory keys. The Spot account endpoint is read even for Futures-only connections
+so its UID can bind the snapshot to an account. When that endpoint is denied, a SHA-256
+API-key fingerprint binds the data to the current key. Changing keys without a
+readable UID clears cached data because Folio cannot verify account continuity.
 A successful sync with a different UID replaces the prior account's stored data
 atomically, preventing histories from two accounts from being mixed.
 
@@ -431,7 +434,44 @@ days. Full windows are subdivided to avoid skipping trades with equal timestamps
 `max_pages` limits the total number of history requests across markets. Exhausting
 it, or an indivisible millisecond containing a full page, produces
 `complete: false`; increase the limit or narrow the selection. Previously stored
-history is retained. Any API error discards the entire new snapshot.
+history is retained. Permission rejections allow a partial sync as described below;
+other API errors discard the entire new snapshot.
+
+### Partial Binance access
+
+An API key may read Spot while Futures requests return HTTP 401 / `-2015`.
+Folio attempts each configured section independently: accounts/balances,
+positions, each configured trade symbol, and income. If at least one configured
+section succeeds, denied sections are skipped and readable data is saved
+atomically. The job returns `state: "completed"`, `complete: false`, and a
+`warnings` list identifying each skipped request, its HTTP status and API code.
+`--verbose` shows `section_skipped` events alongside individual request logs.
+
+```sh
+uv run folio sync binance --verbose
+uv run folio read binance balances
+uv run folio read binance positions
+```
+
+Reads and `connections` include `scopes` with each resource's market, `status`
+(`complete`, `incomplete` or `denied`) and last successful `synced` timestamp.
+Denied sections keep their previously collected records and timestamps. A section
+without a known successful fetch has `synced: null`; a wholly unavailable resource
+has no new snapshot. A successful empty balance or position response clears previous
+values for that market. Mixed resources can contain fresh and older records;
+check each scope and each record's `observed_at` rather than treating the aggregate
+snapshot timestamp as freshness for every market.
+
+Valid credentials stay cached after a partial sync. After fixing permissions,
+start another sync to retry all configured sections; the normal minimum sync
+interval still applies. Zond is used only for credentials missing from `.env.local`.
+If you replace a key after a partial sync, restart `folio.service` to load it.
+
+If every configured section is denied, the job still fails with `login_required`
+and credentials are discarded so `.env.local` is reread on retry. Invalid key
+formats (`-2014`) and signatures (`-1022`) also fail the job. Rate limits, network
+errors, malformed responses and other API errors retain the previous complete
+stored state; they do not silently become partial successes.
 
 Decimal strings are preserved exactly. Crypto asset codes are not constrained to
 three-letter fiat currencies. Futures position IDs include the market, symbol
@@ -503,8 +543,9 @@ journalctl --user -u folio -f
 
 Each request records its method, fixed endpoint, start/completion, elapsed
 milliseconds, HTTP status when available, and Binance numeric error code when
-present. Job events show completion or a safe failure code; missing-field prompts
-appear as `credentials_requested`. Verbose progress goes to stderr so the final
+present. Job completion includes completeness and a warning count; skipped Binance
+sections emit `section_skipped`. Missing-field prompts appear as
+`credentials_requested`. Verbose progress goes to stderr so the final
 JSON result remains usable on stdout.
 
 Logs are written by Folio, appear in its service journal, and retain the newest
@@ -524,10 +565,12 @@ after correcting credentials. Start a new Folio sync to retry; Zond only handles
 the credential form.
 
 Each successful sync is committed atomically. Account/balance/position snapshots
-replace previous current values. Histories merge by provider IDs and retain
-previously collected records; a truncated page range never deletes older history.
+replace previous current values within successfully read sections. Histories merge
+by provider IDs and retain previously collected records; a truncated page range
+never deletes older history.
 Records and their snapshot metadata are committed together. Failure at any page
-leaves the previous data and freshness untouched.
+leaves the previous data and freshness untouched. Binance permission denials
+produce partial successes and preserve inaccessible sections with their old freshness.
 
 `max_pages` bounds each sync (default 100). `snapshot.complete` means pagination
 finished **within the provider page's selected range**, not that the entire account

@@ -59,6 +59,9 @@ min_sync_seconds = 1
 [connections.binance.binance]
 key_type = "{key_type}"
 markets = ["spot", "usdm", "coinm"]
+spot_symbols = ["BTCUSDT"]
+usdm_symbols = ["BTCUSDT"]
+coinm_symbols = ["BTCUSD_PERP"]
 """)
     cli = [str(Path(sys.executable).parent / "folio"), "--config", str(config)]
     with (tmp_path / "daemon.log").open("w+") as log:
@@ -101,10 +104,73 @@ markets = ["spot", "usdm", "coinm"]
             assert json.loads(success.stdout)["state"] == "completed"
             assert b"request_finished" in success.stderr and b"status=200" in success.stderr
             assert b"credentials_requested" not in success.stderr + rejected.stderr
+
+            def read(resource):
+                response = subprocess.run(
+                    [*cli, "read", "binance", resource],
+                    capture_output=True,
+                    timeout=15,
+                    check=True,
+                )
+                return json.loads(response.stdout)
+
+            before = {r: read(r) for r in ("balances", "positions", "trades")}
+            denied = tmp_path / "denied-endpoints.json"
+            denied.write_text(
+                json.dumps(
+                    [
+                        "/fapi/v3/account",
+                        "/fapi/v3/positionRisk",
+                        "/fapi/v1/userTrades",
+                        "/fapi/v1/income",
+                    ]
+                )
+            )
+            partial = subprocess.run(
+                [*cli, "sync", "binance", "--verbose"],
+                capture_output=True,
+                timeout=15,
+                check=True,
+            )
+            job = json.loads(partial.stdout)
+            assert job["state"] == "completed" and job["complete"] is False
+            assert len(job["warnings"]) == 4 and "/fapi/v3/account" in job["warnings"][0]
+            assert (
+                b"section_skipped" in partial.stderr and b"status=401 code=-2015" in partial.stderr
+            )
+            assert b"credentials_requested" not in partial.stderr
+            for resource, previous in before.items():
+                after = read(resource)
+                assert [r for r in after["items"] if r["market"] == "usdm"] == [
+                    r for r in previous["items"] if r["market"] == "usdm"
+                ]
+                old = next(s for s in previous["scopes"] if s["market"] == "usdm")
+                stale = next(s for s in after["scopes"] if s["market"] == "usdm")
+                assert stale["synced"] == old["synced"] and stale["status"] == "denied"
+                fresh = next(s for s in after["scopes"] if s["market"] == "coinm")
+                assert fresh["synced"] > stale["synced"] and fresh["status"] == "complete"
+            denied.unlink()
+            restored = subprocess.run(
+                [*cli, "sync", "binance", "--verbose"],
+                capture_output=True,
+                timeout=15,
+                check=True,
+            )
+            job = json.loads(restored.stdout)
+            assert job["complete"] is True and job["warnings"] == []
+            assert b"credentials_requested" not in restored.stderr
+            refreshed = next(s for s in read("positions")["scopes"] if s["market"] == "usdm")
+            assert refreshed["synced"] > before["positions"]["snapshot"]["synced"]
+            assert refreshed["status"] == "complete"
         finally:
             service.terminate()
             service.wait(timeout=15)
         assert not (tmp_path / "state/daemon.pid").exists()
         log.seek(0)
-        output = log.read() + success.stderr.decode() + rejected.stderr.decode()
+        output = (
+            log.read()
+            + success.stderr.decode()
+            + rejected.stderr.decode()
+            + partial.stderr.decode()
+        )
         assert KEY not in output and SECRET not in output and signing_value not in output

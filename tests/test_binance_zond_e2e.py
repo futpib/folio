@@ -195,6 +195,8 @@ history_days = 1
             successful = call("sync", "binance", "--detach")
             third = wait(lambda: request({"method": "pending"})["interactions"])[0]
             assert len({c["challenge_id"] for c in (first, second, third)}) == 3
+            denied = tmp_path / "denied-endpoints.json"
+            denied.write_text(json.dumps(["/fapi/v3/positionRisk"]))
             request(
                 {
                     "method": "answer_interaction",
@@ -214,6 +216,15 @@ history_days = 1
                     }
                 )
             wait(lambda: call("job", successful["id"])["state"] == "completed")
+            partial = call("job", successful["id"])
+            assert partial["complete"] is False and len(partial["warnings"]) == 1
+            assert len(call("read", "binance", "positions")["items"]) == 2
+            assert not request({"method": "pending"})["interactions"]
+            denied.unlink()
+            recovered = call("sync", "binance", "--detach")
+            wait(lambda: call("job", recovered["id"])["state"] == "completed")
+            assert call("job", recovered["id"])["complete"] is True
+            assert not request({"method": "pending"})["interactions"]
             positions = call("read", "binance", "positions")
             assert len(positions["items"]) == 4
             assert positions["snapshot"]["complete"]

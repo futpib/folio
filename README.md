@@ -31,6 +31,17 @@ Use `folio config show`, `folio config set KEY VALUE`, and `folio credentials PR
 to inspect settings, change individual values, or enter credentials privately.
 See the [configuration CLI guide](docs/folio.md#configuration-cli) for examples.
 
+Read a live history page through the normal resource interface:
+
+```sh
+uv run folio read binance trades --live --market usdm --symbol ETHUSDT --from-id 0
+```
+
+Live reads return native provider fields and a cursor for the caller to resume.
+They fetch one data page and leave pagination, aggregation, joins and lot matching
+to the caller. Use the [live-read guide](docs/folio.md#single-page-live-reads) to
+define readable Zond history rules. `read` without `--live` reads the stored cache.
+
 Binance setup creates an Ed25519 signing key for a fresh installation and prints
 the public key to paste into Binance's **Self-generated** API key form. It saves
 the private key in the ignored `.secrets/` directory and registers it in

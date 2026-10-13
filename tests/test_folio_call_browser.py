@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from contextlib import asynccontextmanager
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -30,6 +30,7 @@ def test_real_browser_call_reuses_env_login_and_headers_without_pagination(
     connector = BrowserConnector(settings, selected, env_file=env)
     original = module.browser
     requests = []
+    query_log = []
     api = f"/rest/rb?serviceId={BOG_ACCOUNTS}" if provider == "bog" else WOLT_ORDERS
     login_fields = (
         '<input name="username"><input type="password">'
@@ -46,6 +47,8 @@ def test_real_browser_call_reuses_env_login_and_headers_without_pagination(
     async def route(request):
         path = urlsplit(request.request.url).path
         requests.append((request.request.method, path))
+        query = parse_qs(urlsplit(request.request.url).query)
+        query_log.append((path, query))
         if path == urlsplit(PAGES[provider][0]).path:
             await request.fulfill(
                 content_type="text/html",
@@ -58,7 +61,19 @@ def test_real_browser_call_reuses_env_login_and_headers_without_pagination(
             )
         elif path == urlsplit(api).path:
             if request.request.headers.get("authorization") == "Bearer fixture-session-token":
-                await request.fulfill(json={"orders": []} if provider == "wolt" else {"code": 0})
+                await request.fulfill(
+                    json={
+                        "orders": [{"purchase_id": "native-order"}]
+                        if query.get("page_token")
+                        else [],
+                        "next_page_token": "next-page" if query.get("page_token") else None,
+                    }
+                    if provider == "wolt"
+                    else {
+                        "code": 0,
+                        "result": {"accounts": [{"acctKey": 1}], "details": [{"balance": "1.50"}]},
+                    }
+                )
             else:
                 await request.fulfill(status=401, json={"error": "expired"})
         elif path == "/smoke/new-read":
@@ -66,6 +81,11 @@ def test_real_browser_call_reuses_env_login_and_headers_without_pagination(
             await request.fulfill(
                 content_type="application/json",
                 body='{"amount":123.4567890123456789012345,"echo":"fixture-session-token","next":"another-page"}',
+            )
+        elif path == "/rest/transactional/statements":
+            await request.fulfill(
+                content_type="application/json",
+                body='{"data":[{"docKey":1,"amount":123.4567890123456789012345,"sort":[1,2]}]}',
             )
         elif path == "/smoke/denied":
             await request.fulfill(status=403, json={"error": "Fixture permission denied"})
@@ -110,3 +130,27 @@ def test_real_browser_call_reuses_env_login_and_headers_without_pagination(
         )
         assert redirect.status_code == 502 and "redirected" in redirect.json()["error"]
         assert not any(path == "/steal" for _, path in requests)
+        if provider == "wolt":
+            live = client.get(
+                "/v1/connections/wolt/live/orders", params={"cursor": "first-page"}
+            ).json()
+            assert live["ok"] and live["items"] == [{"purchase_id": "native-order"}]
+            assert live["next_cursor"] == {"cursor": "next-page"}
+            assert sum(q.get("page_token") == ["first-page"] for _, q in query_log) == 1
+        else:
+            live = client.get(
+                "/v1/connections/bog/live/transactions",
+                params={"limit": 1, "cursor": "0,1", "since": "2026-09-12", "until": "2026-09-19"},
+            ).json()
+            assert live["ok"] and live["items"][0]["amount"] == "123.4567890123456789012345"
+            assert live["next_cursor"] == {"cursor": "1,2"}
+            q = next(q for path, q in query_log if path == "/rest/transactional/statements")
+            assert q["searchAndSort"] == ["0,1"] and q["limit"] == ["1"]
+            assert q["operationDateTimeLowerBound"] == ["2026-09-12T00:00:00+00:00"]
+            accounts = client.get("/v1/connections/bog/live/accounts").json()
+            assert accounts["items"][0]["result"] == {
+                "accounts": [{"acctKey": 1}],
+                "details": [{"balance": "1.50"}],
+            }
+        with module_app.state.store.db() as db:
+            assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0

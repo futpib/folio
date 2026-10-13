@@ -139,6 +139,36 @@ history_days = 1
             wait(healthy)
             call("call", "binance", "/api/v3/time")
             smoke = subprocess.Popen(
+                [
+                    *cli,
+                    "read",
+                    "binance",
+                    "trades",
+                    "--live",
+                    "--market",
+                    "usdm",
+                    "--symbol",
+                    "BTCUSDT",
+                    "--account-mode",
+                    "classic",
+                    "--verbose",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            live_form = wait(lambda: request({"method": "pending"})["interactions"])[0]
+            request(
+                {
+                    "method": "answer_interaction",
+                    "challenge_id": live_form["challenge_id"],
+                    "values": None,
+                }
+            )
+            live_out, live_err = smoke.communicate(timeout=10)
+            assert smoke.returncode == 1 and json.loads(live_out)["error_code"] == "login_required"
+            assert b"live_read_failed" in live_err
+            assert not request({"method": "pending"})["interactions"]
+            smoke = subprocess.Popen(
                 [*cli, "call", "binance", "/api/v3/account", "--verbose"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -157,7 +187,19 @@ history_days = 1
             assert b"declined or expired" in smoke_err
             assert not request({"method": "pending"})["interactions"]
             smoke = subprocess.Popen(
-                [*cli, "call", "binance", "/api/v3/account"],
+                [
+                    *cli,
+                    "read",
+                    "binance",
+                    "trades",
+                    "--live",
+                    "--market",
+                    "usdm",
+                    "--symbol",
+                    "BTCUSDT",
+                    "--account-mode",
+                    "classic",
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )

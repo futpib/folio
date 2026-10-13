@@ -14,9 +14,10 @@ from . import __version__
 from .binance import BinanceConnector
 from .broker import ServiceBroker
 from .browser import BrowserConnector
-from .calls import CallRequest
+from .calls import CallRequest, CallResult
 from .config import Connection, Settings
 from .ibkr import IbkrConnector
+from .live import LiveReadRequest, read_live
 from .models import ConnectorError, SyncRequest
 from .observability import Recorder, RequestLog, current, recording
 from .store import Store, exclusive
@@ -189,6 +190,7 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
                 ),
                 "live_api": f"/v1/connections/{c.id}/ibkr" if c.provider == "ibkr" else None,
                 "call_api": f"/v1/connections/{c.id}/call",
+                "live_read_api": f"/v1/connections/{c.id}/live",
             }
             for c in settings.connections
         ]
@@ -200,28 +202,54 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
 
     @app.post("/v1/connections/{name}/call")
     async def call(name: str, spec: CallRequest, request: Request):
+        connection(name)
+        return await execute_live(name, request, lambda: connectors[name].call(spec))
+
+    @app.get("/v1/connections/{name}/live/{resource}")
+    async def live_read(
+        name: str, resource: str, request: Request, spec: Annotated[LiveReadRequest, Query()]
+    ):
         selected = connection(name)
+        if resource not in selected.resources:
+            raise HTTPException(404, "resource is not supported by this connection")
+
+        async def fetch():
+            result = await read_live(
+                connectors[name],
+                selected,
+                resource,
+                spec,
+                mode_hint=store.binance_mode_hint(name) if selected.provider == "binance" else None,
+            )
+            return {"resource": resource, **result}
+
+        return await execute_live(name, request, fetch, event="live_read")
+
+    async def execute_live(name, request, action, *, event="call"):
+        selected = connection(name)
+        # GET handlers do not otherwise consume the ASGI request body before disconnect watching.
+        await request.body()
         ident = str(uuid4())
 
         async def run():
             async with locks[name]:
                 with recording(store, selected, call_id=ident) as log:
-                    log.emit("call_started")
+                    log.emit(f"{event}_started")
                     try:
-                        result = await connectors[name].call(spec)
-                        log.emit("call_completed", status=result.status)
-                        return {
-                            "id": ident,
-                            "status": result.status,
-                            "content_type": result.content_type,
-                            "body": result.body,
-                            "logs": log.items,
-                        }
+                        result = await action()
+                        if isinstance(result, CallResult):
+                            result = {
+                                "status": result.status,
+                                "content_type": result.content_type,
+                                "body": result.body,
+                            }
+                        log.emit(f"{event}_completed", status=result["status"])
+                        return {"id": ident, "connection": name, **result, "logs": log.items}
                     except ValueError as error:
-                        log.emit("call_failed", error_code="invalid_call")
+                        log.emit(f"{event}_failed", error_code="invalid_call")
                         raise HTTPException(400, str(error)) from None
                     except ConnectorError as error:
-                        log.emit("call_failed", error_code=error.code)
+                        log.emit(f"{event}_failed", error_code=error.code)
                         return JSONResponse(
                             status_code=502,
                             content={
@@ -232,10 +260,10 @@ def create_app(settings: Settings, *, connectors=None) -> FastAPI:
                             },
                         )
                     except asyncio.CancelledError:
-                        log.emit("call_failed", error_code="cancelled")
+                        log.emit(f"{event}_failed", error_code="cancelled")
                         raise
                     except Exception:
-                        log.emit("call_failed", error_code="connector_failed")
+                        log.emit(f"{event}_failed", error_code="connector_failed")
                         return JSONResponse(
                             status_code=502,
                             content={

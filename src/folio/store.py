@@ -173,6 +173,21 @@ class Store:
             "fields": fields,
         }
 
+    def binance_mode_hint(self, connection):
+        with self.db() as db:
+            key = db.execute(
+                "SELECT credential_identity FROM connection_credentials WHERE id=?", (connection,)
+            ).fetchone()
+            snapshot = db.execute(
+                "SELECT coverage FROM snapshots WHERE connection=? ORDER BY synced DESC LIMIT 1",
+                (connection,),
+            ).fetchone()
+        if key and snapshot:
+            mode = snapshot[0].split(" | ", 1)[0].removeprefix("account mode=")
+            if mode in {"classic", "portfolio", "portfolio_pro", "portfolio_pro_span"}:
+                return key[0], mode
+        return None
+
     def logs(self, connection, *, after=0, limit=1000, job=None):
         with self.db() as db:
             result = db.execute(

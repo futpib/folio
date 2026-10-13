@@ -181,6 +181,16 @@ def test_ibkr_calls_keep_exposure_policy_and_accept_post_read_queries(tmp_path):
         result = call("/v1/positions")
         assert result["status"] == 200 and "DU424242" not in result["body"]
         assert len(json.loads(result["body"])) == 2
+        native = client.get("/v1/connections/ibkr/live/positions").json()
+        assert native["ok"] and len(native["items"]) == 2
+        assert "DU424242" not in json.dumps(native)
+        assert native["next_cursor"] is None
+        assert (
+            client.get(
+                "/v1/connections/ibkr/live/positions", params={"since": "2026-09-01"}
+            ).status_code
+            == 400
+        )
         result = call(
             "/v1/contracts/details",
             method="POST",

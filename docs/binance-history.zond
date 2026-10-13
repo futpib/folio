@@ -1,0 +1,3 @@
+rule binance-history(symbol: repo-name, cursor: repo-name) {
+  run uv run --no-sync --frozen --directory "$HOME/code/folio" folio read binance trades --live --market usdm --account-mode portfolio --symbol "$symbol" --from-id "$cursor" --limit 1000
+}

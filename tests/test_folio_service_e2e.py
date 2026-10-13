@@ -157,6 +157,52 @@ coinm_symbols = ["BTCUSD_PERP"]
             assert b"HTTP 200" in calls.stderr
             assert calls.stderr.count(b"request_started") == 1
             assert {r: read(r) for r in before} == before
+            live = subprocess.run(
+                [
+                    *cli,
+                    "read",
+                    "binance",
+                    "trades",
+                    "--live",
+                    "--market",
+                    "usdm",
+                    "--symbol",
+                    "BTCUSDT",
+                    "--limit",
+                    "1",
+                    "--verbose",
+                ],
+                capture_output=True,
+                timeout=15,
+                check=True,
+            )
+            page = json.loads(live.stdout)
+            assert page["items"][0]["qty"] == "0.001"
+            assert page["next_cursor"] == {"from_id": 2} and page["page_full"]
+            assert live.stderr.count(b"request_started") == 1
+            assert b"live_read_completed" in live.stderr
+            tail = subprocess.run(
+                [
+                    *cli,
+                    "read",
+                    "binance",
+                    "trades",
+                    "--live",
+                    "--market",
+                    "usdm",
+                    "--symbol",
+                    "BTCUSDT",
+                    "--from-id",
+                    "2",
+                    "--verbose",
+                ],
+                capture_output=True,
+                timeout=15,
+                check=True,
+            )
+            assert json.loads(tail.stdout)["items"] == []
+            assert json.loads(tail.stdout)["next_cursor"] is None
+            assert {r: read(r) for r in before} == before
             denied = tmp_path / "denied-endpoints.json"
             denied.write_text(
                 json.dumps(
@@ -223,6 +269,26 @@ coinm_symbols = ["BTCUSD_PERP"]
                 holdings = read("positions")["items"]
                 assert len(holdings) == 4 and {p["account_mode"] for p in holdings} == {mode}
                 assert len(read("trades")["items"]) == 3
+                history = subprocess.run(
+                    [
+                        *cli,
+                        "read",
+                        "binance",
+                        "trades",
+                        "--live",
+                        "--market",
+                        "usdm",
+                        "--symbol",
+                        "BTCUSDT",
+                        "--verbose",
+                    ],
+                    capture_output=True,
+                    timeout=15,
+                    check=True,
+                )
+                assert json.loads(history.stdout)["scope"]["account_mode"] == mode
+                assert history.stderr.count(b"request_started") == 1
+                assert len(json.loads(history.stdout)["items"]) == 1
                 assert len(read("income")["items"]) == 4
                 unified = next(p for p in read("balances")["items"] if p["market"] == "portfolio")
                 assert unified["balance_scope"] == "unified"

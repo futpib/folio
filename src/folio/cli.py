@@ -61,6 +61,21 @@ def main():
     read.add_argument("--since")
     read.add_argument("--limit", type=int, default=100)
     read.add_argument("--offset", type=int, default=0)
+    read.add_argument(
+        "--live", action="store_true", help="fetch one native provider page; caller owns pagination"
+    )
+    read.add_argument("--market", choices=["spot", "usdm", "coinm", "portfolio"])
+    read.add_argument("--symbol")
+    read.add_argument("--until")
+    read.add_argument("--from-id", type=int)
+    read.add_argument("--page", type=int)
+    read.add_argument("--cursor")
+    read.add_argument(
+        "--account-mode",
+        choices=["auto", "classic", "portfolio", "portfolio_pro", "portfolio_pro_span"],
+        default="auto",
+    )
+    read.add_argument("--verbose", action="store_true", help="show live request metadata on stderr")
     sync = sub.add_parser("sync", help="queue a sync and follow it until completion")
     sync.add_argument("connection")
     sync.add_argument("--detach", action="store_true")
@@ -171,6 +186,57 @@ def main():
                 connection = settings.connection(args.connection)
                 if args.resource not in connection.resources:
                     parser.error("unsupported resource; see 'folio connections'")
+                if args.live:
+                    from .live import LiveReadRequest
+
+                    if args.offset:
+                        parser.error(
+                            "live reads use --from-id, --page or --cursor instead of --offset"
+                        )
+                    spec = LiveReadRequest(
+                        limit=args.limit,
+                        market=args.market,
+                        symbol=args.symbol,
+                        since=args.since,
+                        until=args.until,
+                        from_id=args.from_id,
+                        page=args.page,
+                        cursor=args.cursor,
+                        account_mode=args.account_mode,
+                    )
+                    response = client.get(
+                        f"/v1/connections/{connection.id}/live/{args.resource}",
+                        params=spec.model_dump(mode="json", exclude_none=True),
+                        timeout=httpx.Timeout(360, connect=15),
+                    )
+                    result = response.json()
+                    if args.verbose:
+                        for row in result.get("logs", []):
+                            print(format_log(row), file=sys.stderr)
+                    print(
+                        json.dumps(
+                            {k: v for k, v in result.items() if k != "logs"},
+                            indent=2,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        )
+                    )
+                    if not response.is_success or not result.get("ok", False):
+                        raise SystemExit(1)
+                    return
+                if any(
+                    (
+                        args.market,
+                        args.symbol,
+                        args.until,
+                        args.from_id is not None,
+                        args.page is not None,
+                        args.cursor,
+                        args.account_mode != "auto",
+                        args.verbose,
+                    )
+                ):
+                    parser.error("provider filters and --verbose require --live")
                 response = client.get(
                     f"/v1/connections/{connection.id}/records/{args.resource}",
                     params={
@@ -220,6 +286,8 @@ def main():
             if isinstance(result, dict) and result.get("state") == "failed":
                 raise SystemExit(1)
     except KeyboardInterrupt:
+        if args.command == "read" and args.live:
+            parser.exit(130, "Stopped the live read.\n")
         if args.command == "call":
             parser.exit(130, "Stopped the one-off call.\n")
         if args.command == "logs":

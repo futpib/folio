@@ -635,6 +635,80 @@ UTC and includes undated records with `occurred_at: null` and
 `undated_included: true`, rather than silently dropping them. Money amounts are
 decimal strings paired with a currency code when the provider supplies one.
 
+## Single-page live reads
+
+`folio read CONNECTION RESOURCE --live` selects the adapter endpoint by resource
+and fetches one native data page. It does not queue a sync, follow pages, join
+responses or change settings and snapshots. The caller chooses pagination,
+aggregation and interpretation, including lot matching. Live response fields
+retain the provider's names; JSON decimal numbers become exact decimal strings.
+Cached `read` responses retain their existing normalized record format.
+
+```sh
+# Start at the earliest trade ID available to the API:
+uv run folio read binance trades --live --market usdm --symbol ETHUSDT \
+  --from-id 0 --limit 1000 --verbose
+# Resume using next_cursor.from_id from the previous response:
+uv run folio read binance trades --live --market usdm --symbol ETHUSDT \
+  --from-id 8747264116 --limit 1000
+# An explicit UTC window: since is inclusive, until is exclusive for Binance.
+uv run folio read binance trades --live --market usdm --symbol ETHUSDT \
+  --since 2026-09-12 --until 2026-09-19
+uv run folio read binance positions --live --market usdm
+uv run folio read binance balances --live --market portfolio
+uv run folio read binance income --live --market usdm --page 1 --limit 1000
+uv run folio read bog transactions --live --limit 25 --cursor '1,2'
+uv run folio read wolt orders --live --cursor PAGE_TOKEN
+uv run folio read ibkr positions --live
+```
+
+Binance requires `--market spot`, `usdm`, `coinm` or `portfolio`; `portfolio`
+selects unified accounts/balances. Trades require `--symbol` and default to
+`--from-id 0` when no date window is specified. `--from-id` cannot be combined
+with date bounds. Provide both `--since` and `--until` for a fixed trade/income
+window; timestamps without a zone use UTC. Trade windows span at most one day
+for Spot or seven days for Futures. The response includes `next_cursor`,
+`page_full`, `observed_at` and `scope`. A trade-ID cursor is also useful for
+resuming future reads after a short page. The caller stops or requests another
+page; an empty page has no next cursor. A full time-window page has no ID cursor
+because Binance cannot combine it with date bounds: the caller must divide the
+window or choose trade-ID pagination. `page_full` describes only the fetched
+page and does not certify lifetime-history coverage or remaining page count.
+
+Binance mode selection uses `--account-mode`, then connection settings, then a
+mode remembered by a successful sync for the same API key. When `auto` is still
+unknown, it makes one account-mode metadata lookup before the one data request.
+It does not try alternative history endpoints or paginate automatically. Set a
+known mode explicitly to guarantee one Binance API request. Signing uses the
+same in-memory/local credentials and Zond fallback as `folio call`.
+
+BoG transactions use `--cursor` for the native sort cursor and support the
+captured API's date-bound fields. BoG accounts/balances return the same native
+response, preserving separate account/detail sections for the caller. Wolt
+orders return the native `next_page_token` as `next_cursor.cursor`, using the
+provider's page size. IBKR snapshots retain the local API's exposure policy.
+Browser preparation can load pages and complete sign-in before the requested
+data page. `--limit` controls Binance history and BoG transactions; snapshot
+endpoints and Wolt do not expose that filter. Unsupported filters fail before
+authentication. BoG/Wolt remain experimental for authenticated real accounts.
+
+For readable reusable Zond access, authorize the normal resource command with
+fixed provider, market and account mode, and typed symbol/cursor parameters:
+
+```text
+rule binance-history(symbol: repo-name, cursor: repo-name) {
+  run uv run --no-sync --frozen --directory "$HOME/code/folio" folio read binance trades --live --market usdm --account-mode portfolio --symbol "$symbol" --from-id "$cursor" --limit 1000
+}
+```
+
+This grants one USD-M Portfolio Margin history page per invocation, with no
+arbitrary URL, headers or API operation. Folio validates the symbol and numeric
+cursor before accessing credentials or the provider. A caller can invoke
+`binance-history ETHUSDT 0`, save the result, and use its cursor in the next
+invocation. Lot reconstruction then runs in the caller's own process; it needs
+no additional remote execution authority. Keep arbitrary `folio call` smoke
+tests on individual command approvals.
+
 ## One-off API calls
 
 `folio call CONNECTION ENDPOINT` runs one requested live call through the adapter.
@@ -709,11 +783,17 @@ POST /v1/connections/{name}/call              JSON body: {"endpoint":"...","para
 GET  /v1/jobs/{id}
 GET  /v1/connections/{name}/logs?after=0&limit=1000&job=...
 GET  /v1/connections/{name}/records/{resource}?since=...&limit=100&offset=0
+GET  /v1/connections/{name}/live/{resource}?market=usdm&symbol=ETHUSDT&from_id=0&limit=1000
 ```
 
 The call response contains `id`, provider `status`, `content_type`, raw text
 `body`, and metadata-only `logs`. A received provider error still returns this
 envelope; transport/authentication failures return a Folio error with HTTP 502.
+
+Live reads return `ok`, provider `status`, native `items`, `next_cursor`,
+`page_full` and `scope`, plus metadata-only logs. Provider errors return
+`ok: false` and the sanitized provider error; the CLI exits with status 1.
+Unknown resource names and raw endpoint/header query arguments are rejected.
 
 Follow `next_offset` to paginate stored records, or `next_after` for logs. The
 optional `job` filter limits logs to that connection's job. Provider calls stay

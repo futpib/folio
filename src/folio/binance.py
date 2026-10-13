@@ -753,7 +753,7 @@ class BinanceConnector:
             warnings=warnings,
         )
 
-    async def call(self, request: CallRequest):
+    async def call(self, request: CallRequest, *, client=None):
         if request.method != "GET":
             raise ValueError("Binance smoke calls support GET")
         prefix = httpx.URL(request.endpoint).path.split("/")[1:2]
@@ -823,6 +823,8 @@ class BinanceConnector:
                 except httpx.HTTPError:
                     raise ConnectorError("Could not reach the Binance API securely.") from None
 
+        if client is not None:
+            return await single(client)
         if not public:
             return await self.authenticated(single)
         async with httpx.AsyncClient(

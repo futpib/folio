@@ -213,6 +213,12 @@ class Api:
             "/papi/v1/um/userTrades",
             "/papi/v1/cm/userTrades",
         }:
+            if "fromId" in params:
+                records = self.history if self.history is not None else [trade(params["symbol"])]
+                records = [r for r in records if r["id"] >= int(params["fromId"])]
+                return httpx.Response(
+                    200, json=sorted(records, key=lambda r: r["id"])[: int(params["limit"])]
+                )
             assert int(params["endTime"]) - int(params["startTime"]) < (
                 86_400_000 if path.startswith("/api") else 7 * 86_400_000
             )
